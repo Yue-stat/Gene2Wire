@@ -1,4 +1,4 @@
-# Gene2Wire core
+# Gene2Wire
 
 Gene2Wire is a data-agnostic implementation of matched logistic, PU-logistic,
 MIRT, PU-MIRT, joint, and PU-joint projection models.
@@ -7,11 +7,16 @@ This repository deliberately contains only the reusable model layer. Raw-data
 download, dataset-specific filtering, feature construction, hiding mechanisms,
 splitting, calibration, evaluation, and plotting belong in dataset notebooks.
 
-## Dataset notebooks
+## One model source for every dataset
 
 Dataset-specific processing and evaluation are intentionally kept outside this
-repository. Companion notebooks pin an immutable core commit and may save
-resumable checkpoints/results to persistent storage.
+repository. Every SPIDER, BARseq, Projection-TAGs, and simulation notebook uses
+this repository's single `main` branch. There are no dataset model branches.
+
+At startup, each notebook resolves `main` once to its current commit SHA,
+installs exactly that snapshot, and records the SHA in its checkpoint
+fingerprint and run manifest. This keeps one shared model implementation while
+making every completed run exactly auditable and resumable.
 
 ## Core data contract
 
@@ -29,12 +34,15 @@ than an outer-test label bundle.
 
 ## Install
 
-For a reproducible run, install a commit SHA rather than `main`:
+All dataset notebooks use the same public `main`:
 
 ```bash
 python -m pip install \
-  "git+https://github.com/Yue-stat/Gene2Wire-core.git@<CORE_COMMIT_SHA>"
+  "git+https://github.com/Yue-stat/Gene2Wire.git@main"
 ```
+
+For an atomic run, resolve `main` to a SHA at notebook startup and install that
+resolved snapshot. Do not create or select a dataset-specific branch.
 
 ## Generic API
 
@@ -82,9 +90,8 @@ observed_q = result.models["PU-MIRT"].observed_probability
 selected_hyperparameters = result.summary_rows()
 ```
 
-`tuning` and `fit` may each be either one shared configuration or a mapping
-from model name to configuration, allowing different datasets/models to use
-different grids.
+`tuning` and `fit` are ordinary inputs to the same runner. A dataset may supply
+a dimension-appropriate grid, but it never selects different model code.
 
 ## Resume guarantees
 
