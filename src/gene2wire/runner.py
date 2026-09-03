@@ -19,12 +19,17 @@ from .checkpoint import (
 )
 from .config import FitConfig, ModelConfig, TuningConfig
 from .data import DatasetBundle
-from .models import FittedModel, UnifiedPUModel, _exposure_matrix
+from .models import (
+    DirectWarmStartCache,
+    FittedModel,
+    UnifiedPUModel,
+    _exposure_matrix,
+)
 from .seeds import stable_seed
 from .tuning import TuningResult, tune_model
 
 
-CORE_API_VERSION = "0.2.0"
+CORE_API_VERSION = "0.2.1"
 
 
 @dataclass(frozen=True)
@@ -222,8 +227,9 @@ def run_model_grid(
     ``train`` and ``validation`` must contain only observed PU labels.  The
     outer-test interface deliberately accepts ``test_X`` rather than a bundle,
     so hidden masks and pre-hide reference labels cannot enter model selection.
-    Candidate trials and completed fitted models/predictions are checkpointed
-    independently when ``checkpoint_dir`` is supplied.
+    Candidate trials, reusable direct warm starts, and completed fitted
+    models/predictions are checkpointed independently when ``checkpoint_dir``
+    is supplied.
     """
 
     _require_reference_free("train", train)
@@ -310,10 +316,30 @@ def run_model_grid(
 
     trial_store = None
     model_store = None
+    warm_start_store = None
     if checkpoint_dir is not None:
         checkpoint_root = Path(checkpoint_dir)
         trial_store = AtomicCheckpointStore(checkpoint_root / "trials")
         model_store = AtomicArrayCheckpointStore(checkpoint_root / "models")
+        warm_start_store = AtomicArrayCheckpointStore(
+            checkpoint_root / "warm_starts"
+        )
+
+    # These caches are deliberately scoped to this run's fixed input arrays.
+    # Tuning and refit use separate caches because their training rows differ.
+    # A shared cache across model families removes repeated deterministic direct
+    # fits while leaving every candidate's objective and SVD initialization
+    # numerically unchanged.
+    tuning_warm_starts = DirectWarmStartCache(
+        checkpoint_store=warm_start_store,
+        fingerprint=fingerprint if warm_start_store is not None else None,
+        context={"phase": "tuning", "runner_context": context},
+    )
+    refit_warm_starts = DirectWarmStartCache(
+        checkpoint_store=warm_start_store,
+        fingerprint=fingerprint if warm_start_store is not None else None,
+        context={"phase": "refit", "runner_context": context},
+    )
 
     results: dict[str, ModelRunResult] = {}
     for base_model in base_models:
@@ -370,6 +396,7 @@ def run_model_grid(
             checkpoint_store=trial_store,
             checkpoint_fingerprint=fingerprint if trial_store is not None else None,
             checkpoint_context={**context, "runner_model": base_model.name},
+            warm_start_cache=tuning_warm_starts,
         )
         final_seed = stable_seed(
             seed,
@@ -378,7 +405,11 @@ def run_model_grid(
             tuned.best_config.rank,
             tuned.best_config.use_target_features,
         )
-        fitted_model = UnifiedPUModel(tuned.best_config, model_fit).fit(
+        fitted_model = UnifiedPUModel(
+            tuned.best_config,
+            model_fit,
+            warm_start_cache=refit_warm_starts,
+        ).fit(
             development,
             exposure=development_e,
             seed=final_seed,

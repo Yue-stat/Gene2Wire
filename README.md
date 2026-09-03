@@ -100,7 +100,9 @@ When `checkpoint_dir` is supplied:
 1. Every completed hyperparameter candidate is saved atomically.
 2. Every completed selected/refitted model saves checksummed fitted parameters
    and test predictions.
-3. The fingerprint covers arrays, IDs/order, exposure, hyperparameters, seed
+3. Deterministic direct-model SVD warm starts are reused across compatible
+   MIRT/joint candidates and checkpointed for runtime-disconnect recovery.
+4. The fingerprint covers arrays, IDs/order, exposure, hyperparameters, seed
    policy, semantic unit context, and pinned code version.
 
 After a runtime disconnect, completed candidates are skipped and completed

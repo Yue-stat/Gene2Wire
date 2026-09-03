@@ -105,3 +105,45 @@ def test_array_checkpoint_detects_tampering(tmp_path: Path):
     arrays_path.write_bytes(arrays_path.read_bytes() + b"tamper")
     with pytest.raises(ValueError, match="array checksum mismatch"):
         store.load(key, "fingerprint")
+
+
+def test_runner_shares_warm_starts_across_model_families(tmp_path: Path):
+    train, validation, test_x, exposure = partitions()
+    tuning = TuningConfig(
+        ranks=(1, 2),
+        shared_l2=(0.1,),
+        residual_l2=(0.1,),
+        target_l2=(0.1,),
+        anchor_shared_l2=0.1,
+        anchor_residual_l2=0.1,
+        anchor_target_l2=0.1,
+    )
+    run_model_grid(
+        train=train,
+        validation=validation,
+        test_X=test_x,
+        train_exposure=exposure[:36],
+        validation_exposure=exposure[36:54],
+        test_exposure=exposure[54:],
+        test_cell_ids=[f"cell_{index}" for index in range(54, 72)],
+        models=(
+            ModelConfig(name="MIRT", kind="lowrank", rank=1, pu=False),
+            ModelConfig(name="Joint", kind="joint", rank=1, pu=False),
+        ),
+        tuning=tuning,
+        fit=FitConfig(
+            maxiter=300,
+            tolerance=1e-7,
+            initialization="svd",
+            init_direct_maxiter=100,
+        ),
+        checkpoint_dir=tmp_path / "checkpoints",
+        unit_context={"fold": 0, "condition": "cache-test"},
+        seed=23,
+        code_version="warm-start-cache-test",
+    )
+
+    # The two compatible model families and both ranks need only one direct
+    # initializer for tuning and one for the distinct development/refit data.
+    manifests = list((tmp_path / "checkpoints" / "warm_starts").glob("*.json"))
+    assert len(manifests) == 2

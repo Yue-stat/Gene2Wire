@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gene2wire"
-version = "0.2.0"
+version = "0.2.1"
 description = "Reproducible, data-agnostic PU multitask model selection"
 readme = "README.md"
 requires-python = ">=3.10"

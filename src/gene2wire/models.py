@@ -8,18 +8,180 @@ optimizer and penalty-scaling confounds from model comparisons.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import minimize
 from scipy.special import expit
 
+from .checkpoint import AtomicArrayCheckpointStore, unit_key
 from .config import FitConfig, ModelConfig
 from .data import DatasetBundle
 
 
 Array = NDArray[np.float64]
+
+
+@dataclass(frozen=True)
+class _DirectWarmStartKey:
+    """Everything that changes a deterministic direct-model initializer.
+
+    A cache instance is scoped to one data/exposure phase by its creator.  The
+    runner uses separate instances for tuning data and refit data, while the
+    run fingerprint protects persistent entries across runtime restarts.
+    """
+
+    pu: bool
+    residual_l2: float
+    use_target_features: bool
+    target_l2: float
+    maxiter: int
+    tolerance: float
+    n_features: int
+    n_targets: int
+    n_target_features: int
+
+
+@dataclass(frozen=True)
+class _DirectWarmStart:
+    residual: Array
+    target_coeff: Array | None
+    intercept: Array
+
+
+class DirectWarmStartCache:
+    """Reuse deterministic direct fits used for SVD initialization.
+
+    The cache is intentionally scoped by ``run_model_grid`` to one training
+    bundle and exposure matrix.  When a checkpoint store is supplied, entries
+    are also restored after a runtime disconnect.  Cached arrays are copied on
+    both insertion and retrieval so candidate fits cannot mutate shared state.
+    """
+
+    def __init__(
+        self,
+        *,
+        checkpoint_store: AtomicArrayCheckpointStore | None = None,
+        fingerprint: str | None = None,
+        context: Mapping[str, Any] | None = None,
+    ) -> None:
+        if (checkpoint_store is None) != (fingerprint is None):
+            raise ValueError(
+                "checkpoint_store and fingerprint must be supplied together"
+            )
+        if fingerprint is not None and not fingerprint:
+            raise ValueError("fingerprint must be nonempty")
+        self._checkpoint_store = checkpoint_store
+        self._fingerprint = fingerprint
+        self._context = dict(context or {})
+        if any(not isinstance(key, str) or not key for key in self._context):
+            raise ValueError("warm-start context keys must be nonempty strings")
+        self._memory: dict[_DirectWarmStartKey, _DirectWarmStart] = {}
+        self._hits = 0
+        self._disk_hits = 0
+        self._misses = 0
+
+    @property
+    def hits(self) -> int:
+        return self._hits
+
+    @property
+    def disk_hits(self) -> int:
+        return self._disk_hits
+
+    @property
+    def misses(self) -> int:
+        return self._misses
+
+    @property
+    def size(self) -> int:
+        return len(self._memory)
+
+    @staticmethod
+    def _copy(value: _DirectWarmStart) -> _DirectWarmStart:
+        return _DirectWarmStart(
+            residual=np.array(value.residual, dtype=np.float64, copy=True),
+            target_coeff=(
+                None
+                if value.target_coeff is None
+                else np.array(value.target_coeff, dtype=np.float64, copy=True)
+            ),
+            intercept=np.array(value.intercept, dtype=np.float64, copy=True),
+        )
+
+    def _checkpoint_key(self, key: _DirectWarmStartKey) -> str:
+        return unit_key(
+            task="direct_warm_start",
+            cache_context=self._context,
+            initializer=asdict(key),
+        )
+
+    def get_or_create(
+        self,
+        key: _DirectWarmStartKey,
+        factory: Callable[[], _DirectWarmStart],
+    ) -> _DirectWarmStart:
+        in_memory = self._memory.get(key)
+        if in_memory is not None:
+            self._hits += 1
+            return self._copy(in_memory)
+
+        checkpoint_key = self._checkpoint_key(key)
+        if self._checkpoint_store is not None:
+            assert self._fingerprint is not None
+            cached = self._checkpoint_store.load(
+                checkpoint_key, fingerprint=self._fingerprint
+            )
+            if cached is not None:
+                payload = cached["payload"]
+                arrays = cached["arrays"]
+                if payload.get("initializer") != asdict(key):
+                    raise ValueError("warm-start checkpoint configuration does not match")
+                target_present = bool(payload.get("target_coeff_present"))
+                expected_names = {"residual", "intercept"}
+                if target_present:
+                    expected_names.add("target_coeff")
+                if set(arrays) != expected_names:
+                    raise ValueError("warm-start checkpoint array index does not match")
+                value = _DirectWarmStart(
+                    residual=np.asarray(arrays["residual"], dtype=np.float64),
+                    target_coeff=(
+                        np.asarray(arrays["target_coeff"], dtype=np.float64)
+                        if target_present
+                        else None
+                    ),
+                    intercept=np.asarray(arrays["intercept"], dtype=np.float64),
+                )
+                self._memory[key] = self._copy(value)
+                self._hits += 1
+                self._disk_hits += 1
+                return self._copy(value)
+
+        value = factory()
+        if not isinstance(value, _DirectWarmStart):
+            raise TypeError("warm-start factory returned an invalid value")
+        stored = self._copy(value)
+        self._memory[key] = stored
+        self._misses += 1
+        if self._checkpoint_store is not None:
+            assert self._fingerprint is not None
+            arrays: dict[str, Array] = {
+                "residual": stored.residual,
+                "intercept": stored.intercept,
+            }
+            if stored.target_coeff is not None:
+                arrays["target_coeff"] = stored.target_coeff
+            self._checkpoint_store.save_complete(
+                checkpoint_key,
+                self._fingerprint,
+                {
+                    "initializer": asdict(key),
+                    "target_coeff_present": stored.target_coeff is not None,
+                },
+                arrays,
+            )
+        return self._copy(stored)
 
 
 def _exposure_matrix(exposure: Any, shape: tuple[int, int]) -> Array:
@@ -180,9 +342,15 @@ class UnifiedPUModel:
     term ``(X D) Y_target.T`` with penalty ``0.5*target_l2*||D||^2``.
     """
 
-    def __init__(self, config: ModelConfig, fit_config: FitConfig | None = None):
+    def __init__(
+        self,
+        config: ModelConfig,
+        fit_config: FitConfig | None = None,
+        warm_start_cache: DirectWarmStartCache | None = None,
+    ):
         self.config = config
         self.fit_config = fit_config or FitConfig()
+        self.warm_start_cache = warm_start_cache
         self.fitted_: FittedModel | None = None
 
     def fit(self, data: DatasetBundle, exposure: Any = 1.0, seed: int = 0) -> FittedModel:
@@ -290,7 +458,11 @@ class UnifiedPUModel:
             )
             return self._pack(cell_shared, target_shared, residual, target_coeff, intercept)
 
-        direct_l2 = self.config.residual_l2 if self.config.kind == "joint" else self.config.shared_l2
+        direct_l2 = (
+            self.config.residual_l2
+            if self.config.kind == "joint"
+            else self.config.shared_l2
+        )
         direct_config = ModelConfig(
             name=f"{self.config.name}__initializer",
             kind="direct",
@@ -299,21 +471,74 @@ class UnifiedPUModel:
             target_l2=self.config.target_l2,
             pu=self.config.pu,
         )
-        direct_fit = UnifiedPUModel(
-            direct_config,
-            FitConfig(
-                maxiter=min(self.fit_config.maxiter, self.fit_config.init_direct_maxiter),
-                tolerance=max(self.fit_config.tolerance, 1e-7),
-                initialization="random",
-                init_direct_maxiter=self.fit_config.init_direct_maxiter,
-            ),
-        ).fit(
-            DatasetBundle(x, s, w, Y_target=target_features),
-            exposure=e,
-            seed=seed,
+        direct_fit_config = FitConfig(
+            maxiter=min(self.fit_config.maxiter, self.fit_config.init_direct_maxiter),
+            tolerance=max(self.fit_config.tolerance, 1e-7),
+            initialization="random",
+            init_direct_maxiter=self.fit_config.init_direct_maxiter,
         )
-        direct_coef = direct_fit.residual
-        assert direct_coef is not None
+
+        def fit_direct_initializer() -> _DirectWarmStart:
+            direct_fit = UnifiedPUModel(direct_config, direct_fit_config).fit(
+                DatasetBundle(x, s, w, Y_target=target_features),
+                exposure=e,
+                seed=seed,
+            )
+            direct_coef = direct_fit.residual
+            assert direct_coef is not None
+            return _DirectWarmStart(
+                residual=direct_coef,
+                target_coeff=direct_fit.target_coeff,
+                intercept=direct_fit.intercept,
+            )
+
+        if self.warm_start_cache is None:
+            direct_start = fit_direct_initializer()
+        else:
+            cache_key = _DirectWarmStartKey(
+                pu=self.config.pu,
+                residual_l2=direct_l2,
+                use_target_features=self.config.use_target_features,
+                target_l2=self.config.target_l2,
+                maxiter=direct_fit_config.maxiter,
+                tolerance=direct_fit_config.tolerance,
+                n_features=n_features,
+                n_targets=n_targets,
+                n_target_features=(
+                    target_features.shape[1]
+                    if self.config.use_target_features and target_features is not None
+                    else 0
+                ),
+            )
+            direct_start = self.warm_start_cache.get_or_create(
+                cache_key, fit_direct_initializer
+            )
+
+        direct_coef = np.asarray(direct_start.residual, dtype=np.float64)
+        expected_residual_shape = (n_features, n_targets)
+        if direct_coef.shape != expected_residual_shape or not np.all(
+            np.isfinite(direct_coef)
+        ):
+            raise ValueError("cached direct residual has invalid shape or values")
+        expected_target_shape = (
+            (n_features, target_features.shape[1])
+            if self.config.use_target_features and target_features is not None
+            else None
+        )
+        if expected_target_shape is None:
+            if direct_start.target_coeff is not None:
+                raise ValueError("cached direct target coefficient is unexpected")
+        elif (
+            direct_start.target_coeff is None
+            or direct_start.target_coeff.shape != expected_target_shape
+            or not np.all(np.isfinite(direct_start.target_coeff))
+        ):
+            raise ValueError("cached direct target coefficient has invalid shape or values")
+        if direct_start.intercept.shape != (n_targets,) or not np.all(
+            np.isfinite(direct_start.intercept)
+        ):
+            raise ValueError("cached direct intercept has invalid shape or values")
+
         u, singular, vt = np.linalg.svd(direct_coef, full_matrices=False)
         root = np.sqrt(np.maximum(singular[:rank], 0.0))
         cell_shared = u[:, :rank] * root[None, :]
@@ -325,8 +550,8 @@ class UnifiedPUModel:
             cell_shared,
             target_shared,
             residual,
-            direct_fit.target_coeff,
-            direct_fit.intercept,
+            direct_start.target_coeff,
+            direct_start.intercept,
         )
 
     def _pack(

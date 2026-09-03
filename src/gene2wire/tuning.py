@@ -12,7 +12,7 @@ from .checkpoint import AtomicCheckpointStore, unit_key
 from .config import FitConfig, ModelConfig, TuningConfig
 from .data import DatasetBundle
 from .metrics import masked_log_loss
-from .models import UnifiedPUModel
+from .models import DirectWarmStartCache, UnifiedPUModel
 from .seeds import stable_seed
 
 
@@ -249,6 +249,7 @@ def tune_model(
     checkpoint_store: AtomicCheckpointStore | None = None,
     checkpoint_fingerprint: str | None = None,
     checkpoint_context: Mapping[str, Any] | None = None,
+    warm_start_cache: DirectWarmStartCache | None = None,
 ) -> TuningResult:
     """Tune only on explicitly supplied train and validation bundles.
 
@@ -321,7 +322,11 @@ def tune_model(
                     if on_trial is not None:
                         on_trial(trial)
                     continue
-            fitted = UnifiedPUModel(config, fit_config).fit(
+            fitted = UnifiedPUModel(
+                config,
+                fit_config,
+                warm_start_cache=warm_start_cache,
+            ).fit(
                 train_safe, exposure=train_exposure, seed=trial_seed
             )
             q_validation = fitted.predict_observed(
