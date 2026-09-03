@@ -24,7 +24,7 @@ from .seeds import stable_seed
 from .tuning import TuningResult, tune_model
 
 
-CORE_API_VERSION = "0.2.0"
+CORE_API_VERSION = "0.3.0"
 
 
 @dataclass(frozen=True)

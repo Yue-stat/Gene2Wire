@@ -86,6 +86,60 @@ selected_hyperparameters = result.summary_rows()
 from model name to configuration, allowing different datasets/models to use
 different grids.
 
+## Matched adaptive API
+
+For grouped experiments that require float32 Adam, equal candidate budgets,
+warm-started rank screening, and an exact direct-model fallback, use the second
+generic runner:
+
+```python
+from gene2wire import (
+    AdaptiveFitConfig,
+    DatasetBundle,
+    MatchedModelConfig,
+    MatchedTuningConfig,
+    run_matched_model_grid,
+)
+
+result = run_matched_model_grid(
+    train=train_bundle,
+    validation=validation_bundle,
+    test_X=X_test,                       # still no outer-test labels
+    train_exposure=e_train,
+    validation_exposure=e_validation,
+    test_exposure=e_test,
+    validation_target_mask=eligible_targets,
+    models=(
+        MatchedModelConfig("Direct", "direct", pu=False),
+        MatchedModelConfig("PU direct", "direct", pu=True),
+        MatchedModelConfig("Low rank", "lowrank", pu=False),
+        MatchedModelConfig("PU low rank", "lowrank", pu=True),
+        MatchedModelConfig("Shared + residual", "joint", pu=False),
+        MatchedModelConfig("PU shared + residual", "joint", pu=True),
+    ),
+    tuning=MatchedTuningConfig(
+        direct_l2=(0, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2),
+        learning_rates=(0.005, 0.01),
+        ranks=(1, 2, 3, 4, 5, 6, 7),
+        shared_l2=(1e-6, 1e-5, 1e-4, 1e-3),
+        residual_l2=(1e-5, 1e-4, 1e-3, 1e-2),
+    ),
+    fit=AdaptiveFitConfig(max_epochs=70, batch_size=8192, patience=8),
+    checkpoint_dir="/persistent/path/checkpoints",
+    unit_context={"outer_fold": 0},
+    seed=42,
+    code_version="<CORE_COMMIT_SHA>",
+)
+```
+
+This runner gives every family the same candidate budget. Structured searches
+contain a frozen rank-zero copy of the matched direct parent, warm-start ranks
+from its coefficient matrix, refine the best nonzero rank, and accept the
+refitted structured model only through the paired target-level stability gate.
+If the gate rejects, returned fitted parameters and predictions are exactly the
+direct parent's. Final training remains on `train`; `validation` is used only
+for candidate selection and early stopping.
+
 ## Resume guarantees
 
 When `checkpoint_dir` is supplied:
@@ -108,4 +162,5 @@ python -m pytest -q
 ```
 
 Tests cover gradients, grid construction, reference-truth isolation, atomic
-array integrity, and completed-model resume.
+array integrity, candidate/model resume, matched budgets, and exact structured
+fallback identity.

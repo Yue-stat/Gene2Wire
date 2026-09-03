@@ -22,6 +22,8 @@ def test_core_source_contains_no_dataset_specific_name():
     root = Path(__file__).resolve().parents[1] / "src" / "gene2wire"
     text = "\n".join(path.read_text(encoding="utf-8") for path in root.glob("*.py"))
     assert "SPIDER" not in text
+    assert "Projection-TAGs" not in text
+    assert "GSE277718" not in text
 
 
 def test_gradient_for_all_structures():
