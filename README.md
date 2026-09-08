@@ -1,120 +1,171 @@
 # Gene2Wire
 
-Gene2Wire is a data-agnostic implementation of matched logistic, PU-logistic,
-MIRT, PU-MIRT, joint, and PU-joint projection models.
+Gene2Wire predicts neuronal projection outcomes from measured cellular features
+under incomplete detection. The repository contains one shared implementation
+of independent logistic, low-rank MIRT, and shared-plus-specific Joint models,
+with matched ordinary and positive-unlabeled (PU) likelihoods. The 0908 release
+also includes shared dataset adapters, experiment controls, checkpointing,
+evaluation, and OnDemand notebooks.
 
-This repository deliberately contains only the reusable model layer. Raw-data
-download, dataset-specific filtering, feature construction, hiding mechanisms,
-splitting, calibration, evaluation, and plotting belong in dataset notebooks.
+**The 0908 notebooks define a new harmonized protocol. Earlier paper numbers do
+not become 0908 results without rerunning.** Tests and small execution checks
+validate implementation; they do not replace the full experiments or establish
+that one method outperforms another.
 
-## One model source for every dataset
+## Paper experiment entry points
 
-Dataset-specific processing and evaluation are intentionally kept outside this
-repository. Every SPIDER, BARseq, Projection-TAGs, and simulation notebook uses
-this repository's single `main` branch. There are no dataset model branches.
+Open one of these notebooks in an OnDemand Python kernel and run its cells from
+top to bottom. Figures display in the notebook and save as PDF; raw data,
+checkpoints, full metric tables, and predictions persist on disk.
 
-At startup, each notebook resolves `main` once to its current commit SHA,
-installs exactly that snapshot, and records the SHA in its checkpoint
-fingerprint and run manifest. This keeps one shared model implementation while
-making every completed run exactly auditable and resumable.
+| Notebook | Experiment |
+|---|---|
+| [simulation_0908.ipynb](simulation_0908.ipynb) | Sharing strengths 0, 0.5, 1; 0–80% loss curves and declared mechanism/calibration controls |
+| [Projection_TAGs_0908.ipynb](Projection_TAGs_0908.ipynb) | Natural paired standard versus standard-or-amplified reference; no artificial loss curve |
+| [SPIDER_0908.ipynb](SPIDER_0908.ipynb) | Spatial holdout and controlled 0–80% positive thinning |
+| [MERGE_seq_0908.ipynb](MERGE_seq_0908.ipynb) | Whole-sample holdout and controlled 0–80% positive thinning |
+| [BARseq_0908.ipynb](BARseq_0908.ipynb) | A1 and M1 fitted and reported separately; within-animal depth holdout |
 
-## Core data contract
+Legacy notebooks under `archive/legacy/` document previous implementations. They
+are not alternative entry points for this protocol and must not supply numbers
+to the new result exports.
 
-| Value | Shape | Meaning |
-|---|---:|---|
-| `X_cell` | cells × features | Numeric cell predictors |
-| `S_observed` | cells × targets | Observed positives; zero is PU-unlabeled |
-| `W_measured` | cells × targets | Entries allowed to enter the likelihood |
-| `Y_target` | targets × covariates | Optional target features |
-| `exposure` | broadcastable to cells × targets | Detection probability for PU models, with `q = exposure × p` |
-
-Pre-hide truth and hidden-positive masks are evaluation objects. They must stay
-outside the core. `run_model_grid` intentionally accepts outer-test `X` rather
-than an outer-test label bundle.
-
-## Install
-
-All dataset notebooks use the same public `main`:
-
-```bash
-python -m pip install \
-  "git+https://github.com/Yue-stat/Gene2Wire.git@main"
-```
-
-For an atomic run, resolve `main` to a SHA at notebook startup and install that
-resolved snapshot. Do not create or select a dataset-specific branch.
-
-## Generic API
+Every notebook starts with the same defaults:
 
 ```python
-from gene2wire import (
-    DatasetBundle,
-    FitConfig,
-    ModelConfig,
-    TuningConfig,
-    run_model_grid,
-)
-
-result = run_model_grid(
-    train=train_bundle,                 # X, post-hiding observed labels, W
-    validation=validation_bundle,
-    test_X=X_test,                      # no test truth enters the core
-    train_exposure=e_train,
-    validation_exposure=e_validation,
-    test_exposure=e_test,
-    test_cell_ids=test_ids,
-    models=(
-        ModelConfig(name="Logistic", kind="direct", pu=False),
-        ModelConfig(name="PU logistic", kind="direct", pu=True),
-        ModelConfig(name="MIRT", kind="lowrank", rank=4, pu=False),
-        ModelConfig(name="PU-MIRT", kind="lowrank", rank=4, pu=True),
-        ModelConfig(name="Joint", kind="joint", rank=4, pu=False),
-        ModelConfig(name="PU-Joint", kind="joint", rank=4, pu=True),
-    ),
-    tuning=TuningConfig(
-        strategy="full_joint",
-        ranks=(2, 4, 8, 12),
-        shared_l2=(1e-5, 1e-3, 1e-2),
-        residual_l2=(1e-5, 1e-3, 1e-2),
-        target_l2=(1e-3,),
-    ),
-    fit=FitConfig(maxiter=500),
-    checkpoint_dir="/persistent/path/checkpoints",
-    unit_context={"outer_fold": 0, "condition": "condition_a"},
-    seed=20260903,
-    code_version="<CORE_COMMIT_SHA>",
-)
-
-latent_p = result.models["PU-MIRT"].latent_probability
-observed_q = result.models["PU-MIRT"].observed_probability
-selected_hyperparameters = result.summary_rows()
+N_OUTER_FOLDS = 3
+USE_LOCATION = False
+USE_TARGET_FEATURES = False
+N_JOBS = 32
+N_REPETITIONS = 5
+STRATEGY = 'full_joint'
 ```
 
-`tuning` and `fit` are ordinary inputs to the same runner. A dataset may supply
-a dimension-appropriate grid, but it never selects different model code.
+`full_joint` searches simultaneous rank/penalty combinations from a deterministic
+bounded Cartesian grid. The common profile caps selectable configurations at
+32 per method and includes exact direct and residual-off candidates in Joint's
+budget. It does not imply exhaustive evaluation of an arbitrarily large grid.
+Actual candidates and selected configurations are exported.
 
-## Resume guarantees
+In simulation, the default `truth_uses_location = USE_LOCATION` controls the
+generated projection signal as well as predictor inputs. Gene-only simulation
+therefore does not silently generate a location-dependent truth. Five
+repetitions generate five independent datasets per sharing strength; each
+dataset contributes three outer spatial folds. Aggregate its folds before
+calculating uncertainty across independent generated datasets.
 
-When `checkpoint_dir` is supplied:
+Read [the experiment protocol](docs/PROTOCOL_0908.md) for the observation model,
+paired-reference access rules, exact endpoints, information-budget baselines,
+scoring ablations, calibration controls, and statistical interpretation.
 
-1. Every completed hyperparameter candidate is saved atomically.
-2. Every completed selected/refitted model saves checksummed fitted parameters
-   and test predictions.
-3. Deterministic direct-model SVD warm starts are reused across compatible
-   MIRT/joint candidates and checkpointed for runtime-disconnect recovery.
-4. The fingerprint covers arrays, IDs/order, exposure, hyperparameters, seed
-   policy, semantic unit context, and pinned code version.
+## Environment and frozen code
 
-After a runtime disconnect, completed candidates are skipped and completed
-models are restored without refitting. Changed data or settings produce a new
-fingerprint rather than silently reusing stale results.
-
-## Validation
+Use Python 3.10 or newer and a configured kernel with the experiment dependencies.
+The notebooks never run `pip`, modify an installed model, or install into a
+read-only OnDemand environment. From an activated **user-owned environment** and
+the released repository checkout, install once:
 
 ```bash
-python -m pip install -e ".[test]"
+python -m pip install ".[experiments,notebooks]"
+python -m ipykernel install --user --name gene2wire-0908 --display-name "Gene2Wire 0908"
+```
+
+Select **Gene2Wire 0908** in OnDemand. Complete setup, offline-cache instructions,
+and common runtime fixes are in [ONDEMAND_0908.md](docs/ONDEMAND_0908.md).
+
+Released notebooks embed a 40-character `CORE_COMMIT` and a SHA256 of all
+`src/gene2wire` Python sources. They load that immutable snapshot, not whatever
+`main` contains on the day of a run. A matching local source tree works offline;
+otherwise the exact commit is downloaded once to the code cache. Later runs
+verify local bytes. A previously imported package with a different path or
+checksum requires a kernel restart.
+
+Dependency version ranges describe supported installation requirements; they
+are not an exact environment lock. Each result manifest records the numerical
+library versions used for that run. Preserve the environment alongside the
+source pin when reproducing its numerical results.
+
+## Persistent outputs
+
+The default base directory is `/home/yueyue/gene2wire`:
+
+| Directory | Contents |
+|---|---|
+| `raw_data/` | Downloaded source data, validation manifests, reusable processed expression, generated simulation arrays |
+| `code/<CORE_COMMIT>/` | Verified immutable source checkout, when a matching local checkout is unavailable |
+| `checkpoints/0908/` | Atomic compatible tuning/model checkpoints |
+| `paper_figure_exports/<dataset>_0908/<run_id>/` | Manifest, complete CSV tables, per-unit audits, saved test predictions and masks |
+| `figures/0908/` | PDF figures; the same figures display in the notebook |
+
+There is no Google Drive dependency. The first uncached run needs internet
+access to obtain code and raw sources. Validated files are reused offline on
+subsequent runs. Hash mismatches raise an error rather than accepting changed
+data or downloading a different file silently.
+
+Completed compatible work resumes after a kernel disconnect. Scientific
+settings, actual code contents, data, splits, and seeds participate in run/fit
+identity. Changing only `N_JOBS` changes concurrency, not the scientific setting.
+Worker count is capped at available fold/repetition units; numerical libraries
+and random forests use one inner thread to avoid nested parallelism.
+
+## Feature switches and measurement scope
+
+| Dataset | `USE_LOCATION=True` | `USE_TARGET_FEATURES=True` |
+|---|---|---|
+| Simulation | Generated location basis; also enters truth under the notebook default | Generated, declared target descriptors |
+| Projection-TAGs | Native coarse source origin (MO/SSC), or an aligned external location CSV | Requires an aligned external target-feature CSV |
+| SPIDER | Native measured spatial covariates | Requires an aligned external target-feature CSV |
+| MERGE-seq | Requires an aligned external physical-location CSV; pseudotime is not substituted | Requires an aligned external target-feature CSV |
+| BARseq A1/M1 | Native depth/angle covariates with training-fitted spline bases | Anatomy descriptors derived from target names; not postsynaptic gene expression |
+
+External feature rows must align to explicit cell/target IDs and describe
+outcome-independent covariates. A missing required input raises an error before
+fitting; enabling a switch never silently invents features. Preprocessing and
+variable-gene selection are fitted on the appropriate training stage only.
+
+Projection-TAGs retains strictly matched cells, excludes Parse, and keeps the
+five prespecified excitatory classes from the audited cohort. Filter counts are
+exported. MERGE's default three folds partition four whole samples into test
+groups of two/one/one samples; four-fold leave-one-sample-out is also available.
+BARseq spatial folds are within-animal, not animal-held-out tests.
+
+## Model and reference semantics
+
+The model core receives `X_cell`, observed labels `S_observed`, assayed-entry
+mask `W_measured`, optional `Y_target`, and estimated detection probabilities.
+Structurally unassayed entries never become negative examples. Evaluation
+references stay outside model selection. Authorized paired training references
+enter only through explicit calibration/reference-supervision views.
+
+Ordinary models, including observed-only random forests, estimate detection
+probability `q`. PU and reference-supervised predictors estimate reference-relative
+projection probability `p`, with observed probability `q = e_hat * p`. An ordinary
+random forest is not a PU random forest. A higher-sensitivity assay reference is
+not complete anatomical truth.
+
+The optional Qiao comparison is disabled by default and restricted to simulation
+with declared target descriptors and a matched target-feature information budget.
+It distinguishes the original squared-error bilinear objective from a logistic
+adaptation. Native real-data target anatomy labels are not equivalent to the
+postsynaptic expression inputs of the original model.
+
+## Tests and development
+
+From a user-owned development environment:
+
+```bash
+python -m pip install -e ".[test,experiments,notebooks]"
 python -m pytest -q
 ```
 
-Tests cover gradients, grid construction, reference-truth isolation, atomic
-array integrity, and completed-model resume.
+CI runs the suite on Python 3.10–3.13. Tests cover analytic gradients, observation
+and reference-access boundaries, exact endpoints, deterministic search/resume,
+dataset alignment and offline cache fixtures, feature switches, calibration,
+scoring, and clean notebook generation. They use small local fixtures and do not
+download full research datasets or execute the formal paper training matrix.
+
+The reusable model API remains in `src/gene2wire/`; shared experiment code is in
+`src/gene2wire/experiments/`. The five notebooks are generated by
+`scripts/build_notebooks_0908.py` and contain configuration, dataset calls, plots,
+and reporting. Source changes require new pins and corresponding reruns before
+their outputs can be treated as one experiment version.

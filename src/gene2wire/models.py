@@ -23,6 +23,22 @@ from .data import DatasetBundle
 Array = NDArray[np.float64]
 
 
+def canonical_model_config(config: ModelConfig) -> ModelConfig:
+    """Resolve exact structural aliases without using a penalty approximation."""
+
+    if config.kind == "joint" and config.rank == 0:
+        return config.with_updates(kind="direct", shared_l2=0.0)
+    return config
+
+
+def model_identity(config: ModelConfig) -> dict[str, Any]:
+    """Statistical fit identity: a display name never changes the optimization."""
+
+    result = asdict(canonical_model_config(config))
+    result.pop("name")
+    return result
+
+
 @dataclass(frozen=True)
 class _DirectWarmStartKey:
     """Everything that changes a deterministic direct-model initializer.
@@ -255,7 +271,11 @@ class FittedModel:
         return eta
 
     def predict_proba(self, x_cell: Any) -> Array:
-        """Latent biological probability p(y=1|x)."""
+        """Return p for a PU/reference fit, or observed q for a non-PU fit.
+
+        The method name is retained for compatibility.  A non-PU predictor
+        trained on detections does not identify reference/biological p.
+        """
 
         return expit(self.latent_logit(x_cell))
 
@@ -266,6 +286,15 @@ class FittedModel:
         if not self.config.pu:
             return p
         return _exposure_matrix(exposure, p.shape) * p
+
+    def predict_hidden(self, x_cell: Any, exposure: Any) -> Array:
+        """Return Pr(P=1 | D=0, X, exposure) for a fitted PU predictor."""
+
+        if not self.config.pu:
+            raise ValueError("hidden-positive posterior requires a PU/reference predictor")
+        p = self.predict_proba(x_cell)
+        e = _exposure_matrix(exposure, p.shape)
+        return np.divide((1.0 - e) * p, np.maximum(1.0 - e * p, np.finfo(float).tiny))
 
     def state_dict(self) -> dict[str, Any]:
         """Return a serialization-friendly state mapping."""
@@ -348,7 +377,7 @@ class UnifiedPUModel:
         fit_config: FitConfig | None = None,
         warm_start_cache: DirectWarmStartCache | None = None,
     ):
-        self.config = config
+        self.config = canonical_model_config(config)
         self.fit_config = fit_config or FitConfig()
         self.warm_start_cache = warm_start_cache
         self.fitted_: FittedModel | None = None
@@ -390,6 +419,29 @@ class UnifiedPUModel:
                 "maxls": 30,
             },
         )
+        iterations = int(result.nit)
+        retried = False
+        if (
+            not result.success
+            and self.fit_config.retry_maxiter > 0
+            and np.isfinite(result.fun)
+            and np.all(np.isfinite(result.x))
+        ):
+            # Continue from the same solution, with the same objective and
+            # tolerance.  Never change a penalty or seed to obtain convergence.
+            retry = minimize(
+                fun, result.x, method="L-BFGS-B", jac=True,
+                options={
+                    "maxiter": self.fit_config.retry_maxiter,
+                    "ftol": self.fit_config.tolerance,
+                    "gtol": self.fit_config.tolerance,
+                    "maxls": 30,
+                },
+            )
+            iterations += int(retry.nit)
+            retried = True
+            if np.isfinite(retry.fun) and np.all(np.isfinite(retry.x)):
+                result = retry
         if not np.isfinite(result.fun) or not np.all(np.isfinite(result.x)):
             raise FloatingPointError("optimizer produced non-finite parameters")
         b_shared, a_shared, residual, target_coeff, intercept = self._unpack(
@@ -405,8 +457,8 @@ class UnifiedPUModel:
             intercept=intercept,
             objective=float(result.fun),
             converged=bool(result.success),
-            iterations=int(result.nit),
-            message=str(result.message),
+            iterations=iterations,
+            message=("deterministic continuation: " if retried else "") + str(result.message),
         )
         self.fitted_ = fitted
         return fitted

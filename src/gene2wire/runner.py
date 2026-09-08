@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -15,6 +15,7 @@ from .checkpoint import (
     canonical_json,
     experiment_fingerprint,
     sha256_array,
+    sha256_source_tree,
     unit_key,
 )
 from .config import FitConfig, ModelConfig, TuningConfig
@@ -24,12 +25,13 @@ from .models import (
     FittedModel,
     UnifiedPUModel,
     _exposure_matrix,
+    model_identity,
 )
 from .seeds import stable_seed
 from .tuning import TuningResult, tune_model
 
 
-CORE_API_VERSION = "0.2.1"
+CORE_API_VERSION = "0.3.0"
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,8 @@ class ModelRunResult:
         return {
             "model": self.model_name,
             "kind": config.kind,
+            "selected_structure": config.kind,
+            "probability_semantics": "reference_p" if config.pu else "observed_q",
             "pu": config.pu,
             "rank": config.rank,
             "shared_l2": config.shared_l2,
@@ -214,6 +218,7 @@ def run_model_grid(
     fit: FitConfig | Mapping[str, FitConfig] | None = None,
     refit: DatasetBundle | None = None,
     refit_exposure: Any | None = None,
+    refit_test_X: Any | None = None,
     test_cell_ids: Sequence[Any] | None = None,
     checkpoint_dir: str | Path | None = None,
     unit_context: Mapping[str, Any] | None = None,
@@ -224,7 +229,11 @@ def run_model_grid(
 ) -> GridRunResult:
     """Tune and refit multiple models without access to evaluation truth.
 
-    ``train`` and ``validation`` must contain only observed PU labels.  The
+    ``train`` and ``validation`` must contain authorized training labels only.
+    Clean-reference supervision is compiled upstream as labels with exposure 1;
+    validation always retains its original detections and calibrated exposure.
+    ``refit_test_X`` explicitly supplies the same test cells transformed by a
+    development-refitted preprocessor, permitting a new feature schema. The
     outer-test interface deliberately accepts ``test_X`` rather than a bundle,
     so hidden masks and pre-hide reference labels cannot enter model selection.
     Candidate trials, reusable direct warm starts, and completed fitted
@@ -270,13 +279,26 @@ def run_model_grid(
         development_e = np.concatenate([train_e, validation_e], axis=0)
     else:
         _require_reference_free("refit", refit)
-        _assert_aligned(train, refit, "train/refit")
+        if refit_test_X is None:
+            _assert_aligned(train, refit, "train/refit")
+        elif train.target_ids != refit.target_ids:
+            raise ValueError("train/refit target_ids differ or are permuted")
         if set(refit.cell_ids) != set((*train.cell_ids, *validation.cell_ids)):
             raise ValueError("refit cell IDs must equal the train/validation union")
         if refit_exposure is None:
             raise ValueError("refit_exposure is required when refit is supplied")
         development = refit
         development_e = _exposure_matrix(refit_exposure, refit.S_observed.shape)
+
+    final_test_array = test_array if refit_test_X is None else np.asarray(refit_test_X, dtype=np.float64)
+    if refit_test_X is not None and refit is None:
+        raise ValueError("refit_test_X requires an explicit refit bundle")
+    if (
+        final_test_array.ndim != 2
+        or final_test_array.shape != (len(test_ids), development.n_features)
+        or not np.all(np.isfinite(final_test_array))
+    ):
+        raise ValueError("refit_test_X must align with test cells and the refit feature schema")
 
     context = dict(unit_context or {})
     reserved = {"task", "model", "runner_model"}
@@ -285,42 +307,53 @@ def run_model_grid(
     if any(not isinstance(key, str) or not key for key in context):
         raise ValueError("unit_context keys must be nonempty strings")
 
+    if run_fingerprint is not None and (not isinstance(run_fingerprint, str) or not run_fingerprint):
+        raise ValueError("run_fingerprint must be None or a nonempty string")
     semantic_config = {
-        "models": [asdict(model) for model in base_models],
-        "tuning": {
-            model.name: asdict(_resolve_tuning(tuning, model.name)) for model in base_models
-        },
-        "fit": {model.name: asdict(_resolve_fit(fit, model.name)) for model in base_models},
         "unit_context": context,
         "refit_supplied": refit is not None,
+        "refit_preprocessing_supplied": refit_test_X is not None,
+        "caller_fingerprint": run_fingerprint,
     }
     input_hashes = {
         "train": _bundle_hash(train),
         "validation": _bundle_hash(validation),
         "refit": _bundle_hash(development),
         "test_X": sha256_array(test_array),
+        "refit_test_X": sha256_array(final_test_array),
         "test_cell_ids": sha256_array(np.asarray(test_ids, dtype=str)),
         "train_exposure": sha256_array(train_e),
         "validation_exposure": sha256_array(validation_e),
         "refit_exposure": sha256_array(development_e),
         "test_exposure": sha256_array(test_e),
     }
-    fingerprint = run_fingerprint or experiment_fingerprint(
-        semantic_config,
-        input_hashes=input_hashes,
-        code_version=code_version,
-        seeds={"base_seed": seed},
+    source_hash = sha256_source_tree(Path(__file__).resolve().parent)
+    # The caller fingerprint supplements, never overrides, data/config/source
+    # identity. This shared identity deliberately excludes the model list.
+    data_fingerprint = experiment_fingerprint(
+        semantic_config, input_hashes=input_hashes, code_version=code_version,
+        seeds={"base_seed": seed}, source_hash=source_hash,
     )
-    if not isinstance(fingerprint, str) or not fingerprint:
-        raise ValueError("run_fingerprint must be None or a nonempty string")
+    model_fingerprints = {
+        model.name: experiment_fingerprint(
+            {"data_fingerprint": data_fingerprint, "model": asdict(model),
+             "tuning": asdict(_resolve_tuning(tuning, model.name)),
+             "fit": asdict(_resolve_fit(fit, model.name))},
+            input_hashes=input_hashes, code_version=code_version,
+            seeds={"base_seed": seed}, source_hash=source_hash,
+        ) for model in base_models
+    }
+    fingerprint = hashlib.sha256(canonical_json(model_fingerprints).encode("utf-8")).hexdigest()
 
     trial_store = None
     model_store = None
     warm_start_store = None
+    refit_store = None
     if checkpoint_dir is not None:
         checkpoint_root = Path(checkpoint_dir)
         trial_store = AtomicCheckpointStore(checkpoint_root / "trials")
         model_store = AtomicArrayCheckpointStore(checkpoint_root / "models")
+        refit_store = AtomicArrayCheckpointStore(checkpoint_root / "refits")
         warm_start_store = AtomicArrayCheckpointStore(
             checkpoint_root / "warm_starts"
         )
@@ -332,19 +365,31 @@ def run_model_grid(
     # numerically unchanged.
     tuning_warm_starts = DirectWarmStartCache(
         checkpoint_store=warm_start_store,
-        fingerprint=fingerprint if warm_start_store is not None else None,
+        fingerprint=data_fingerprint if warm_start_store is not None else None,
         context={"phase": "tuning", "runner_context": context},
     )
     refit_warm_starts = DirectWarmStartCache(
         checkpoint_store=warm_start_store,
-        fingerprint=fingerprint if warm_start_store is not None else None,
+        fingerprint=data_fingerprint if warm_start_store is not None else None,
         context={"phase": "refit", "runner_context": context},
     )
+
+    candidate_cache = {}
+    final_fit_cache = {}
+
+    def final_coordinates(config: ModelConfig, fit_config: FitConfig) -> tuple[str, int]:
+        identity = model_identity(config)
+        final_seed = stable_seed(
+            seed, "refit", config.kind, config.rank, config.use_target_features,
+        )
+        return unit_key(task="canonical_refit", context=context, candidate=identity,
+                        fit=asdict(fit_config), seed=final_seed), final_seed
 
     results: dict[str, ModelRunResult] = {}
     for base_model in base_models:
         model_key = unit_key(task="completed_model", **context, model=base_model.name)
-        cached = None if model_store is None else model_store.load(model_key, fingerprint)
+        model_fingerprint = model_fingerprints[base_model.name]
+        cached = None if model_store is None else model_store.load(model_key, model_fingerprint)
         if cached is not None:
             payload = cached["payload"]
             arrays = cached["arrays"]
@@ -370,6 +415,8 @@ def run_model_grid(
                 resumed=True,
             )
             results[base_model.name] = result
+            refit_key, _ = final_coordinates(tuned.best_config, _resolve_fit(fit, base_model.name))
+            final_fit_cache[refit_key] = fitted_model
             if on_model is not None:
                 on_model(base_model.name, "resumed")
             continue
@@ -378,12 +425,7 @@ def run_model_grid(
             on_model(base_model.name, "started")
         model_tuning = _resolve_tuning(tuning, base_model.name)
         model_fit = _resolve_fit(fit, base_model.name)
-        tuning_seed = stable_seed(
-            seed,
-            "tune",
-            base_model.kind,
-            base_model.use_target_features,
-        )
+        tuning_seed = stable_seed(seed, "tune")
         tuned = tune_model(
             train=train,
             validation=validation,
@@ -394,28 +436,31 @@ def run_model_grid(
             fit=model_fit,
             seed=tuning_seed,
             checkpoint_store=trial_store,
-            checkpoint_fingerprint=fingerprint if trial_store is not None else None,
-            checkpoint_context={**context, "runner_model": base_model.name},
+            checkpoint_fingerprint=data_fingerprint if trial_store is not None else None,
+            checkpoint_context=context,
             warm_start_cache=tuning_warm_starts,
+            candidate_cache=candidate_cache,
         )
-        final_seed = stable_seed(
-            seed,
-            "refit",
-            tuned.best_config.kind,
-            tuned.best_config.rank,
-            tuned.best_config.use_target_features,
-        )
-        fitted_model = UnifiedPUModel(
-            tuned.best_config,
-            model_fit,
-            warm_start_cache=refit_warm_starts,
-        ).fit(
-            development,
-            exposure=development_e,
-            seed=final_seed,
-        )
-        latent = fitted_model.predict_proba(test_array)
-        observed = fitted_model.predict_observed(test_array, exposure=test_e)
+        refit_key, final_seed = final_coordinates(tuned.best_config, model_fit)
+        fitted_model = final_fit_cache.get(refit_key)
+        if fitted_model is None and refit_store is not None:
+            cached_refit = refit_store.load(refit_key, data_fingerprint)
+            if cached_refit is not None:
+                fitted_model = _state_from_checkpoint(cached_refit["payload"]["fitted"], cached_refit["arrays"])
+                if model_identity(fitted_model.config) != model_identity(tuned.best_config):
+                    raise ValueError("canonical refit checkpoint configuration does not match")
+        if fitted_model is None:
+            fitted_model = UnifiedPUModel(tuned.best_config, model_fit, warm_start_cache=refit_warm_starts).fit(
+                development, exposure=development_e, seed=final_seed,
+            )
+            if refit_store is not None:
+                metadata, arrays = _state_to_checkpoint(fitted_model)
+                refit_store.save_complete(refit_key, data_fingerprint, {"fitted": metadata}, arrays)
+        final_fit_cache[refit_key] = fitted_model
+        # Preserve the reporting alias while reusing the exact canonical fit.
+        fitted_model = replace(fitted_model, config=tuned.best_config)
+        latent = fitted_model.predict_proba(final_test_array)
+        observed = fitted_model.predict_observed(final_test_array, exposure=test_e)
         result = ModelRunResult(
             model_name=base_model.name,
             tuning=tuned,
@@ -428,7 +473,7 @@ def run_model_grid(
             fitted_metadata, fitted_arrays = _state_to_checkpoint(fitted_model)
             model_store.save_complete(
                 model_key,
-                fingerprint,
+                model_fingerprint,
                 {
                     "model_name": base_model.name,
                     "base_config": asdict(base_model),

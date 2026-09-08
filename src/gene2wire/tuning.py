@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from itertools import product
-from typing import Any, Callable, Iterable, Mapping
+from pathlib import Path
+from typing import Any, Callable, Iterable, Mapping, MutableMapping
 
 import numpy as np
 
-from .checkpoint import AtomicCheckpointStore, unit_key
+from .checkpoint import (
+    AtomicCheckpointStore, canonical_json, experiment_fingerprint,
+    sha256_array, sha256_source_tree, unit_key,
+)
 from .config import FitConfig, ModelConfig, TuningConfig
 from .data import DatasetBundle
 from .metrics import masked_log_loss
-from .models import DirectWarmStartCache, UnifiedPUModel
+from .models import DirectWarmStartCache, UnifiedPUModel, canonical_model_config, model_identity
 from .seeds import stable_seed
 
 
@@ -88,7 +92,11 @@ class TuningResult:
 
 
 def full_joint_candidates(base: ModelConfig, tuning: TuningConfig) -> tuple[ModelConfig, ...]:
-    """Enumerate the complete relevant Cartesian grid, without duplicates."""
+    """Enumerate the relevant grid, with optional exact endpoints and budget cap.
+
+    A finite budget selects a deterministic, evenly spaced subset of each
+    structural family.  It is a bounded Cartesian search, not a staged fit.
+    """
 
     candidates: list[ModelConfig] = []
     target_grid = tuning.target_l2 if base.use_target_features else (base.target_l2,)
@@ -138,6 +146,16 @@ def full_joint_candidates(base: ModelConfig, tuning: TuningConfig) -> tuple[Mode
                     )
                 )
 
+    if base.kind == "joint" and tuning.include_endpoints:
+        # Exact endpoints are independent optimization structures, not zero or
+        # very large residual-penalty approximations.
+        direct = base.with_updates(kind="direct", rank=0, shared_l2=0.0)
+        candidates.extend(full_joint_candidates(direct, replace(tuning, candidate_budget=None)))
+        if any(rank > 0 for rank in tuning.ranks):
+            lowrank = base.with_updates(kind="lowrank", rank=max(1, base.rank), residual_l2=0.0)
+            candidates.extend(full_joint_candidates(lowrank, replace(tuning, candidate_budget=None)))
+        candidates = [canonical_model_config(config) for config in candidates]
+
     unique: dict[tuple[Any, ...], ModelConfig] = {}
     for config in candidates:
         key = (
@@ -152,7 +170,34 @@ def full_joint_candidates(base: ModelConfig, tuning: TuningConfig) -> tuple[Mode
         unique[key] = config
     if not unique:
         raise ValueError(f"grid has no valid candidates for model kind {base.kind!r}")
-    return tuple(unique.values())
+    return _budget_candidates(tuple(unique.values()), tuning.candidate_budget)
+
+
+def _budget_candidates(
+    candidates: tuple[ModelConfig, ...], budget: int | None
+) -> tuple[ModelConfig, ...]:
+    """Allocate an equal initial share to each structure, then use spare slots.
+
+    The order is based only on the declared grid. No labels or scores are used.
+    """
+
+    if budget is None or len(candidates) <= budget:
+        return candidates
+    groups = {}
+    for candidate in candidates:
+        groups.setdefault(candidate.kind, []).append(candidate)
+    if budget < len(groups):
+        raise ValueError("candidate_budget is too small to retain every requested structure")
+    allocation = {kind: 0 for kind in groups}
+    for _ in range(budget):
+        available = [kind for kind in groups if allocation[kind] < len(groups[kind])]
+        chosen = min(available, key=lambda kind: (allocation[kind], list(groups).index(kind)))
+        allocation[chosen] += 1
+    chosen = []
+    for kind, values in groups.items():
+        indices = np.linspace(0, len(values) - 1, allocation[kind], dtype=int)
+        chosen.extend(values[int(index)] for index in indices)
+    return tuple(chosen)
 
 
 def _stage_one_candidates(base: ModelConfig, tuning: TuningConfig) -> tuple[ModelConfig, ...]:
@@ -170,9 +215,22 @@ def _stage_one_candidates(base: ModelConfig, tuning: TuningConfig) -> tuple[Mode
                 target_l2=tuning.anchor_target_l2 if base.use_target_features else base.target_l2,
             )
         )
+    if base.kind == "joint" and tuning.include_endpoints:
+        candidates = [canonical_model_config(config) for config in candidates]
+        candidates.append(base.with_updates(
+            kind="direct", rank=0, shared_l2=0.0,
+            residual_l2=tuning.anchor_residual_l2,
+            target_l2=tuning.anchor_target_l2 if base.use_target_features else 0.0,
+        ))
+        candidates.extend(base.with_updates(
+            kind="lowrank", rank=rank, shared_l2=tuning.anchor_shared_l2,
+            residual_l2=0.0,
+            target_l2=tuning.anchor_target_l2 if base.use_target_features else 0.0,
+        ) for rank in tuning.ranks if rank > 0)
     if not candidates:
         raise ValueError("staged rank grid has no valid candidates")
-    return tuple(candidates)
+    unique = {canonical_json(model_identity(candidate)): candidate for candidate in candidates}
+    return tuple(unique.values())
 
 
 def _stage_two_candidates(
@@ -188,6 +246,8 @@ def _stage_two_candidates(
         anchor_residual_l2=tuning.anchor_residual_l2,
         anchor_target_l2=tuning.anchor_target_l2,
         metric=tuning.metric,
+        candidate_budget=None,
+        include_endpoints=False,
     )
     return full_joint_candidates(base, narrowed)
 
@@ -250,6 +310,7 @@ def tune_model(
     checkpoint_fingerprint: str | None = None,
     checkpoint_context: Mapping[str, Any] | None = None,
     warm_start_cache: DirectWarmStartCache | None = None,
+    candidate_cache: MutableMapping[str, TrialResult] | None = None,
 ) -> TuningResult:
     """Tune only on explicitly supplied train and validation bundles.
 
@@ -276,84 +337,83 @@ def tune_model(
     train_safe = train.without_reference()
     validation_safe = validation.without_reference()
     trials: list[TrialResult] = []
+    # Also protect standalone tune_model callers: a supplied cache namespace is
+    # never permission to reuse scores for different labels or exposures.
+    hashes = {}
+    for phase, bundle, exposure in (
+        ("train", train_safe, train_exposure),
+        ("validation", validation_safe, validation_exposure),
+    ):
+        for key in ("X_cell", "S_observed", "W_measured"):
+            hashes[f"{phase}_{key}"] = sha256_array(getattr(bundle, key))
+        hashes[f"{phase}_exposure"] = sha256_array(np.asarray(exposure, dtype=float))
+        hashes[f"{phase}_cell_ids"] = sha256_array(np.asarray(bundle.cell_ids, dtype=str))
+        hashes[f"{phase}_target_ids"] = sha256_array(np.asarray(bundle.target_ids, dtype=str))
+        if bundle.Y_target is not None:
+            hashes[f"{phase}_Y_target"] = sha256_array(bundle.Y_target)
+    cache_fingerprint = experiment_fingerprint(
+        {"caller_fingerprint": checkpoint_fingerprint, "context": context},
+        input_hashes=hashes, code_version="canonical-tuning-0908",
+        seeds={"seed": int(seed)},
+        source_hash=sha256_source_tree(Path(__file__).resolve().parent),
+    )
+
+    memory = {} if candidate_cache is None else candidate_cache
 
     def evaluate(candidates: Iterable[ModelConfig], stage: str) -> tuple[TrialResult, ...]:
         stage_trials: list[TrialResult] = []
-        for config in candidates:
+        for requested_config in candidates:
+            config = canonical_model_config(requested_config)
             trial_index = len(trials)
+            identity = model_identity(config)
+            # Matched PU/non-PU fits use the same starting randomness.  The
+            # likelihood, not an unrelated seed, is their experimental contrast.
             trial_seed = stable_seed(
-                seed,
-                "model_initialization",
-                config.kind,
-                config.rank,
+                seed, "model_initialization", config.kind, config.rank,
                 config.use_target_features,
             )
-            coordinates = dict(context)
-            coordinates.update(
-                {
-                    "tuning_model": base_model.name,
-                    "tuning_stage": stage,
-                    "candidate": asdict(config),
-                    "trial_seed": trial_seed,
-                }
-            )
+            coordinates = {
+                **context,
+                "candidate": identity,
+                "fit": asdict(fit_config),
+                "trial_seed": trial_seed,
+            }
             checkpoint_key = unit_key(**coordinates)
-            if checkpoint_store is not None:
-                cached = checkpoint_store.load(
-                    checkpoint_key, fingerprint=checkpoint_fingerprint
-                )
+            # Memory is scoped to fixed data by the runner. Including the
+            # supplied fingerprint also protects explicitly shared caller caches.
+            cache_key = canonical_json([cache_fingerprint, coordinates])
+            previous = memory.get(cache_key)
+            if previous is None and checkpoint_store is not None:
+                cached = checkpoint_store.load(checkpoint_key, fingerprint=cache_fingerprint)
                 if cached is not None:
                     payload = cached.get("payload")
-                    if not isinstance(payload, Mapping) or not isinstance(
-                        payload.get("trial"), Mapping
-                    ):
+                    if not isinstance(payload, Mapping) or not isinstance(payload.get("trial"), Mapping):
                         raise ValueError("checkpoint payload does not contain a trial")
-                    trial = TrialResult.from_dict(payload["trial"])
-                    if (
-                        trial.stage != stage
-                        or trial.index != trial_index
-                        or trial.config != config
-                        or trial.seed != trial_seed
-                        or not np.isfinite(trial.validation_loss)
-                    ):
-                        raise ValueError("checkpointed trial does not match requested candidate")
-                    trials.append(trial)
-                    stage_trials.append(trial)
-                    if on_trial is not None:
-                        on_trial(trial)
-                    continue
-            fitted = UnifiedPUModel(
-                config,
-                fit_config,
-                warm_start_cache=warm_start_cache,
-            ).fit(
-                train_safe, exposure=train_exposure, seed=trial_seed
-            )
-            q_validation = fitted.predict_observed(
-                validation_safe.X_cell, exposure=validation_exposure
-            )
-            score = masked_log_loss(
-                validation_safe.S_observed,
-                q_validation,
-                validation_safe.W_measured,
-            )
-            trial = TrialResult(
-                stage=stage,
-                index=trial_index,
-                config=config,
-                validation_loss=score,
-                converged=fitted.converged,
-                iterations=fitted.iterations,
-                seed=trial_seed,
-            )
+                    previous = TrialResult.from_dict(payload["trial"])
+            if previous is not None:
+                if (
+                    model_identity(previous.config) != identity
+                    or previous.seed != trial_seed
+                    or not np.isfinite(previous.validation_loss)
+                ):
+                    raise ValueError("checkpointed trial does not match requested candidate")
+                trial = replace(previous, stage=stage, index=trial_index, config=config)
+            else:
+                fitted = UnifiedPUModel(config, fit_config, warm_start_cache=warm_start_cache).fit(
+                    train_safe, exposure=train_exposure, seed=trial_seed
+                )
+                q_validation = fitted.predict_observed(validation_safe.X_cell, exposure=validation_exposure)
+                score = masked_log_loss(validation_safe.S_observed, q_validation, validation_safe.W_measured)
+                trial = TrialResult(
+                    stage=stage, index=trial_index, config=config,
+                    validation_loss=score, converged=fitted.converged,
+                    iterations=fitted.iterations, seed=trial_seed,
+                )
+                if checkpoint_store is not None:
+                    checkpoint_store.save_complete(checkpoint_key, cache_fingerprint, {"trial": trial.to_dict()})
+            memory[cache_key] = trial
             trials.append(trial)
             stage_trials.append(trial)
-            if checkpoint_store is not None:
-                checkpoint_store.save_complete(
-                    checkpoint_key,
-                    checkpoint_fingerprint,
-                    {"trial": trial.to_dict()},
-                )
             if on_trial is not None:
                 on_trial(trial)
         return tuple(stage_trials)
@@ -361,12 +421,22 @@ def tune_model(
     if tuning.strategy == "full_joint" or base_model.kind == "direct":
         selectable = evaluate(full_joint_candidates(base_model, tuning), "joint_grid")
     else:
-        rank_trials = evaluate(_stage_one_candidates(base_model, tuning), "rank")
-        selected_rank = _winner(rank_trials).config.rank
-        selectable = evaluate(
-            _stage_two_candidates(base_model, tuning, selected_rank),
-            "penalty",
-        )
+        first = _stage_one_candidates(base_model, tuning)
+        if tuning.candidate_budget is not None:
+            kinds = len({candidate.kind for candidate in first})
+            first_budget = min(tuning.candidate_budget, max(kinds, tuning.candidate_budget // 2))
+            first = _budget_candidates(first, first_budget)
+        rank_trials = evaluate(first, "rank")
+        selected = _winner(rank_trials).config
+        second = _stage_two_candidates(selected, tuning, selected.rank)
+        done = {canonical_json(model_identity(trial.config)) for trial in rank_trials}
+        second = tuple(candidate for candidate in second if canonical_json(model_identity(candidate)) not in done)
+        if tuning.candidate_budget is not None:
+            remaining = tuning.candidate_budget - len(rank_trials)
+            second = () if remaining <= 0 else _budget_candidates(second, remaining)
+        # Rank-stage anchor fits are real candidates and already used selection
+        # information. Retaining them avoids losing an exact endpoint in stage 2.
+        selectable = (*rank_trials, *evaluate(second, "penalty"))
 
     if not any(trial.converged for trial in selectable):
         raise RuntimeError(

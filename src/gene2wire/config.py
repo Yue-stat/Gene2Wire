@@ -24,6 +24,7 @@ class FitConfig:
     tolerance: float = 1e-8
     initialization: str = "svd"
     init_direct_maxiter: int = 100
+    retry_maxiter: int = 0
 
     def __post_init__(self) -> None:
         if (
@@ -39,6 +40,12 @@ class FitConfig:
             raise ValueError("tolerance must be finite and positive")
         if self.initialization not in {"svd", "random"}:
             raise ValueError("initialization must be 'svd' or 'random'")
+        if (
+            not isinstance(self.retry_maxiter, int)
+            or isinstance(self.retry_maxiter, bool)
+            or self.retry_maxiter < 0
+        ):
+            raise ValueError("retry_maxiter must be a nonnegative integer")
 
 
 @dataclass(frozen=True)
@@ -94,8 +101,18 @@ class TuningConfig:
     anchor_residual_l2: float = 1e-3
     anchor_target_l2: float = 1e-3
     metric: str = "observed_log_loss"
+    candidate_budget: int | None = None
+    include_endpoints: bool = False
 
     def __post_init__(self) -> None:
+        if self.candidate_budget is not None and (
+            not isinstance(self.candidate_budget, int)
+            or isinstance(self.candidate_budget, bool)
+            or self.candidate_budget < 1
+        ):
+            raise ValueError("candidate_budget must be None or a positive integer")
+        if not isinstance(self.include_endpoints, bool):
+            raise ValueError("include_endpoints must be a boolean")
         if self.strategy not in {"full_joint", "staged_rank_l2"}:
             raise ValueError("strategy must be full_joint or staged_rank_l2")
         if self.metric != "observed_log_loss":
