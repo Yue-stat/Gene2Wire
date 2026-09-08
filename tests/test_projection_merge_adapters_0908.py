@@ -210,7 +210,22 @@ def test_projection_full_loader_preserves_filters_and_offline_cache(tmp_path, mo
     files = {key: tmp_path / source[0] for key, source in projection.SOURCES.items()}
     standard.to_csv(files["standard"])
     union.to_csv(files["union"])
-    pd.DataFrame(animal_rows).to_excel(files["animals"], sheet_name="Animals", index=False)
+    # The official workbook contains a second Animal ID header for an HCR
+    # cohort.  Preserve that layout so the loader cannot rely on a unique
+    # header cell or accidentally select non-sequencing animals.
+    with pd.ExcelWriter(files["animals"]) as writer:
+        pd.DataFrame([["Animals used for sequencing"]]).to_excel(
+            writer, sheet_name="Animals", index=False, header=False)
+        pd.DataFrame(animal_rows).to_excel(
+            writer, sheet_name="Animals", index=False, startrow=1)
+        pd.DataFrame([["Animals used for HCR"]]).to_excel(
+            writer, sheet_name="Animals", index=False, header=False, startrow=9)
+        pd.DataFrame([
+            {"Animal ID": "Animal_FISH_1", **{
+                f"BC injected into {target}": f"BC{j}"
+                for j, target in enumerate(projection.TARGETS, start=1)
+            }}
+        ]).to_excel(writer, sheet_name="Animals", index=False, startrow=10)
     files["expression"].write_bytes(b"fixture RDS placeholder")
     sources = {key: (path.name, projection.SOURCES[key][1], io.file_hash(path)) for key, path in files.items()}
     monkeypatch.setattr(projection, "SOURCES", sources)

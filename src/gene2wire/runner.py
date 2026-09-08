@@ -31,7 +31,7 @@ from .seeds import stable_seed
 from .tuning import TuningResult, tune_model
 
 
-CORE_API_VERSION = "0.3.0"
+CORE_API_VERSION = "0.3.1"
 
 
 @dataclass(frozen=True)

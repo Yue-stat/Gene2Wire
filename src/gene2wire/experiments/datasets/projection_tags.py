@@ -51,6 +51,47 @@ def canonical_standard_cell_id(cell_id: str) -> str:
     return str(cell_id)
 
 
+def _sequencing_animal_table(path: str | Path) -> pd.DataFrame:
+    """Extract the six sequencing-animal barcode rows from Supplementary Data 2.
+
+    The official ``Animals`` worksheet contains a second ``Animal ID`` header
+    for the HCR cohort.  Locate candidate headers by content and accept the
+    unique one followed by ``Animal_SEQ_1`` through ``Animal_SEQ_6``.  This is
+    stricter than selecting the first header while remaining insensitive to
+    title rows, blank rows, or harmless surrounding whitespace.
+    """
+    sheet = pd.read_excel(path, sheet_name="Animals", header=None)
+
+    def normalized(value) -> str:
+        if pd.isna(value):
+            return ""
+        return " ".join(str(value).replace("\xa0", " ").split())
+
+    expected_ids = {f"Animal_SEQ_{animal}" for animal in range(1, 7)}
+    required = ("Animal ID", *(f"BC injected into {target}" for target in TARGETS))
+    candidates = []
+    for header_row in range(len(sheet)):
+        labels = [normalized(value) for value in sheet.iloc[header_row].tolist()]
+        if "Animal ID" not in labels or any(label not in labels for label in required):
+            continue
+        positions = {label: labels.index(label) for label in required}
+        animal_column = sheet.iloc[header_row + 1:, positions["Animal ID"]].map(normalized)
+        selected_rows = animal_column.index[animal_column.isin(expected_ids)]
+        selected_ids = animal_column.loc[selected_rows]
+        if set(selected_ids) != expected_ids or not selected_ids.is_unique:
+            continue
+        records = {
+            label: [normalized(sheet.iat[row, column]) or np.nan for row in selected_rows]
+            for label, column in positions.items()
+        }
+        candidates.append(pd.DataFrame(records))
+    if len(candidates) != 1:
+        raise ValueError(
+            "Cannot identify a unique Supplementary Data 2 sequencing-animal barcode table"
+        )
+    return candidates[0]
+
+
 def _aligned_numeric_csv(path, ids: Sequence[str], role: str):
     if path is None:
         return None, ()
@@ -289,12 +330,7 @@ def load_projection_tags(cache_dir, *, location_features_csv=None, target_featur
     standard = standard.loc[meta.index]
     if len(meta) == 0:
         raise ValueError("No cells survive the prespecified paired cohort filters")
-    sheet = pd.read_excel(paths["animals"], sheet_name="Animals", header=None)
-    hits = np.flatnonzero(sheet.iloc[:, 0].astype(str).eq("Animal ID"))
-    if len(hits) != 1:
-        raise ValueError("Cannot identify the Supplementary Data 2 animal header")
-    table = sheet.iloc[int(hits[0]) + 1:].copy()
-    table.columns = sheet.iloc[int(hits[0])].tolist()
+    table = _sequencing_animal_table(paths["animals"])
     table = table[table["Animal ID"].astype(str).str.match(r"Animal_SEQ_[1-6]$")].copy()
     table["animal"] = table["Animal ID"].astype(str).str.extract(r"(\d+)$")[0].astype(int)
     if set(table["animal"]) != set(range(1, 7)) or not table["animal"].is_unique:
