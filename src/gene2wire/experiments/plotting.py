@@ -370,32 +370,30 @@ def plot_results(artifacts: Any, output_dir: str | Path, *, show: bool = True,
 # Diagnostic figures deliberately discover models from the exported results.
 # Keep MODEL_ORDER above fixed: changing it would alter the existing paper plots.
 _BENCHMARK_ORDER = MODEL_ORDER + (
-    "Reference-only", "Reference+PU", "Logistic-rescaled",
-    "RF-observed", "RF-reference", "Prevalence-observed", "Prevalence-reference",
+    "Reference+PU", "Logistic-rescaled",
+    "RF-observed", "RF-reference", "RF-mixed",
     "Qiao-squared", "Qiao-logit",
 )
+_RETIRED_BENCHMARKS = {"Reference-only", "Prevalence-observed", "Prevalence-reference"}
 _BENCHMARK_LABELS = {**MODEL_LABELS,
-    "Reference-only": "Reference-only logistic",
     "Reference+PU": "Reference + PU logistic",
     "Logistic-rescaled": "Logistic + sensitivity rescaling",
     "RF-observed": "RF (observed labels)",
     "RF-reference": "RF (paired references)",
-    "Prevalence-observed": "Prevalence (observed labels)",
-    "Prevalence-reference": "Prevalence (paired references)",
+    "RF-mixed": "RF (observed + paired references)",
     "Qiao-squared": "Qiao bilinear (squared error)",
     "Qiao-logit": "Qiao bilinear (logistic)",
 }
 _BENCHMARK_COLORS = {**COLORS,
-    "Reference-only": "#9467BD", "Reference+PU": "#332288",
+    "Reference+PU": "#332288",
     "Logistic-rescaled": "#CC79A7", "RF-observed": "#AA4499",
-    "RF-reference": "#882255", "Prevalence-observed": "#AA8833",
-    "Prevalence-reference": "#665522", "Qiao-squared": "#44AA99",
+    "RF-reference": "#882255", "RF-mixed": "#9467BD", "Qiao-squared": "#44AA99",
     "Qiao-logit": "#117733",
 }
 _BENCHMARK_MARKERS = {**MARKERS,
-    "Reference-only": "D", "Reference+PU": "P", "Logistic-rescaled": "*",
-    "RF-observed": "v", "RF-reference": "D", "Prevalence-observed": "X",
-    "Prevalence-reference": "P", "Qiao-squared": "<", "Qiao-logit": ">",
+    "Reference+PU": "P", "Logistic-rescaled": "*",
+    "RF-observed": "v", "RF-reference": "D", "RF-mixed": "h",
+    "Qiao-squared": "<", "Qiao-logit": ">",
 }
 _BENCHMARK_SCOPES = ("dataset", "sharing_strength", "analysis", "mechanism",
                      "calibration_fraction", "calibration_spec")
@@ -423,9 +421,16 @@ def _benchmark_aggregate(tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
 
 
 def _benchmark_models(frame: pd.DataFrame) -> tuple[str, ...]:
-    available = set(frame["model"].dropna().astype(str))
+    available = set(frame["model"].dropna().astype(str)) - _RETIRED_BENCHMARKS
     return tuple(model for model in _BENCHMARK_ORDER if model in available) + tuple(
         sorted(available.difference(_BENCHMARK_ORDER)))
+
+
+def _benchmark_linestyle(model: str) -> str:
+    """Encode use of PU or paired-reference information, including direct RF labels."""
+    uses_reference = model.startswith("PU") or model in {
+        "Reference+PU", "Logistic-rescaled", "RF-reference", "RF-mixed"}
+    return "-" if uses_reference else "--"
 
 
 def _benchmark_style(model: str, models: tuple[str, ...]) -> dict[str, Any]:
@@ -468,7 +473,7 @@ def _benchmark_curve(axis, frame, metric, models):
         count = int(np.isfinite(values).sum())
         if not count:
             continue
-        linestyle = "-" if model.startswith("PU") else "--"
+        linestyle = _benchmark_linestyle(model)
         if count < 3:
             linestyle = "None"
         axis.plot(rates, values, **style, linestyle=linestyle, markeredgewidth=.7)
@@ -535,8 +540,9 @@ def plot_benchmark_results(artifacts: Any, output_dir: str | Path, *,
     fraction and calibration specification: no controls are averaged into
     primary estimates. Three or more measured loss rates produce curves;
     endpoint-only models have disconnected markers. Natural and single-rate
-    comparisons use categorical dot panels. All exported model names are
-    discovered dynamically, so optional and future baselines are included.
+    comparisons use categorical dot panels. Exported model names are discovered
+    dynamically, excluding retired Prevalence and reference-only logistic arms.
+    Solid lines use PU or paired references; other methods use dashed lines.
 
     Diagnostic means follow the same fold-then-repetition aggregation as the
     main plots. They carry no confidence intervals; formal simulation intervals
@@ -604,8 +610,8 @@ def plot_benchmark_results(artifacts: Any, output_dir: str | Path, *,
                               ncol=min(legend_columns, len(models)), fontsize=8.5, columnspacing=1.5,
                               handlelength=2.5)
                 figure.suptitle(title, fontsize=10, y=.995)
-                figure.text(.5, .012, "Points show evaluated loss rates; endpoint-only fits are not connected. "
-                            "Means over folds and repetitions; no diagnostic confidence intervals.",
+                figure.text(.5, .012, "Solid: PU or paired references; dashed: neither. "
+                            "Means over folds and repetitions; missing fits are not interpolated.",
                             ha="center", va="bottom", fontsize=8, color="#555555")
                 figure.canvas.draw()
                 legend_bottom = legend.get_window_extent(figure.canvas.get_renderer()).transformed(
@@ -627,15 +633,17 @@ def plot_benchmark_results(artifacts: Any, output_dir: str | Path, *,
     return paths
 
 
-_INFORMATION_ARMS = ("Reference-only", "PU", "Reference+PU")
-_INFORMATION_LABELS = {"Reference-only": "Reference-only",
-                       "PU": "Calibrated PU",
-                       "Reference+PU": "Reference + PU"}
+_INFORMATION_ARMS = ("PU", "Reference+PU", "RF-observed", "RF-reference", "RF-mixed")
+_INFORMATION_LABELS = {"PU": "Calibrated PU logistic",
+                       "Reference+PU": "Reference + PU logistic",
+                       "RF-observed": "RF: observed labels",
+                       "RF-reference": "RF: paired references",
+                       "RF-mixed": "RF: observed + paired references"}
 
 
 def plot_information_budget_results(artifacts: Any, output_dir: str | Path, *,
                                     show: bool = True) -> dict[str, Path]:
-    """Compare three independent-logistic arms at the same paired budget.
+    """Compare retained logistic/RF controls using the same authorized paired C.
 
     Additional 1-by-3 PDF figures show the primary natural evaluation or the
     80%-loss endpoint. Each scientific setting gets its own figure, including
@@ -676,7 +684,7 @@ def plot_information_budget_results(artifacts: Any, output_dir: str | Path, *,
                 title_parts.append(f"paired = {float(fraction):.0%}")
             title_parts.append("natural paired evaluation" if scope.get("mechanism") == "natural"
                                else "positive-label loss = 80%")
-            figure, axes = plt.subplots(1, len(PRIMARY_METRICS), figsize=(11.6, 3.05))
+            figure, axes = plt.subplots(1, len(PRIMARY_METRICS), figsize=(12.4, 3.7))
             for column, (axis, metric) in enumerate(zip(axes, PRIMARY_METRICS)):
                 for position, model in enumerate(_INFORMATION_ARMS):
                     estimates = selected.loc[selected["model"].eq(model)]
@@ -702,8 +710,8 @@ def plot_information_budget_results(artifacts: Any, output_dir: str | Path, *,
                 axis.xaxis.set_major_locator(MaxNLocator(nbins=4))
                 axis.set_xlabel(_metric_title(metric, simulation=simulation))
             figure.suptitle(" · ".join(title_parts), fontsize=10, y=.98)
-            figure.text(.5, .015, "Independent logistic predictors; same paired-reference budget. "
-                        "Means over folds and repetitions; no diagnostic confidence intervals.",
+            figure.text(.5, .015, "Paired methods share the same reference subset; RF observed uses detections only. "
+                        "Means over folds and repetitions.",
                         ha="center", va="bottom", fontsize=8, color="#555555")
             figure.tight_layout(rect=(0, .07, 1, .92), w_pad=2.)
             stem = "__".join(f"{label}_{_slug(value)}" for label, value in scope.items()

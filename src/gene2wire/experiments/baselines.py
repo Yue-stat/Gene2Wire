@@ -27,7 +27,7 @@ from ..checkpoint import canonical_json, sha256_array, sha256_source_tree
 @dataclass(frozen=True)
 class BaselineResult:
     prediction: np.ndarray
-    observed_prediction: np.ndarray
+    observed_prediction: np.ndarray | None
     selected_config: Mapping[str, Any]
     candidate_records: tuple[Mapping[str, Any], ...]
     probability_semantics: str
@@ -186,7 +186,7 @@ def fit_baseline(
     validation_observed: Any, validation_measured: Any, validation_sensitivity: Any,
     X_test: Any, test_sensitivity: Any, *,
     kind: Literal["random_forest", "prevalence"] = "random_forest",
-    probability_semantics: Literal["reference", "observed"] = "observed",
+    probability_semantics: Literal["reference", "observed", "mixed"] = "observed",
     candidate_budget: int = 32, seed: int = 0, checkpoint_dir: str | Path | None = None,
     refit_X: Any | None = None, refit_labels: Any | None = None, refit_measured: Any | None = None,
     candidate_configs: Sequence[Mapping[str, Any]] | None = None,
@@ -196,7 +196,11 @@ def fit_baseline(
 
     Optional ``refit_*`` arrays provide an authorized development-set label view
     after selection. They must be supplied together. Original validation D is
-    never replaced with reference outcomes for selecting either baseline.
+    never replaced with reference outcomes for selecting a baseline. Mixed-label
+    RF uses its raw hybrid-label probability as the score against validation D,
+    like observed-label RF; no inverse-sensitivity correction is applied. This
+    common validation-label budget does not make the mixed score an estimate of
+    the detection probability. Its observed_prediction is therefore None.
 
     Candidate-level checkpoints contain numeric predictions and checksummed
     metadata, not executable estimator pickles. Every candidate and final fit is
@@ -204,8 +208,8 @@ def fit_baseline(
     ``on_progress`` receives candidate inventories and start/completion events
     for tuning and the final refit. It does not enter fitting or cache identity.
     """
-    if probability_semantics not in {"reference", "observed"}:
-        raise ValueError("probability_semantics must be 'reference' or 'observed'")
+    if probability_semantics not in {"reference", "observed", "mixed"}:
+        raise ValueError("probability_semantics must be 'reference', 'observed', or 'mixed'")
     if isinstance(seed, bool) or not isinstance(seed, (int, np.integer)) or seed < 0:
         raise ValueError("seed must be a nonnegative integer")
     candidates = baseline_candidates(kind, candidate_budget)
@@ -288,11 +292,14 @@ def fit_baseline(
                      "cache_status": "checkpoint" if resumed else "fitted",
                      "elapsed_seconds": perf_counter() - started})
     q_test = et * prediction if probability_semantics == "reference" else prediction.copy()
-    return BaselineResult(prediction=prediction, observed_prediction=q_test,
+    return BaselineResult(prediction=prediction,
+        observed_prediction=q_test if probability_semantics != "mixed" else None,
         selected_config=dict(selected), candidate_records=tuple(records),
         probability_semantics=probability_semantics,
         diagnostics={"kind": kind, "candidate_budget": int(candidate_budget),
                      "n_candidates_evaluated": len(candidates), "selected_candidate_index": winner,
                      "selection_rule": "minimum_mean_entry_observed_log_loss_then_candidate_order",
+                     "validation_score_semantics": ("raw_mixed_label_score" if probability_semantics == "mixed"
+                                                    else "observed_probability"),
                      "final_refit_on_supplied_development_view": all(supplied),
                      "final_fit_resumed": resumed, **fit_diagnostics})

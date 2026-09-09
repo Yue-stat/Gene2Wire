@@ -13,7 +13,8 @@ from ..data import DatasetBundle
 from .observation import _rows
 
 
-SUPERVISION_MODES = ("observed", "calibrated_pu", "reference_only", "reference_plus_pu")
+SUPERVISION_MODES = ("observed", "calibrated_pu", "reference_only", "reference_plus_pu",
+                     "reference_plus_observed")
 
 
 def compile_training_bundle(
@@ -30,6 +31,8 @@ def compile_training_bundle(
     masked and have label zero.  Reference-only uses all assayed positive *and*
     negative reference labels in paired cells.  Reference+PU uses reference BCE
     on C (exposure=1) and observed PU BCE on O, without duplicating C's outcome.
+    Reference+observed replaces labels on C and retains raw detections on O;
+    its exposure is one everywhere, with no PU likelihood or rescaling.
 
     ``paired_reference`` may have shape (N,T) or (len(paired_rows),T).  Only the
     paired measured entries are read; other entries may deliberately be NaN.
@@ -67,7 +70,7 @@ def compile_training_bundle(
         if not np.all(np.isfinite(values)) or np.any((values <= 0) | (values > 1)):
             raise ValueError("PU training sensitivities must be finite in (0,1]")
         exposure[pu_entries] = values
-    if mode in {"reference_only", "reference_plus_pu"}:
+    if mode in {"reference_only", "reference_plus_pu", "reference_plus_observed"}:
         if paired_reference is None:
             raise ValueError("Reference supervision requires explicit paired_reference; evaluation truth is never used automatically")
         if not np.any(c):
@@ -104,7 +107,8 @@ def compile_training_bundle(
         semantics={
             **dict(bundle.semantics), "supervision_mode": mode,
             "reference_access": "explicit-authorized-paired-training-only",
-            "prediction_semantics": "q" if mode == "observed" else "p",
+            "prediction_semantics": ("q" if mode == "observed" else
+                                     "mixed" if mode == "reference_plus_observed" else "p"),
         },
         metadata={
             **dict(bundle.metadata), "training_row_count": int(len(train)),

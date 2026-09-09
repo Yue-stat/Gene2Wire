@@ -20,8 +20,8 @@ def test_whole_unit_inventory_and_missing_export_recovery(tmp_path, capsys):
     kwargs = dict(checkpoint_dir=tmp_path / 'checkpoints', export_dir=tmp_path / 'exports')
     first = run_experiment(data, settings, **kwargs)
     output = capsys.readouterr().out
-    assert '0/24 model evaluations reusable' in output
-    assert 'finished units 24/24' in output
+    assert '0/18 model evaluations reusable' in output
+    assert 'finished units 18/18' in output
     assert '[start]' not in output and '[done]' not in output and '[trial]' not in output
     assert not first.tables['checkpoint_inventory']['fully_cached'].any()
     events = first.tables['progress_events']
@@ -31,7 +31,7 @@ def test_whole_unit_inventory_and_missing_export_recovery(tmp_path, capsys):
         second = run_experiment(data, settings, **kwargs)
         assert second.tables['checkpoint_inventory']['fully_cached'].all()
         assert second.tables['selected']['resumed'].all()
-        assert '24/24 model evaluations reusable' in capsys.readouterr().out
+        assert '18/18 model evaluations reusable' in capsys.readouterr().out
         prediction = next(first.export_dir.rglob('PU-Joint_predictions.npz'))
         with np.load(prediction) as archive:
             expected = archive['prediction'].copy()
@@ -103,12 +103,19 @@ def test_summary_final_and_disabled_output(tmp_path, capsys):
     assert relay.done_units == 1 and len(relay.rows) == 1
 
 
-def test_default_real_plan_includes_all_fifty_models_per_fold_repetition():
+def test_default_real_plan_runs_identical_twelve_models_at_every_primary_rate():
     from types import SimpleNamespace
     from gene2wire.experiments.pipeline import _planned_models
     settings = Settings()
     planned = _planned_models(SimpleNamespace(metadata={}, natural_observed=None), settings)
-    assert len(planned) == 50
-    assert len(planned) * settings.n_outer_folds * settings.n_repetitions == 750
-    assert {row['model'] for row in planned} >= {'Qiao-ID-squared', 'Qiao-ID-logit',
-        'Reference-only', 'Reference+PU', 'RF-reference', 'Prevalence-observed'}
+    assert len(planned) == 60
+    assert len(planned) * settings.n_outer_folds * settings.n_repetitions == 900
+    models = {row['model'] for row in planned}
+    assert len(models) == 12
+    assert models >= {'Qiao-ID-squared', 'Qiao-ID-logit', 'Reference+PU',
+                      'RF-observed', 'RF-reference', 'RF-mixed'}
+    assert not models & {'Reference-only', 'Prevalence-observed', 'Prevalence-reference'}
+    for rate in settings.loss_rates:
+        assert {row['model'] for row in planned if row['loss_rate'] == rate} == models
+    natural = _planned_models(SimpleNamespace(metadata={}, natural_observed=True), settings)
+    assert len(natural) == 12 and {row['loss_rate'] for row in natural} == {None}

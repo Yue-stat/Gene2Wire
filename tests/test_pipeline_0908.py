@@ -114,7 +114,7 @@ def test_simulation_intervals_count_generated_datasets_not_folds(tmp_path):
         export_dir=tmp_path / "exports", sharing_strengths=(.5,), simulation_options=OPTIONS)
     interval = artifacts.tables["simulation_intervals"].query("metric == 'macro_log_loss'")
     assert interval["n"].eq(2).all()
-    assert len(artifacts.tables["per_repetition"]) == 2 * 8  # six core + two prevalence controls
+    assert len(artifacts.tables["per_repetition"]) == 2 * 6  # six core methods; optional controls disabled
     assert artifacts.manifest["uncertainty_unit"] == "generated_dataset"
     raw_files = list((tmp_path / "raw").glob("*.npz"))
     assert len(raw_files) == 2
@@ -136,3 +136,33 @@ def test_validated_raw_cache_is_read_offline(tmp_path):
         second = cached_download("https://example.invalid/raw.bin", raw, sha256=expected)
     assert first == second == raw
     assert raw.with_name(raw.name + ".download.json").exists()
+
+
+def test_mixed_rf_real_fit_exports_score_semantics_and_resumes(tmp_path, monkeypatch):
+    from gene2wire.experiments import baselines
+    monkeypatch.setattr(baselines, "baseline_candidates", lambda kind, budget: [
+        {"n_estimators": 8, "min_samples_leaf": leaf, "max_features": 1.}
+        for leaf in (1, 3)])
+    config = settings(loss_rates=(.8,), run_random_forest=True, run_information_controls=True)
+    data = dataset()
+    kwargs = dict(checkpoint_dir=tmp_path / "checkpoints", export_dir=tmp_path / "exports", progress=False)
+    first = run_experiment(data, config, **kwargs)
+    assert first.manifest["status"] == "complete"
+    metrics = first.tables["metrics"]
+    assert len(metrics) == 30  # Three folds; six core + Reference+PU + three RF.
+    mixed = metrics.loc[metrics["model"].eq("RF-mixed")]
+    assert len(mixed) == 3 and mixed["probability_semantics"].eq("mixed").all()
+    assert mixed["uses_paired_reference"].all()
+    assert mixed["uses_pu_likelihood"].eq(False).all()
+    assert mixed["macro_log_loss"].notna().all()
+    selected = first.tables["selected"].query("model == 'RF-mixed'")
+    assert selected["validation_score_semantics"].eq("raw_mixed_label_score").all()
+    files = list(first.export_dir.rglob("RF-mixed_predictions.npz"))
+    assert len(files) == 3
+    for path in files:
+        with np.load(path, allow_pickle=False) as archive:
+            assert not {"p", "q", "h"} & set(archive.files)
+            np.testing.assert_allclose(archive["mixed_label_score"], archive["prediction"], equal_nan=True)
+    with patch.object(baselines, "fit_baseline", side_effect=AssertionError("completed RF refitted")):
+        second = run_experiment(data, config, **kwargs)
+    assert second.tables["checkpoint_inventory"]["fully_cached"].all()

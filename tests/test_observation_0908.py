@@ -178,3 +178,24 @@ def test_calibrated_pu_does_not_open_reference_labels():
     compiled, e = compile_training_bundle(bundle, np.arange(4), [0, 2], poisoned, np.full(reference.shape, .5), "calibrated_pu")
     np.testing.assert_array_equal(compiled.S_observed[:4], bundle.S_observed[:4])
     np.testing.assert_array_equal(e[:4][compiled.W_measured[:4]], .5)
+
+
+def test_reference_plus_observed_replaces_only_authorized_labels_without_pu():
+    bundle, reference = supervision_example()
+    paired = [0, 2]
+    blinded = np.full(reference.shape, np.nan)
+    blinded[paired] = reference[paired]
+    compiled, exposure = compile_training_bundle(bundle, np.arange(4), paired, blinded,
+                                                 mode="reference_plus_observed")
+    expected = bundle.S_observed.copy()
+    expected[paired] = reference[paired]
+    expected[4] = 0
+    np.testing.assert_array_equal(compiled.S_observed, expected)
+    np.testing.assert_array_equal(compiled.W_measured[:4], bundle.W_measured[:4])
+    assert not compiled.W_measured[4].any()
+    assert compiled.W_measured.sum() == bundle.W_measured[:4].sum()  # No duplicated paired entries.
+    np.testing.assert_array_equal(exposure, 1)
+    assert compiled.semantics["prediction_semantics"] == "mixed"
+    assert compiled.Z_reference is None
+    with pytest.raises(ValueError, match="explicit paired_reference"):
+        compile_training_bundle(bundle, np.arange(4), paired, mode="reference_plus_observed")

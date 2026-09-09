@@ -264,73 +264,63 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                                      "validation_loss": trial.validation_loss,
                                      "converged": trial.converged, "iterations": trial.iterations,
                                      "seed": trial.seed} for trial in model_result.tuning.trials)
-        endpoint = scenario["analysis"] == "primary" and scenario["loss_rate"] in (None, .8)
-        reference_bundles = None
-        if endpoint and (settings.run_information_controls or settings.run_random_forest):
-            clean_train, clean_train_e = _compile(prepared, prepared.train_features, observed, tuning_e,
-                                                  train, paired_train, "reference_only")
-            clean_refit, clean_refit_e = _compile(prepared, prepared.refit_features, observed, final_e,
-                                                  development, paired, "reference_only")
-            reference_bundles = (clean_train, clean_train_e, clean_refit, clean_refit_e)
-        if endpoint and settings.run_information_controls:
-            for role, name in (("reference_only", "Reference-only"), ("reference_plus_pu", "Reference+PU")):
-                if role == "reference_only":
-                    tb, te, rb, re = reference_bundles
-                else:
-                    tb, te = _compile(prepared, prepared.train_features, observed, tuning_e,
-                                      train, paired_train, role)
-                    rb, re = _compile(prepared, prepared.refit_features, observed, final_e,
-                                      development, paired, role)
-                base = next(m for m in settings.models() if m.name == "PU").with_updates(name=name)
-                control = core_run((base,), tb, te, rb, re, role).models[name]
-                record(name, control.latent_probability, "reference")
-                tables["selected"].append({**context, **control.summary()})
-                tables["tuning"].extend({**context, "model": name, **asdict(trial.config),
-                                         "stage": trial.stage, "index": trial.index,
-                                         "validation_loss": trial.validation_loss,
-                                         "converged": trial.converged, "iterations": trial.iterations,
-                                         "seed": trial.seed} for trial in control.tuning.trials)
+        primary = scenario["analysis"] == "primary"
+        if primary and settings.run_information_controls:
+            role, name = "reference_plus_pu", "Reference+PU"
+            tb, te = _compile(prepared, prepared.train_features, observed, tuning_e,
+                              train, paired_train, role)
+            rb, re = _compile(prepared, prepared.refit_features, observed, final_e,
+                              development, paired, role)
+            base = next(m for m in settings.models() if m.name == "PU").with_updates(name=name)
+            control = core_run((base,), tb, te, rb, re, role).models[name]
+            record(name, control.latent_probability, "reference")
+            tables["selected"].append({**context, **control.summary()})
+            tables["tuning"].extend({**context, "model": name, **asdict(trial.config),
+                                     "stage": trial.stage, "index": trial.index,
+                                     "validation_loss": trial.validation_loss,
+                                     "converged": trial.converged, "iterations": trial.iterations,
+                                     "seed": trial.seed} for trial in control.tuning.trials)
         # Rescaling is only defined here for target-constant detection mechanisms.
         if scenario["mechanism"] in ("scar", "target_sar") and "Logistic" in result.models:
             q = result.models["Logistic"].latent_probability
             unbounded = q / final_e[test]
             record("Logistic-rescaled", np.clip(unbounded, 0, 1), "reference",
                    {"rescaling_clip_fraction": float(np.mean(unbounded[prepared.measured[test]] > 1))})
-        baseline_endpoint = scenario["analysis"] == "primary" and scenario["loss_rate"] in (None, 0., .8)
-        if baseline_endpoint:
+        if primary and settings.run_random_forest:
             from .baselines import fit_baseline
-            if reference_bundles is None:
-                clean_train, clean_train_e = _compile(prepared, prepared.train_features, observed, tuning_e,
-                                                      train, paired_train, "reference_only")
-                clean_refit, clean_refit_e = _compile(prepared, prepared.refit_features, observed, final_e,
-                                                      development, paired, "reference_only")
-                reference_bundles = (clean_train, clean_train_e, clean_refit, clean_refit_e)
-            for kind in ("prevalence", "random_forest"):
-                if kind == "random_forest" and not settings.run_random_forest:
-                    continue
-                for semantics in ("observed", "reference"):
-                    tb, rb = ((train_bundle, refit_bundle) if semantics == "observed"
-                              else (reference_bundles[0], reference_bundles[2]))
-                    name = ("RF" if kind == "random_forest" else "Prevalence") + ("-reference" if semantics == "reference" else "-observed")
-                    baseline_started = time.monotonic()
-                    emit({"event": "model_start", "model": name})
-                    baseline = fit_baseline(tb.X_cell, tb.S_observed, tb.W_measured,
-                        safe_validation.X_cell, safe_validation.S_observed, safe_validation.W_measured,
-                        tuning_e[validation], prepared.refit_features.X[test], final_e[test],
-                        kind=kind, probability_semantics=semantics,
-                        candidate_budget=settings.candidate_budget,
-                        seed=stable_seed(settings.seed, repetition, fold.outer_fold, kind),
-                        checkpoint_dir=model_checkpoint / "baselines" / fingerprint({**runner_context, "kind": kind, "semantics": semantics}),
-                        refit_X=rb.X_cell, refit_labels=rb.S_observed, refit_measured=rb.W_measured,
-                        on_progress=lambda event: emit({**event, "model": name}))
-                    emit({"event": "model_complete", "model": name,
-                          "elapsed_seconds": time.monotonic()-baseline_started,
-                          "cache_status": "checkpoint" if baseline.diagnostics.get("final_fit_resumed") else "fitted",
-                          "summary": dict(baseline.selected_config)})
-                    record(name, baseline.prediction, semantics)
-                    tables["selected"].append({**context, "model": name, **baseline.selected_config,
-                                                "tuning_trials": len(baseline.candidate_records)})
-                    tables["tuning"].extend({**context, "model": name, **row} for row in baseline.candidate_records)
+            kind = "random_forest"
+            for semantics, role in (("observed", "observed"), ("reference", "reference_only"),
+                                     ("mixed", "reference_plus_observed")):
+                if role == "observed":
+                    tb, rb = train_bundle, refit_bundle
+                else:
+                    tb, _ = _compile(prepared, prepared.train_features, observed, tuning_e,
+                                     train, paired_train, role)
+                    rb, _ = _compile(prepared, prepared.refit_features, observed, final_e,
+                                     development, paired, role)
+                name = f"RF-{semantics}"
+                baseline_started = time.monotonic()
+                emit({"event": "model_start", "model": name})
+                baseline = fit_baseline(tb.X_cell, tb.S_observed, tb.W_measured,
+                    safe_validation.X_cell, safe_validation.S_observed, safe_validation.W_measured,
+                    tuning_e[validation], prepared.refit_features.X[test], final_e[test],
+                    kind=kind, probability_semantics=semantics,
+                    candidate_budget=settings.candidate_budget,
+                    seed=stable_seed(settings.seed, repetition, fold.outer_fold, kind),
+                    checkpoint_dir=model_checkpoint / "baselines" / fingerprint({**runner_context, "kind": kind, "semantics": semantics}),
+                    refit_X=rb.X_cell, refit_labels=rb.S_observed, refit_measured=rb.W_measured,
+                    on_progress=lambda event, model=name: emit({**event, "model": model}))
+                emit({"event": "model_complete", "model": name,
+                      "elapsed_seconds": time.monotonic()-baseline_started,
+                      "cache_status": "checkpoint" if baseline.diagnostics.get("final_fit_resumed") else "fitted",
+                      "summary": dict(baseline.selected_config)})
+                record(name, baseline.prediction, semantics,
+                       {"supervision_mode": role, "uses_paired_reference": semantics != "observed",
+                        "uses_pu_likelihood": False})
+                tables["selected"].append({**context, "model": name, **baseline.selected_config,
+                                            "tuning_trials": len(baseline.candidate_records),
+                                            **baseline.diagnostics})
+                tables["tuning"].extend({**context, "model": name, **row} for row in baseline.candidate_records)
         if settings.run_qiao and scenario["analysis"] == "primary":
             _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
                                record, tables, model_checkpoint, on_progress=emit)
@@ -393,12 +383,10 @@ def _planned_models(prepared, settings):
         names = [m.name for m in settings.models()
                  if m.pu or not scenario["analysis"].startswith("calibration")]
         if scenario["analysis"] == "primary":
-            if scenario["loss_rate"] in (None, .8) and settings.run_information_controls:
-                names += ["Reference-only", "Reference+PU"]
-            if scenario["loss_rate"] in (None, 0., .8):
-                names += ["Prevalence-observed", "Prevalence-reference"]
-                if settings.run_random_forest:
-                    names += ["RF-observed", "RF-reference"]
+            if settings.run_information_controls:
+                names += ["Reference+PU"]
+            if settings.run_random_forest:
+                names += ["RF-observed", "RF-reference", "RF-mixed"]
             if settings.run_qiao:
                 from .qiao import qiao_model_names
                 names += list(qiao_model_names(settings.use_target_features))

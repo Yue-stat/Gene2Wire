@@ -143,6 +143,21 @@ projection probability `p`, with observed probability `q = e_hat * p`. An ordina
 random forest is not a PU random forest. A higher-sensitivity assay reference is
 not complete anatomical truth.
 
+`RF-mixed` trains on reference labels in the authorized paired subset and on
+observed labels elsewhere, using each entry once. Its raw mixed-label score is
+evaluated directly, without sensitivity rescaling or Bayes h-ranking; it is not
+exported as an identified p or q. The default paired fraction is 20% and remains
+configurable. RF-observed, RF-reference and RF-mixed share the candidate grid,
+seed schedule and validation-label budget.
+
+All 12 retained methods run at every primary loss rate (0%, 20%, 40%, 60%, 80%);
+Projection-TAGs retains its natural paired evaluation. Both Prevalence methods
+and reference-only logistic are removed from the active experiment matrix and
+benchmark figures. Solid lines indicate PU or paired-reference information;
+dashed lines indicate neither. Reference + PU logistic and both RF arms using
+paired references therefore have solid curves. Historical unrun rates remain
+gaps when loading old exports; new intermediate fits require a training run.
+
 Qiao bilinear comparisons are enabled by default on every dataset's primary
 conditions. With target features disabled, `Qiao-ID-squared` and `Qiao-ID-logit`
 use one-hot known target IDs; they are explicitly named adaptations. With target

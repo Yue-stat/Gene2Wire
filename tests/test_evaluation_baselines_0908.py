@@ -49,6 +49,36 @@ def test_feature_dependent_detection_changes_fixed_predictor_recovery_scoring():
     np.testing.assert_array_equal(observed["scores"]["q"], p)
 
 
+def test_mixed_label_score_is_not_rescaled_or_given_bayes_hidden_ranking():
+    z, d = np.array([[1], [0], [1]]), np.array([[0], [0], [1]])
+    score = np.array([[.6], [.4], [.8]])
+    result = evaluate_predictions(z, d, np.ones_like(z), score, np.array([[.9], [.1], [.5]]),
+                                  probability_semantics="mixed")
+    assert result["summary"]["hidden_recall_at_h"] == 1.
+    assert np.isnan(result["summary"]["hidden_recall_at_h_h_ranking"])
+    assert result["summary"]["macro_log_loss"] == pytest.approx(-np.log([.6, .6, .8]).mean())
+    assert all(result["scores"][key] is None for key in ("p", "q", "h"))
+    np.testing.assert_array_equal(result["scores"]["mixed_label_score"], score)
+
+
+def test_mixed_rf_uses_raw_score_on_observed_validation_and_resumes(tmp_path):
+    x = np.arange(24, dtype=float).reshape(12, 2)
+    labels = (np.arange(12) % 3 == 0).astype(int)[:, None]
+    d = np.array([[0], [1], [0]])
+    args = (x, labels, np.ones_like(labels), x[:3], d, np.ones_like(d), .2, x[3:6], .3)
+    config = [{"n_estimators": 8, "min_samples_leaf": 2, "max_features": 1.}]
+    mixed = fit_baseline(*args, probability_semantics="mixed", candidate_configs=config,
+                         checkpoint_dir=tmp_path)
+    # The two semantics have the same raw-score selection rule and RF fitting.
+    observed = fit_baseline(*args, probability_semantics="observed", candidate_configs=config,
+                            checkpoint_dir=tmp_path)
+    np.testing.assert_array_equal(mixed.prediction, observed.prediction)
+    assert mixed.candidate_records[0]["validation_observed_log_loss"] == observed.candidate_records[0]["validation_observed_log_loss"]
+    assert mixed.observed_prediction is None
+    assert mixed.diagnostics["validation_score_semantics"] == "raw_mixed_label_score"
+    assert observed.diagnostics["final_fit_resumed"] is True
+
+
 def test_zero_hidden_and_single_class_are_not_reported_as_zero_discrimination():
     z = np.array([[1, 0], [1, 0], [1, 0]])
     result = evaluate_predictions(z, z, np.ones_like(z), np.full(z.shape, 0.5), 1)

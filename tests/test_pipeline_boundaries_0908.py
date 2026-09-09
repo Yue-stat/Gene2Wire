@@ -1,6 +1,7 @@
 """Instrument pipeline information boundaries without running model searches."""
 
 from types import SimpleNamespace
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
@@ -111,7 +112,7 @@ def test_pipeline_compiles_disjoint_information_views_and_reuses_fold_local_mask
     np.testing.assert_array_equal(tuning["paired"], np.intersect1d(final["paired"], fold.train_rows))
     assert not np.intersect1d(final["paired"], fold.test_rows).size
     assert set(call["unit_context"]["supervision"] for call in calls["core"]) == {
-        "calibrated_pu", "reference_only", "reference_plus_pu",
+        "calibrated_pu", "reference_plus_pu",
     }
     observed = calls["thinning"][0]["result"].observed
     for call in calls["core"]:
@@ -132,13 +133,50 @@ def test_pipeline_compiles_disjoint_information_views_and_reuses_fold_local_mask
                 expected_labels[np.isin(rows, paired)] = data.reference[paired]
             expected_labels &= bundle.W_measured
             np.testing.assert_array_equal(bundle.S_observed, expected_labels)
-    # Both prevalence baseline roles are retained when RF itself is disabled.
-    assert {kw["probability_semantics"] for _, kw in calls["baselines"]} == {"observed", "reference"}
-    for args, kwargs in calls["baselines"]:
-        np.testing.assert_array_equal(args[4], observed[fold.validation_rows])
-        np.testing.assert_array_equal(args[6], tuning["value"])
-        if kwargs["probability_semantics"] == "reference":
-            np.testing.assert_array_equal(args[2], data.measured[fold.train_rows] & np.isin(fold.train_rows, tuning["paired"])[:, None])
+    assert not calls["baselines"]  # No automatic prevalence models when RF is disabled.
+
+
+def test_all_primary_rates_share_three_rf_views_and_reference_pu_control(tmp_path, monkeypatch):
+    data, fold, _ = _dataset()
+    settings = replace(_settings(), loss_rates=(0., .2, .4, .6, .8), run_random_forest=True)
+    prepared = pipeline._prepare(data, fold, settings)
+    calls = _instrument(monkeypatch)
+    tables = pipeline._run_fold(prepared, 0, settings, tmp_path / "checkpoints",
+                                tmp_path / "exports", "test-source")
+    assert len(calls["baselines"]) == 15
+    assert len(calls["core"]) == 10  # Six-model grid and Reference+PU at each rate.
+    frame = pd.DataFrame(tables["metrics"])
+    for name, rows in frame.groupby("model"):
+        assert set(rows["loss_rate"]) == set(settings.loss_rates), name
+    assert set(frame["model"]) == {m.name for m in settings.models()} | {
+        "Reference+PU", "RF-observed", "RF-reference", "RF-mixed"}
+    for index, rate in enumerate(settings.loss_rates):
+        observed = calls["thinning"][index]["result"].observed
+        # Zero loss has known e=1 and skips detector fitting; paired IDs are
+        # identical across loss rates and are recorded by the next scenario.
+        detector_index = 2 * max(index - 1, 0)
+        tuning, final = calls["detectors"][detector_index:detector_index + 2]
+        forests = calls["baselines"][3 * index:3 * index + 3]
+        assert {kw["probability_semantics"] for _, kw in forests} == {"observed", "reference", "mixed"}
+        assert len({kw["seed"] for _, kw in forests}) == 1
+        assert len({kw["candidate_budget"] for _, kw in forests}) == 1
+        for args, kwargs in forests:
+            assert kwargs["kind"] == "random_forest"
+            np.testing.assert_array_equal(args[4], observed[fold.validation_rows])
+            np.testing.assert_array_equal(args[6], 1. if rate == 0 else tuning["value"])
+            for rows, paired, labels, mask in (
+                (fold.train_rows, tuning["paired"], args[1], args[2]),
+                (np.arange(45), final["paired"], kwargs["refit_labels"], kwargs["refit_measured"]),
+            ):
+                paired_local = np.isin(rows, paired)
+                expected_mask = data.measured[rows].copy()
+                expected_labels = observed[rows].copy()
+                if kwargs["probability_semantics"] != "observed":
+                    expected_labels[paired_local] = data.reference[paired]
+                if kwargs["probability_semantics"] == "reference":
+                    expected_mask &= paired_local[:, None]
+                np.testing.assert_array_equal(mask, expected_mask)
+                np.testing.assert_array_equal(labels, expected_labels & expected_mask)
 
 
 def test_natural_validation_references_affect_refit_but_not_tuning_views(tmp_path, monkeypatch):

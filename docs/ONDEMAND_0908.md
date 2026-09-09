@@ -213,11 +213,22 @@ The explicit run directories must exist on that machine. This mode reads their
 saved manifests and all CSVs, displays the existing plots plus new plots of all
 available benchmarks, adds the same-information-budget plot, and prints concise diagnostics. It skips raw-data loading,
 preflight and training. The loaded run's saved protocol remains authoritative.
-Every benchmark actually present is plotted; disabled or unexecuted methods are
-not invented. Endpoint-only baselines use disconnected markers. Curve methods show their
+Every retained benchmark actually present is plotted; both Prevalence methods
+and reference-only logistic are omitted. Unexecuted methods are not invented.
+Historical endpoint-only baselines use disconnected markers. Curve methods show their
 actual solid/dashed line and marker in the legend; endpoint-only methods retain
 marker-only legend entries. Missing intermediate fits are never interpolated. Additional
 PDFs are saved in `figures/0908/all_benchmarks/`; no PNGs are written.
+
+New primary runs evaluate all 12 retained methods at every configured loss rate
+(default 0%, 20%, 40%, 60%, 80%). `RF-mixed` uses reference labels on the same
+20% paired subset and observed labels on the other cells, with each entry used
+once. It performs ordinary RF fitting, not PU correction. Three RF arms share
+the candidate grid, seed schedule and validation-label budget. Dashed curves
+use neither PU nor paired references; solid curves use at least one. This
+includes solid `Reference+PU`, `RF-reference` and `RF-mixed` curves. Qiao uses
+observed labels and remains dashed, with target ID one-hot inputs by default.
+Set `USE_TARGET_FEATURES=True` to supply the declared target descriptors.
 
 For training, use `RESULTS_ONLY = False`. New progress switches are:
 
@@ -232,12 +243,12 @@ Default progress prints one initial cache summary, one compact line per minute,
 and one completion summary. For example:
 
 ```text
-[running 1min] finished units 82/750, current time 2026-09-09 10:42:00 PDT
+[running 1min] finished units 82/900, current time 2026-09-09 10:42:00 PDT
 ```
 
 One unit is one model evaluation at a specified repetition, fold and scenario:
 its candidate search and final refit together. The denominator includes all
-planned primary, information-budget, RF, prevalence and Qiao models, including
+planned primary, information-budget, RF and Qiao models, including
 simulation control scenarios. Optimizer iterations and individual candidates
 are not separate units in this counter. A changed loss rate or calibration
 condition is a different scenario. Failed calibration is reported separately
@@ -253,10 +264,10 @@ Worker events remain under `progress/` and in `progress_events.csv`;
 `checkpoint_inventory.csv` retains the initial counts.
 
 The final notebook report shows primary endpoint metrics for every recorded
-method, a direct comparison of the three independent information-budget arms,
+method, a comparison of the retained logistic and RF supervision controls,
 selected-configuration frequencies, convergence and candidate coverage. It shows
 only a small sample of failure details with complete failure counts. Full tuning,
 per-target, calibration and reliability tables remain in the CSV exports; set
 `SHOW_FULL_DIAGNOSTICS=True` to display them all. Existing exports can be replotted
-without fitting. New Qiao results require a new training run; loading older
-exports does not fabricate methods that were not run.
+without fitting. New RF-mixed results and previously missing intermediate-rate
+fits require training; loading older exports does not fabricate unrun methods.

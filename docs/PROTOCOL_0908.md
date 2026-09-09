@@ -160,29 +160,41 @@ target intercepts.
 ## Same-budget supervision controls
 
 Let `C` denote the assayed entries in the authorized paired cells, and `O` the
-remaining assayed training entries. The independent-model controls share cells,
-features, splits, and reference budget:
+remaining assayed training entries. The retained controls share features, splits,
+and the same authorized paired C; observed-only RF does not use C's references:
 
 | Arm | Projection training objective |
 |---|---|
-| Reference-only | Reference Bernoulli loss on C, including reference negatives |
 | Calibrated PU | Observed PU likelihood on C and O; C estimates detection |
 | Reference + PU | Reference loss on C plus observed PU likelihood on O |
+| RF-observed | Ordinary RF using detections on C and O |
+| RF-reference | Ordinary RF using reference positives and negatives on C only |
+| RF-mixed | Ordinary RF using reference labels on C and detections on O |
 
-The mixed arm compiles `C` to reference labels with effective sensitivity 1 and
+The Reference + PU arm compiles `C` to reference labels with effective sensitivity 1 and
 `O` to observed labels with estimated sensitivity. It reuses the exact core
 likelihood, averaged over the included entries. It does not additionally count
 the marginal observed-label loss on `C` as an independent projection outcome.
 
-Reference+PU versus Reference-only isolates the contribution of the additional
-detection-only cells under this protocol. Calibrated PU versus Reference-only
-also changes how paired references are used and cannot alone establish that
-isolated contribution. Common validation scoring uses the original validation
+RF-mixed counts every assayed training entry once. It uses no PU likelihood or
+sensitivity rescaling. Its output is a mixed-label score, not an identified
+reference probability p or detection probability q. Reference proper scores and
+hidden recovery use that raw score; p/q/h arrays are absent in its score export.
+RF-mixed versus RF-reference changes the training label view and the use of the
+remaining detections; it is not an independent-logistic information ablation.
+Both Prevalence methods and reference-only logistic are retired from new runs
+and diagnostic plots. Their historical exports and the low-level reference-only
+supervision compiler (still used by RF-reference) remain readable.
+
+Common validation scoring uses the original validation
 detections: a reference-probability predictor is mapped to observed probability
 with the same training-side detector. Validation references do not choose its
-hyperparameters. The reference-only predictor may therefore share calibration
-information for common selection while using only references to fit projection
-coefficients; this access should be reported explicitly.
+hyperparameters. RF-observed and RF-mixed score their raw predictions against
+that same D, without multiplying by sensitivity. For RF-mixed this is an explicit
+raw-score selection rule, not a claim of observed-probability calibration;
+its `validation_score_semantics` records this distinction. RF-reference uses
+the shared training-side detector for selection while fitting only C's labels.
+All RF arms use the same candidate grid, candidate cap and seed schedule.
 
 ## Fixed experiment matrix
 
@@ -195,8 +207,8 @@ restricted to the following scopes, rather than crossed with every dataset:
 | Mechanism controls | Simulation only: SCAR and Target-SAR at 80%, all three sharing strengths |
 | Calibration-size controls | Simulation only: sharing 0 and 1, Technical-SAR 80%, correctly specified detector; optional sizes from `CALIBRATION_FRACTIONS`, default `(0.20,)` reuses primary |
 | Calibration misspecification | Simulation only: sharing 0 and 1, Technical-SAR 80%, 20% budget; omit technical score or pool targets |
-| Independent information-budget controls | Natural endpoint or 80% artificial loss |
-| Observed-only/reference-only random forests | Natural endpoint or primary 0/80% endpoints |
+| Reference + PU logistic | All five primary loss rates; natural paired evaluation for Projection-TAGs |
+| RF-observed / RF-reference / RF-mixed | All five primary loss rates; natural paired evaluation for Projection-TAGs |
 | Post-hoc sensitivity rescaling | Reuse observed-model predictions in target-constant SCAR/Target-SAR settings |
 | Fixed-predictor p/h ranking | Reuse saved primary predictions, without retraining |
 | Qiao comparisons | Enabled by default on every primary rate/natural endpoint; target-ID adaptation when descriptors are disabled |
@@ -208,7 +220,11 @@ zero/full-sharing simulation. All default scenarios use the 20% paired budget.
 `(PAIRED_FRACTION,)`. Setting it to `(0.10, 0.20, 0.40)` restores the additional
 size comparison and eleven zero/full-sharing scenarios; the primary fraction
 is reused instead of adding a duplicate scenario. Information and RF controls
-are model-level additions at the stated endpoints, not extra missingness axes.
+are model-level additions at every primary rate, not extra missingness axes.
+With all default switches enabled, each primary rate has 12 methods. A real-data
+thinning panel therefore has 60 model evaluations per fold/repetition, or 900
+across three folds and five repetitions. Optional simulation mechanism and
+calibration diagnostics retain their stated endpoint scopes.
 
 Qiao's squared-error and logit variants use only observed training outcomes and
 the common observed-validation log-loss rule. When `USE_TARGET_FEATURES=False`,

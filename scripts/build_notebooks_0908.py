@@ -499,9 +499,10 @@ def notebook(name, commit, source_hash):
         '''),
         ("markdown", """## PU-Joint and every recorded benchmark
 
-        These additional figures
-        retain every available benchmark at its actually evaluated loss rates. Endpoint-only
-        controls are shown at those endpoints; missing intermediate experiments are not invented.
+        New primary runs evaluate every retained method at 0%, 20%, 40%, 60%, and 80% loss.
+        Dashed lines use neither PU nor paired references; solid lines use either kind of information.
+        Both Prevalence methods and reference-only logistic are excluded. Older exports retain
+        gaps where fits were not run. Projection-TAGs uses its natural paired evaluation.
         Existing primary figures above are retained. Figures display here and save as PDF."""),
         ("code", '''
         benchmark_figure_paths = {}
@@ -511,10 +512,12 @@ def notebook(name, commit, source_hash):
         '''),
         ("markdown", """## Same paired-reference budget
 
-        Independent logistic models compare
-        Reference-only, Calibrated PU (`PU` in saved tables), and Reference + PU. All use the same
-        paired cells, cell features, splits and tuning rules. The mixed arm uses each paired
-        reference outcome once; those entries do not also contribute detection loss.
+        Compare Calibrated PU (`PU`), Reference + PU logistic, and three random forests:
+        observed labels, paired references only, and observed + paired references (`RF-mixed`).
+        Paired methods share the same authorized subset, features and splits. RF-mixed uses
+        reference labels on paired cells and observed labels elsewhere, once per entry, without
+        PU correction. Its raw mixed-label scores are evaluated directly, without p/h reinterpretation.
+        All three RF arms share the same candidate grid, seed schedule and validation-label budget.
         Only actually recorded, matched conditions are plotted."""),
         ("code", '''
         information_budget_figure_paths = {}

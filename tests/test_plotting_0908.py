@@ -110,13 +110,13 @@ def test_raw_metric_fallback_averages_folds_before_repetitions():
     assert result.iloc[0]["macro_auprc"] == pytest.approx(.5)
 
 
-def test_benchmark_figures_add_every_available_model_without_replacing_paper_plots(tmp_path, monkeypatch):
+def test_benchmark_figures_keep_active_models_and_legacy_gaps_without_replacing_paper_plots(tmp_path, monkeypatch):
     from gene2wire.experiments.plotting import plot_benchmark_results
     figures = _capture_show(monkeypatch)
     artifacts = _artifacts()
     primary = artifacts.tables["aggregate"].query("analysis == 'primary'").copy()
     extras = []
-    for model in ("RF-observed", "RF-reference", "Prevalence-observed", "Prevalence-reference",
+    for model in ("RF-observed", "RF-reference", "RF-mixed", "Prevalence-observed", "Prevalence-reference",
                   "Reference-only", "Reference+PU", "Qiao-squared", "Qiao-logit", "Future baseline"):
         for rate in ((0., .8) if model.startswith(("RF", "Prevalence")) else (.8,)):
             extras.append({**primary.iloc[0].to_dict(), "model": model, "loss_rate": rate})
@@ -130,9 +130,10 @@ def test_benchmark_figures_add_every_available_model_without_replacing_paper_plo
     assert all(path.suffix == ".pdf" and path.parent.name == "all_benchmarks" for path in paths.values())
     assert not list(tmp_path.rglob("*.png"))
     benchmark = figures[-1]
-    assert len(benchmark.legends[0].get_texts()) == len(MODEL_ORDER) + 9
+    assert len(benchmark.legends[0].get_texts()) == len(MODEL_ORDER) + 7
     legend_labels = {text.get_text() for text in benchmark.legends[0].get_texts()}
     assert {"PU-Joint", "Future baseline", "RF (paired references)", "Reference + PU logistic"} <= legend_labels
+    assert not {"Reference-only logistic", "Prevalence (observed labels)", "Prevalence (paired references)"} & legend_labels
     curves = {line.get_label(): line for line in benchmark.axes[0].lines}
     forest = curves["RF (observed labels)"]
     assert forest.get_linestyle() == "None"
@@ -150,6 +151,32 @@ def test_benchmark_figures_add_every_available_model_without_replacing_paper_plo
         assert legend_lines[label].get_marker() == curves[label].get_marker()
         assert legend_lines[label].get_color() == curves[label].get_color()
         assert legend_lines[label].get_linewidth() == curves[label].get_linewidth()
+
+
+def test_all_rate_benchmark_lines_and_legend_encode_reference_information(tmp_path, monkeypatch):
+    from gene2wire.experiments.plotting import plot_benchmark_results
+    figures = _capture_show(monkeypatch)
+    artifacts = _artifacts()
+    primary = artifacts.tables["aggregate"].query("analysis == 'primary'")
+    template = primary.loc[primary["model"].eq("PU")]
+    extras = [template.assign(model=name) for name in (
+        "Reference+PU", "RF-observed", "RF-reference", "RF-mixed", "Qiao-ID-squared", "Qiao-ID-logit")]
+    artifacts.tables["aggregate"] = pd.concat([primary, *extras], ignore_index=True)
+    plot_benchmark_results(artifacts, tmp_path)
+    figure = figures[-1]
+    legend = figure.legends[0]
+    legend_lines = dict(zip([text.get_text() for text in legend.get_texts()], legend.get_lines()))
+    solid = {"PU logistic", "PU-MIRT", "PU-Joint", "Reference + PU logistic",
+             "RF (paired references)", "RF (observed + paired references)"}
+    dashed = {"Logistic", "MIRT", "Joint", "RF (observed labels)", "Qiao-ID-squared", "Qiao-ID-logit"}
+    assert set(legend_lines) == solid | dashed
+    for line in figure.axes[0].lines:
+        expected = "-" if line.get_label() in solid else "--"
+        assert line.get_linestyle() == legend_lines[line.get_label()].get_linestyle() == expected
+        np.testing.assert_allclose(line.get_xdata(), [0., .2, .4, .6, .8])
+    # Hidden recall is undefined at zero loss, even though every model is fitted there.
+    for line in figure.axes[2].lines:
+        np.testing.assert_allclose(line.get_xdata(), [.2, .4, .6, .8])
 
 
 def test_benchmark_legend_uses_visible_segments_across_metrics_and_respects_gaps(tmp_path, monkeypatch):
@@ -255,13 +282,13 @@ def _information_artifacts(*, simulation=False, natural=False):
                            datasets=("simulation" if simulation else "Projection_TAGs" if natural else "BARseq_M1",))
     base = artifacts.tables["aggregate"].query("analysis == 'primary' and model == 'PU'")
     endpoint = base.loc[base["loss_rate"].isna() | base["loss_rate"].eq(.8)]
-    extras = [endpoint.assign(model="Reference-only", macro_auprc=.31),
-              endpoint.assign(model="Reference+PU", macro_auprc=.32)]
+    extras = [endpoint.assign(model=name, macro_auprc=value) for name, value in (
+        ("Reference+PU", .32), ("RF-observed", .28), ("RF-reference", .31), ("RF-mixed", .33))]
     artifacts.tables["aggregate"] = pd.concat([artifacts.tables["aggregate"], *extras], ignore_index=True)
     return artifacts
 
 
-def test_information_budget_compares_three_independent_arms_at_80_percent(tmp_path, monkeypatch):
+def test_information_budget_compares_retained_logistic_rf_arms_at_80_percent(tmp_path, monkeypatch):
     from gene2wire.experiments.plotting import plot_information_budget_results
     figures = _capture_show(monkeypatch)
     artifacts = _information_artifacts()
@@ -274,11 +301,11 @@ def test_information_budget_compares_three_independent_arms_at_80_percent(tmp_pa
                and path.read_bytes().startswith(b"%PDF") for path in paths.values())
     assert len(figures[0].axes) == 3
     axis = figures[0].axes[0]
-    assert [tick.get_text() for tick in axis.get_yticklabels()] == [
-        "Reference-only", "Calibrated PU", "Reference + PU"]
-    assert [line.get_label() for line in axis.lines] == [
-        "Reference-only", "Calibrated PU", "Reference + PU"]
-    assert [float(line.get_xdata()[0]) for line in axis.lines] == pytest.approx([.31, .23, .32])
+    labels = ["Calibrated PU logistic", "Reference + PU logistic", "RF: observed labels",
+              "RF: paired references", "RF: observed + paired references"]
+    assert [tick.get_text() for tick in axis.get_yticklabels()] == labels
+    assert [line.get_label() for line in axis.lines] == labels
+    assert [float(line.get_xdata()[0]) for line in axis.lines] == pytest.approx([.23, .32, .28, .31, .33])
     assert "80%" in figures[0]._suptitle.get_text()
     assert not list(tmp_path.rglob("*.png"))
 
@@ -311,9 +338,9 @@ def test_information_budget_natural_missing_arms_and_undefined_metrics_are_expli
     assert "natural paired evaluation" in figures[0]._suptitle.get_text()
     assert "80%" not in figures[0]._suptitle.get_text()
     assert any(text.get_text() == "Not run" for text in figures[0].axes[0].texts)
-    assert len(figures[0].axes[0].lines) == 2
+    assert len(figures[0].axes[0].lines) == 4
     assert len(figures[0].axes[2].lines) == 0
-    assert sum(text.get_text() == "Undefined / unavailable" for text in figures[0].axes[2].texts) == 2
+    assert sum(text.get_text() == "Undefined / unavailable" for text in figures[0].axes[2].texts) == 4
 
 
 def test_information_budget_never_substitutes_a_different_loss_or_mixes_semantics(tmp_path):

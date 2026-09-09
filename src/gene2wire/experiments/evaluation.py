@@ -17,7 +17,7 @@ from scipy.optimize import minimize
 from scipy.special import expit, logit
 from sklearn.metrics import average_precision_score, roc_auc_score
 
-ProbabilitySemantics = Literal["reference", "observed"]
+ProbabilitySemantics = Literal["reference", "observed", "mixed"]
 _EPS = np.finfo(np.float64).eps
 
 
@@ -186,9 +186,12 @@ def evaluate_predictions(
     Observed-probability adapters may supply an unbounded finite ``ranking_score``
     (e.g. a squared-error bilinear score before probability clipping). This score
     affects discrimination/recovery only, and is exported for reproducibility.
+    Mixed-label RF scores are evaluated directly against each outcome, without
+    sensitivity rescaling or h-ranking. They are neither identified p nor q;
+    the exported p/q/h arrays are therefore absent for this baseline.
     """
-    if probability_semantics not in {"reference", "observed"}:
-        raise ValueError("probability_semantics must be 'reference' or 'observed'")
+    if probability_semantics not in {"reference", "observed", "mixed"}:
+        raise ValueError("probability_semantics must be 'reference', 'observed', or 'mixed'")
     z, d = np.asarray(reference, dtype=float), np.asarray(observed, dtype=float)
     if z.ndim != 2 or z.shape != d.shape:
         raise ValueError("reference and observed must be aligned cell-by-target matrices")
@@ -305,7 +308,9 @@ def evaluate_predictions(
                    micro_hidden_auprc=micro_ah if p is not None else micro_ap)
     return {"summary": summary, "per_target": rows, "reliability": reliability,
             "scores": {"prediction": prediction, "ranking_score": ranking,
-                       "p": p, "q": q, "h": h, "e": e}}
+                       "p": p, "q": q if probability_semantics != "mixed" else None,
+                       "h": h, "e": e,
+                       "mixed_label_score": prediction if probability_semantics == "mixed" else None}}
 
 
 def evaluate_detection_calibration(reference: Any, observed: Any, measured: Any,
