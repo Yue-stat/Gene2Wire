@@ -13,10 +13,11 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 NAMES = ("simulation", "SPIDER", "MERGE_seq", "Projection_TAGs", "BARseq")
+RELEASE_DATE = "0909"
 
 
 def load(name):
-    return json.loads((ROOT / f"{name}_0908.ipynb").read_text())
+    return json.loads((ROOT / f"{name}_{RELEASE_DATE}.ipynb").read_text())
 
 
 def text(cell):
@@ -50,6 +51,7 @@ def test_clean_valid_python_and_shared_defaults(name):
         "RUN_INFORMATION_CONTROLS": True, "RUN_RANDOM_FOREST": True,
         "RUN_MECHANISM_CONTROLS": True, "RUN_CALIBRATION_CONTROLS": True,
         "RUN_QIAO": True, "PAIRED_FRACTION": .2,
+        "SHOW_FULL_DIAGNOSTICS": True,
     }.items():
         assert assignments[key] == expected
     joined = "\n".join(all_code)
@@ -98,7 +100,8 @@ def test_generated_results_only_skips_all_raw_and_fit_cells(name):
     assert "load_existing_exports(" in all_code
     assert "configure_full_display()" in all_code
     assert "display_diagnostics(artifacts, label=label, full=SHOW_FULL_DIAGNOSTICS)" in all_code
-    assert "SHOW_FULL_DIAGNOSTICS = False" in all_code
+    assert "SHOW_FULL_DIAGNOSTICS = True" in all_code
+    assert "plot_detection_only_benchmark_results(" in all_code
     assert "plot_information_budget_results(" in all_code
     assert "RUN_QIAO = True" in all_code
     assert "enabled in simulation only" not in all_code
@@ -129,7 +132,8 @@ def test_generator_reproduces_checked_in_notebooks(tmp_path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     manifest = load("simulation")["metadata"]["gene2wire"]
-    generated = module.build(manifest["core_commit"], manifest["source_hash"], tmp_path)
+    generated = module.build(manifest["core_commit"], manifest["source_hash"], tmp_path,
+                             date_suffix=manifest["notebook_date"])
     for output in generated:
         assert output.read_bytes() == (ROOT / output.name).read_bytes()
 
@@ -196,3 +200,41 @@ def test_simulation_exposes_primary_budget_and_optional_size_sweep():
     code = module.SETTINGS
     assert "paired_fraction=PAIRED_FRACTION" in code
     assert "calibration_fractions=CALIBRATION_FRACTIONS" in code
+
+
+def test_dated_releases_preserve_previous_files_and_replace_same_date(tmp_path):
+    module = builder()
+    previous = module.build("a" * 40, "b" * 64, tmp_path, date_suffix="0908")
+    previous_bytes = {p.name: p.read_bytes() for p in previous}
+    current = module.build("c" * 40, "d" * 64, tmp_path, date_suffix="0909")
+    replaced = module.build("e" * 40, "f" * 64, tmp_path, date_suffix="0909")
+    assert current == replaced
+    assert len(list(tmp_path.glob("*.ipynb"))) == 10
+    for path in previous:
+        assert path.read_bytes() == previous_bytes[path.name]
+    for path in replaced:
+        nb = json.loads(path.read_text())
+        assert nb["metadata"]["gene2wire"]["core_commit"] == "e" * 40
+        config = next(text(c) for c in nb["cells"] if "N_OUTER_FOLDS =" in text(c))
+        assert "FIGURE_DIR = BASE_DIR / 'figures' / '0909'" in config
+        assert "CHECKPOINT_DIR = BASE_DIR / 'checkpoints' / '0908'" in config
+
+
+def test_default_release_date_tracks_today(monkeypatch):
+    from datetime import datetime, timezone
+    module = builder()
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            assert tz == timezone.utc
+            return cls(2026, 9, 10, tzinfo=tz)
+
+    monkeypatch.setattr(module, "datetime", Clock)
+    assert module.release_date() == "0910"
+
+
+@pytest.mark.parametrize("invalid", ("909", "0931", "0000", "../x", "１３１２"))
+def test_invalid_release_date_rejected(invalid):
+    with pytest.raises(ValueError):
+        builder().release_date(invalid)

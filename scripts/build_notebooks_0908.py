@@ -1,6 +1,8 @@
-"""Rebuild clean OnDemand entry points for the shared 0908 experiment protocol.
+"""Build dated OnDemand entry points for the shared 0908 experiment protocol.
 
-Usage: python scripts/build_notebooks_0908.py --commit <SHA> --source-hash <SHA256>
+Usage: python scripts/build_notebooks_0908.py --commit <SHA> --source-hash <SHA256> [--date MMDD]
+The default suffix is today's UTC date. Same-date files are replaced; other dates
+are preserved. Notebook release dates do not change scientific seeds or caches.
 The generator itself has no model or dataset implementation.
 """
 from __future__ import annotations
@@ -8,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import inspect
+from datetime import datetime, timezone
 from pathlib import Path
 import textwrap
 
@@ -16,8 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK_NAMES = ("simulation", "SPIDER", "MERGE_seq", "Projection_TAGs", "BARseq")
 
 
-def cell(kind, source, index):
-    result = {"cell_type": kind, "id": f"g2w0908-{index:03d}", "metadata": {},
+def cell(kind, source, index, date_suffix):
+    result = {"cell_type": kind, "id": f"g2w{date_suffix}-{index:03d}", "metadata": {},
               "source": (inspect.cleandoc(source) if kind == "markdown" else textwrap.dedent(source).strip()) + "\n"}
     if kind == "code":
         result.update(execution_count=None, outputs=[])
@@ -53,13 +56,13 @@ RUN_QIAO = True  # Target-ID adaptation when USE_TARGET_FEATURES=False; declared
 SHOW_PROGRESS = True
 PROGRESS_LEVEL = 'summary'  # One elapsed/finished/total/Los-Angeles-time line per minute.
 PROGRESS_INTERVAL_SECONDS = 60.0
-SHOW_FULL_DIAGNOSTICS = False  # True displays every saved trial, target table and manifest.
+SHOW_FULL_DIAGNOSTICS = True  # False switches to compact summaries.
 
 BASE_DIR = Path('/home/yueyue/gene2wire').expanduser()
 RAW_DATA_DIR = BASE_DIR / 'raw_data'
-CHECKPOINT_DIR = BASE_DIR / 'checkpoints' / '0908'
+CHECKPOINT_DIR = BASE_DIR / 'checkpoints' / '0908'  # Scientific protocol cache, independent of notebook date.
 EXPORT_DIR = BASE_DIR / 'paper_figure_exports'
-FIGURE_DIR = BASE_DIR / 'figures' / '0908'
+FIGURE_DIR = BASE_DIR / 'figures' / '__NOTEBOOK_DATE__'
 CODE_CACHE_DIR = BASE_DIR / 'code'
 
 # Reload a completed export to add figures/diagnostics without fitting or raw downloads.
@@ -182,6 +185,7 @@ from IPython.display import display
 from gene2wire.experiments.pipeline import run_experiment, run_simulation_experiments
 from gene2wire.experiments.plotting import (
     plot_results, plot_benchmark_results, plot_information_budget_results,
+    plot_detection_only_benchmark_results,
 )
 from gene2wire.experiments.reporting import (
     configure_compact_display, configure_full_display, display_diagnostics, load_existing_exports,
@@ -289,8 +293,8 @@ def preflight(dataset):
 
 
 FINAL = '''
-# Endpoint metrics and compact selection/convergence diagnostics are the default.
-# All trial/per-target/prediction exports remain available on disk.
+# Full saved diagnostics display by default; set SHOW_FULL_DIAGNOSTICS=False for summaries.
+# Trial/per-target/prediction exports also remain available on disk.
 for label, artifacts in all_artifacts.items():
     display_diagnostics(artifacts, label=label, full=SHOW_FULL_DIAGNOSTICS)
 print('Figure PDFs:', FIGURE_DIR)
@@ -441,7 +445,18 @@ def dataset_cells(name):
     ]
 
 
-def notebook(name, commit, source_hash):
+def release_date(date_suffix=None):
+    if date_suffix is None:
+        return datetime.now(timezone.utc).strftime("%m%d")
+    if len(date_suffix) != 4 or not date_suffix.isascii() or not date_suffix.isdigit():
+        raise ValueError("Notebook date must be four digits in MMDD format")
+    # A leap year admits every valid month/day while rejecting impossible dates.
+    datetime.strptime("2000" + date_suffix, "%Y%m%d")
+    return date_suffix
+
+
+def notebook(name, commit, source_hash, date_suffix=None):
+    date_suffix = release_date(date_suffix)
     expected_labels = {"BARseq": ("A1", "M1"), "Projection_TAGs": ("Projection-TAGs",),
                        "MERGE_seq": ("MERGE-seq",)}.get(name, (name,))
     modules = ["numpy", "scipy", "pandas", "sklearn", "joblib", "threadpoolctl", "matplotlib", "yaml", "IPython"]
@@ -450,7 +465,7 @@ def notebook(name, commit, source_hash):
     if name == "Projection_TAGs":
         modules.append("openpyxl")
     parts = [
-        ("markdown", f"""# Gene2Wire {name} — OnDemand 0908
+        ("markdown", f"""# Gene2Wire {name} — OnDemand {date_suffix}
 
         This notebook runs the shared, versioned paper experiment code. It contains no
         dataset-specific model patches. Use a Python 3.10+ OnDemand kernel with the repository's
@@ -463,8 +478,8 @@ def notebook(name, commit, source_hash):
 
         For completed results, set `RESULTS_ONLY=True` and fill `EXISTING_EXPORT_DIRS`
         with exact run directories. This skips raw-data loading and fitting, preserves the
-        saved scientific settings, and adds all figures and concise diagnostics.
-        Set `SHOW_FULL_DIAGNOSTICS=True` only when you need every exported table.
+        saved scientific settings, and adds all figures and full diagnostics.
+        `SHOW_FULL_DIAGNOSTICS=True` is the default; set it to `False` for compact summaries.
 
         Progress prints one summary per minute in Los Angeles local time. One unit is a
         model at one repetition, fold and scenario, including selection and final refit.
@@ -475,6 +490,7 @@ def notebook(name, commit, source_hash):
         the harmonized reruns and their diagnostics have been reviewed."""),
         ("markdown", "## Run configuration"),
         ("code", CONFIG.replace("__CORE_COMMIT_0908__", commit).replace("__SOURCE_HASH_0908__", source_hash)
+         .replace("__NOTEBOOK_DATE__", date_suffix)
          .replace("__EXISTING_EXPORT_DIRS_0908__", repr(dict.fromkeys(expected_labels)))
          + f"\nREQUIRED_MODULES = {modules!r}\nEXPECTED_EXPORT_LABELS = {expected_labels!r}\n"),
         ("markdown", """## Load the pinned code
@@ -519,7 +535,7 @@ def notebook(name, commit, source_hash):
 
         Curves retain the complete configured
         loss-rate grid. Simulation includes all three sharing strengths; BARseq includes both panels.
-        The natural Projection-TAGs analysis uses paired-audit and model-comparison panels.
+        The natural Projection-TAGs analysis retains its paired-label audit; no model dot panels are drawn.
         No PNG files are written."""),
         ("code", '''
         for label, artifacts in all_artifacts.items():
@@ -540,6 +556,22 @@ def notebook(name, commit, source_hash):
             benchmark_figure_paths[label] = plot_benchmark_results(artifacts, output_dir=FIGURE_DIR, show=True)
         display(benchmark_figure_paths)
         '''),
+        ("markdown", """## Benchmarks without reference labels as training samples
+
+        This additional figure includes every recorded method whose projection predictor does
+        not train directly on paired-reference outcomes. PU logistic, PU-MIRT, PU-Joint and
+        sensitivity rescaling remain: paired references may calibrate their detector.
+        Reference-only, all Reference + PU variants, RF (paired references), and RF (observed
+        + paired references) are excluded from this figure. They remain in the plots above.
+        Solid lines use PU or sensitivity calibration; other methods use dashed lines.
+        Figures display here and save as PDF. Natural and single-rate model dot panels remain off."""),
+        ("code", '''
+        detection_only_figure_paths = {}
+        for label, artifacts in all_artifacts.items():
+            detection_only_figure_paths[label] = plot_detection_only_benchmark_results(
+                artifacts, output_dir=FIGURE_DIR, show=True)
+        display(detection_only_figure_paths)
+        '''),
         ("markdown", """## Same paired-reference budget
 
         Curves compare exactly Reference + PU logistic, RF (observed + paired references),
@@ -556,37 +588,40 @@ def notebook(name, commit, source_hash):
                 artifacts, output_dir=FIGURE_DIR, show=True)
         display(information_budget_figure_paths)
         '''),
-        ("markdown", """## Useful diagnostics and reusable exports
+        ("markdown", """## Full diagnostics and reusable exports
 
-        The default report shows
+        The report shows
         endpoint metrics for every recorded method, selected-configuration frequencies, convergence,
         candidate coverage and failures. Per-target metrics, every tuning trial, calibration tables,
-        and the saved run manifest remain in the export directory. `model_evaluation_plan.csv`
+        and the saved run manifest display by default and remain in the export directory. `model_evaluation_plan.csv`
         lists every unit in the progress denominator; `model_cache_accounting.csv` distinguishes
         restored results, reused fits, and new/mixed fitting. An unchecked cache is not counted
         as a cache miss. Progress still prints one line per minute.
         `joint_selection_diagnostics.csv` reports the candidate-family counts, converged
         validation minima and the selected model's margin over its own direct endpoint.
         Full diagnostics can also compute this table from older exports without fitting.
-        Set `SHOW_FULL_DIAGNOSTICS=True` to display these full tables."""),
+        Set `SHOW_FULL_DIAGNOSTICS=False` to show only the compact diagnostic summaries."""),
         ("code", FINAL),
     ])
-    return {"cells": [cell(kind, source, i) for i, (kind, source) in enumerate(parts)],
+    return {"cells": [cell(kind, source, i, date_suffix) for i, (kind, source) in enumerate(parts)],
             "metadata": {"kernelspec": {"display_name": "Python 3 (OnDemand)", "language": "python", "name": "python3"},
                          "language_info": {"name": "python", "version": "3.10"},
                          "gene2wire": {"protocol": "0908-v2-balanced", "core_commit": commit,
                                        "source_hash": source_hash, "dataset": name,
+                                       "notebook_date": date_suffix,
                                        "environment": "OnDemand"}},
             "nbformat": 4, "nbformat_minor": 5}
 
 
-def build(commit="__CORE_COMMIT_0908__", source_hash="__SOURCE_HASH_0908__", output_dir=ROOT):
+def build(commit="__CORE_COMMIT_0908__", source_hash="__SOURCE_HASH_0908__", output_dir=ROOT,
+          date_suffix=None):
+    date_suffix = release_date(date_suffix)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     paths = []
     for name in NOTEBOOK_NAMES:
-        destination = output_dir / f"{name}_0908.ipynb"
-        destination.write_text(json.dumps(notebook(name, commit, source_hash), indent=1, ensure_ascii=False) + "\n")
+        destination = output_dir / f"{name}_{date_suffix}.ipynb"
+        destination.write_text(json.dumps(notebook(name, commit, source_hash, date_suffix), indent=1, ensure_ascii=False) + "\n")
         paths.append(destination)
     return paths
 
@@ -596,6 +631,8 @@ if __name__ == "__main__":
     parser.add_argument("--commit", default="__CORE_COMMIT_0908__")
     parser.add_argument("--source-hash", default="__SOURCE_HASH_0908__")
     parser.add_argument("--output-dir", type=Path, default=ROOT)
+    parser.add_argument("--date", dest="date_suffix", default=None,
+                        help="Release suffix MMDD; defaults to today's UTC date")
     args = parser.parse_args()
-    for path in build(args.commit, args.source_hash, args.output_dir):
+    for path in build(args.commit, args.source_hash, args.output_dir, args.date_suffix):
         print(path)

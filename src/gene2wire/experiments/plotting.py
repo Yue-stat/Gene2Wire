@@ -405,14 +405,14 @@ _BENCHMARK_COLORS = {**COLORS,
     "Reference+PU-MIRT": "#00664A", "Reference+PU-Joint": "#882D00",
     "Logistic-rescaled": "#CC79A7", "RF-observed": "#AA4499",
     "RF-reference": "#882255", "RF-mixed": "#9467BD", "Qiao-squared": "#44AA99",
-    "Qiao-logit": "#117733",
+    "Qiao-logit": "#117733", "Qiao-ID-squared": "#F7B6D2", "Qiao-ID-logit": "#E377C2",
 }
 _BENCHMARK_MARKERS = {**MARKERS,
     "Reference-only": "D",
     "Reference+PU": "P", "Reference+PU-MIRT": "s", "Reference+PU-Joint": "^",
     "Logistic-rescaled": "*",
     "RF-observed": "v", "RF-reference": "D", "RF-mixed": "h",
-    "Qiao-squared": "<", "Qiao-logit": ">",
+    "Qiao-squared": "<", "Qiao-logit": ">", "Qiao-ID-squared": "v", "Qiao-ID-logit": "D",
 }
 _BENCHMARK_SCOPES = ("dataset", "sharing_strength", "analysis", "mechanism",
                      "calibration_fraction", "calibration_spec")
@@ -570,6 +570,52 @@ def plot_benchmark_results(artifacts: Any, output_dir: str | Path, *,
     remain in the preserved main plots and exported tables.
     """
     frame = _benchmark_aggregate(artifacts.tables)
+    return _plot_benchmark_frame(
+        frame, Path(output_dir) / "all_benchmarks", show=show, metrics=metrics,
+        show_single_condition_dots=show_single_condition_dots,
+        filename_suffix="all_benchmarks_0908",
+        footer="Solid: PU or paired references; dashed: neither. "
+               "Means over folds and repetitions; missing fits are not interpolated.")
+
+
+def plot_detection_only_benchmark_results(
+        artifacts: Any, output_dir: str | Path, *, show: bool = True,
+        metrics: tuple[str, ...] = PRIMARY_METRICS,
+        show_single_condition_dots: bool = False) -> dict[str, Path]:
+    """Add benchmarks whose predictors train on observed detection labels.
+
+    Paired-reference labels may estimate detector sensitivities for PU learning
+    or post-hoc rescaling, but they are never direct predictor training labels
+    in this comparison. Exclude Reference-only, every Reference+PU structure,
+    RF-reference and RF-mixed; retain other available active models, including
+    observed-label RF and Qiao. This is an information-use comparison, not a
+    claim that PU methods require no paired references.
+
+    Existing figures are preserved. PDFs live in
+    ``output_dir/detection_only_benchmarks`` and are displayed when ``show`` is
+    true. Controls retain separate settings, and natural or single-rate model
+    dot panels stay disabled unless explicitly requested. Plotting reads the
+    existing result tables and requires no model refitting.
+    """
+    frame = _benchmark_aggregate(artifacts.tables)
+    if not frame.empty:
+        model = frame["model"].astype(str)
+        direct_reference = (model.str.startswith(("Reference-only", "Reference+PU"))
+                            | model.isin(("RF-reference", "RF-mixed")))
+        frame = frame.loc[~direct_reference].copy()
+    return _plot_benchmark_frame(
+        frame, Path(output_dir) / "detection_only_benchmarks", show=show,
+        metrics=metrics, show_single_condition_dots=show_single_condition_dots,
+        filename_suffix="detection_only_benchmarks",
+        footer="Paired references may calibrate detection; predictor training uses observed labels.\n"
+               "Solid: PU or sensitivity rescaling; dashed: neither. "
+               "Means over folds and repetitions; missing fits are not interpolated.")
+
+
+def _plot_benchmark_frame(frame: pd.DataFrame, directory: Path, *, show: bool,
+                          metrics: tuple[str, ...], show_single_condition_dots: bool,
+                          filename_suffix: str, footer: str) -> dict[str, Path]:
+    """Render the full or information-filtered benchmark tables identically."""
     if frame.empty:
         return {}
     missing = set(metrics).difference(frame.columns)
@@ -580,7 +626,6 @@ def plot_benchmark_results(artifacts: Any, output_dir: str | Path, *,
     scope_columns = [key for key in _BENCHMARK_SCOPES if key in frame]
     grouping = (frame.groupby(scope_columns, observed=True, dropna=False, sort=True)
                 if scope_columns else [((), frame)])
-    directory = Path(output_dir) / "all_benchmarks"
     paths = {}
     with plt.rc_context(_STYLE):
         for scope_key, selected in grouping:
@@ -617,7 +662,7 @@ def plot_benchmark_results(artifacts: Any, output_dir: str | Path, *,
                 title_parts.append(f"loss = {float(finite_rates[0]):.0%}")
             title = " · ".join(title_parts)
             stem = "__".join(f"{label}_{_slug(value)}" for label, value in scope.items() if pd.notna(value)) or "results"
-            destination = directory / f"{stem}__all_benchmarks_0908.pdf"
+            destination = directory / f"{stem}__{filename_suffix}.pdf"
             count = len(metrics)
             if curves:
                 legend_columns = min(4, max(1, int(4.2 * count / 2.8)))
@@ -633,8 +678,7 @@ def plot_benchmark_results(artifacts: Any, output_dir: str | Path, *,
                               ncol=min(legend_columns, len(models)), fontsize=8.5, columnspacing=1.5,
                               handlelength=2.5)
                 figure.suptitle(title, fontsize=10, y=.995)
-                figure.text(.5, .012, "Solid: PU or paired references; dashed: neither. "
-                            "Means over folds and repetitions; missing fits are not interpolated.",
+                figure.text(.5, .012, footer,
                             ha="center", va="bottom", fontsize=8, color="#555555")
                 figure.canvas.draw()
                 legend_bottom = legend.get_window_extent(figure.canvas.get_renderer()).transformed(

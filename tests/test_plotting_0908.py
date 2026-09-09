@@ -394,3 +394,87 @@ def test_natural_plot_results_without_audit_does_not_fabricate_comparisons(tmp_p
     assert len(paths) == len(figures) == 2
     assert len(figures[0].axes) == 3
     assert all(path.suffix == ".pdf" for path in paths.values())
+
+
+def test_detection_only_benchmarks_filter_training_labels_keep_calibration_and_existing_figures(
+        tmp_path, monkeypatch):
+    from gene2wire.experiments.plotting import (
+        plot_benchmark_results, plot_detection_only_benchmark_results,
+        plot_information_budget_results)
+
+    figures = _capture_show(monkeypatch)
+    artifacts = _information_artifacts()
+    base = artifacts.tables["aggregate"].query("analysis == 'primary' and model == 'PU'")
+    extras = [base.assign(model=name) for name in (
+        "Logistic-rescaled", "Qiao-ID-squared", "Qiao-ID-logit", "Qiao-squared", "Qiao-logit")]
+    artifacts.tables["aggregate"] = pd.concat([artifacts.tables["aggregate"], *extras], ignore_index=True)
+    before = artifacts.tables["aggregate"].copy(deep=True)
+    plot_benchmark_results(artifacts, tmp_path)
+    all_curves = {line.get_label(): line for line in figures[-1].axes[0].lines}
+    plot_information_budget_results(artifacts, tmp_path)
+    original_pdfs = {path: path.read_bytes() for path in tmp_path.rglob("*.pdf")}
+
+    paths = plot_detection_only_benchmark_results(artifacts, tmp_path)
+    assert len(paths) == 1
+    assert all(path.parent.name == "detection_only_benchmarks" and path.suffix == ".pdf"
+               and path.read_bytes().startswith(b"%PDF") for path in paths.values())
+    assert {path: path.read_bytes() for path in original_pdfs} == original_pdfs
+    pd.testing.assert_frame_equal(artifacts.tables["aggregate"], before)
+    assert not list(tmp_path.rglob("*.png"))
+
+    figure = figures[-1]
+    solid = {"PU logistic", "PU-MIRT", "PU-Joint", "Logistic + sensitivity rescaling"}
+    dashed = {"Logistic", "MIRT", "Joint", "RF (observed labels)",
+              "Qiao-ID-squared", "Qiao-ID-logit", "Qiao bilinear (squared error)",
+              "Qiao bilinear (logistic)"}
+    legend = figure.legends[0]
+    legend_lines = dict(zip([text.get_text() for text in legend.get_texts()], legend.get_lines()))
+    assert set(legend_lines) == solid | dashed
+    for index, axis in enumerate(figure.axes):
+        assert {line.get_label() for line in axis.lines} == solid | dashed
+        assert not axis.collections  # Curves, without horizontal model dots or invented CIs.
+        for line in axis.lines:
+            expected_style = "-" if line.get_label() in solid else "--"
+            assert line.get_linestyle() == legend_lines[line.get_label()].get_linestyle() == expected_style
+            assert line.get_color() == all_curves[line.get_label()].get_color()
+            assert line.get_marker() == all_curves[line.get_label()].get_marker()
+            np.testing.assert_allclose(line.get_xdata(), [.2, .4, .6, .8] if index == 2
+                                       else [0., .2, .4, .6, .8])
+    assert any("Paired references may calibrate detection" in text.get_text() for text in figure.texts)
+
+
+def test_detection_only_benchmarks_omit_natural_single_rate_and_excluded_only_tables(
+        tmp_path, monkeypatch):
+    from gene2wire.experiments.plotting import plot_detection_only_benchmark_results
+
+    figures = _capture_show(monkeypatch)
+    assert plot_detection_only_benchmark_results(_information_artifacts(natural=True), tmp_path) == {}
+    artifacts = _information_artifacts()
+    frame = artifacts.tables["aggregate"]
+    artifacts.tables["aggregate"] = frame.loc[frame["loss_rate"].eq(.8)]
+    assert plot_detection_only_benchmark_results(artifacts, tmp_path) == {}
+    artifacts.tables["aggregate"] = frame.loc[frame["model"].isin((
+        "Reference-only", "Reference+PU", "Reference+PU-MIRT", "Reference+PU-Joint",
+        "RF-reference", "RF-mixed"))]
+    assert plot_detection_only_benchmark_results(artifacts, tmp_path) == {}
+    assert plot_detection_only_benchmark_results(SimpleNamespace(tables={}), tmp_path) == {}
+    assert figures == []
+
+
+def test_detection_only_benchmarks_keep_simulation_and_calibration_scopes_separate(tmp_path, monkeypatch):
+    from gene2wire.experiments.plotting import plot_detection_only_benchmark_results
+
+    figures = _capture_show(monkeypatch)
+    artifacts = _information_artifacts(simulation=True)
+    frame = artifacts.tables["aggregate"]
+    primary = frame.loc[frame["analysis"].eq("primary")]
+    artifacts.tables["aggregate"] = pd.concat([
+        primary,
+        primary.assign(analysis="calibration_size", calibration_fraction=.4, macro_auprc=.7),
+    ], ignore_index=True)
+    paths = plot_detection_only_benchmark_results(artifacts, tmp_path)
+    assert len(paths) == len(figures) == 6
+    assert sum("paired = 40%" in figure._suptitle.get_text() for figure in figures) == 3
+    for figure in figures:
+        if "paired = 40%" in figure._suptitle.get_text():
+            assert all(np.all(line.get_ydata() == .7) for line in figure.axes[0].lines)
