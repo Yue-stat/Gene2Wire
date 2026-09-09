@@ -535,7 +535,10 @@ def notebook(name, commit, source_hash):
         The default report shows
         endpoint metrics for every recorded method, selected-configuration frequencies, convergence,
         candidate coverage and failures. Per-target metrics, every tuning trial, calibration tables,
-        and the saved run manifest remain in the export directory.
+        and the saved run manifest remain in the export directory. `model_evaluation_plan.csv`
+        lists every unit in the progress denominator; `model_cache_accounting.csv` distinguishes
+        restored results, reused fits, and new/mixed fitting. An unchecked cache is not counted
+        as a cache miss. Progress still prints one line per minute.
         Set `SHOW_FULL_DIAGNOSTICS=True` to display these full tables."""),
         ("code", FINAL),
     ])

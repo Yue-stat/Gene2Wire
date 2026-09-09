@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -53,6 +54,28 @@ def test_real_data_scenarios_do_not_expand_to_control_cartesian_product():
     assert {row["loss_rate"] for row in empirical} == {0., .2, .4, .6, .8}
     expanded_fractions = replace(settings, calibration_fractions=(.05, .1, .2, .4, .8))
     assert scenarios(expanded_fractions, natural=False, simulation=False) == empirical
+
+
+@pytest.mark.parametrize("fractions", [(.1, .1), (.1, .2, .1), (.2, .2)])
+def test_duplicate_calibration_fractions_are_rejected(fractions):
+    with pytest.raises(ValueError, match="calibration_fractions must be unique"):
+        Settings(calibration_fractions=fractions)
+    assert Settings().calibration_fractions == (.2,)
+
+
+def test_default_model_evaluation_totals_cover_the_configured_matrix():
+    from gene2wire.experiments.pipeline import _planned_models
+
+    settings = Settings()
+    repeats_and_folds = settings.n_repetitions * settings.n_outer_folds
+    real = SimpleNamespace(metadata={}, natural_observed=None)
+    natural = SimpleNamespace(metadata={}, natural_observed=True)
+    assert len(_planned_models(real, settings)) * repeats_and_folds == 1125
+    assert len(_planned_models(natural, settings)) * repeats_and_folds == 225
+    simulation_per_fold = sum(len(_planned_models(SimpleNamespace(
+        metadata={"independent_unit": "generated_dataset", "sharing_strength": rho},
+        natural_observed=None), settings)) for rho in (0., .5, 1.))
+    assert simulation_per_fold * repeats_and_folds == 4095
 
 
 @pytest.mark.parametrize("rho, expected_count", [(0., 9), (.5, 7), (1., 9)])

@@ -61,6 +61,8 @@ class Settings:
             raise ValueError("Penalties must be positive and finite")
         if any(not 0 < f < 1 for f in self.calibration_fractions):
             raise ValueError("Calibration fractions must lie between zero and one")
+        if len(set(self.calibration_fractions)) != len(self.calibration_fractions):
+            raise ValueError("calibration_fractions must be unique")
 
     def scientific_dict(self):
         result = asdict(self)

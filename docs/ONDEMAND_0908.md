@@ -263,7 +263,7 @@ Default progress prints one initial cache summary, one compact line per minute,
 and one completion summary. For example:
 
 ```text
-[running 1min] finished units 82/1125, current time 2026-09-09 10:42:00 PDT
+[running 1min] finished units 82/1125, current time 2026-09-09 10:42:00 PDT; restored results 30, reused fits 40, new/mixed 12
 ```
 
 One unit is one model evaluation at a specified repetition, fold and scenario:
@@ -283,6 +283,27 @@ work still to process, not necessarily unfitted models. Completed unit summaries
 accepted only when their exported predictions and audits pass content checks.
 Worker events remain under `progress/` and in `progress_events.csv`;
 `checkpoint_inventory.csv` retains the initial counts.
+
+The three heartbeat counts sum to `finished units`: `restored results` came
+from complete verified summaries; `reused fits` processed a model using only
+cached candidate/refit work or a completed-model checkpoint; `new/mixed` performed
+at least one new candidate or refit. Reuse includes both disk and in-memory
+reuse and can arise within the current run. They are model units, not counts
+of optimizer calls or trees. Incomplete fit telemetry is explicitly `unknown`.
+Startup prints only verified summary hits and labels remaining cache checks
+as unchecked; it cannot know all lower-level cache hits yet. Thus startup zero
+and a later large `reused fits` count are consistent. The final-refit status
+alone is insufficient because candidates might have required new fitting.
+
+`model_evaluation_plan.csv` is written before fitting and lists one row for
+every planned model unit. With all defaults enabled, its row counts are 1,125
+per real-data thinning panel, 225 for natural Projection-TAGs, and 4,095 for the
+three-rho simulation including declared controls. Changed repetitions, flags
+or scenario settings change these totals. `model_cache_accounting.csv` and the
+manifest record actual completed-unit categories. The existing manifest key
+`cached_model_evaluations` remains the startup summary-only count; additional
+keys record `reused_fit_model_evaluations`, `new_or_mixed_model_evaluations` and
+`unknown_fit_model_evaluations`.
 
 The final notebook report shows primary endpoint metrics for every recorded
 method, a comparison of the retained logistic and RF supervision controls,

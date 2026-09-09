@@ -286,7 +286,8 @@ def display_diagnostics(artifacts, *, label: str | None = None,
     print(f"All result tables, predictions and settings: {artifacts.export_dir}", flush=True)
     runtime = {name: artifacts.manifest[name] for name in (
         "parallel_unit", "requested_n_jobs", "effective_n_jobs", "scheduled_tasks",
-        "planned_model_evaluations", "cached_model_evaluations") if name in artifacts.manifest}
+        "planned_model_evaluations", "cached_model_evaluations", "reused_fit_model_evaluations",
+        "new_or_mixed_model_evaluations", "unknown_fit_model_evaluations") if name in artifacts.manifest}
     if runtime:
         print(f"Execution settings recorded in this export: {runtime}", flush=True)
     print("Metrics: largest recorded primary loss rate for each model (or natural paired labels). "

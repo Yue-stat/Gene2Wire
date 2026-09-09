@@ -58,6 +58,8 @@ class ProgressRelay:
         self.enabled, self.level, self.interval = enabled, level, float(interval)
         self.total_units, self.done_units = total_units, cached_units
         self.cached_units = cached_units
+        self.reused_fit_units = self.new_or_mixed_units = self.unknown_units = 0
+        self.fit_activity, self.model_accounting = {}, []
         self.completed_models, self.failed_scenarios = set(), set()
         self.rows, self.offsets, self.active = [], {}, {}
         self.lock = threading.Lock()
@@ -87,11 +89,39 @@ class ProgressRelay:
         label = self.label(row)
         if event in ("model_start", "candidate_start", "refit_start", "scenario_start"):
             self.active[unit] = label
+        if event in ("candidate_complete", "refit_complete") and row.get("model"):
+            model_key = self._event_key(row, include_model=True)
+            activity = self.fit_activity.setdefault(model_key, set())
+            status = row.get("cache_status")
+            if status == "fitted":
+                activity.add("new")
+            elif status in ("checkpoint", "memory"):
+                activity.add("reused")
+            else:
+                activity.add("unknown")
         if event == "model_complete" and row.get("model"):
             model_key = self._event_key(row, include_model=True)
             if model_key not in self.completed_models:
                 self.completed_models.add(model_key)
                 self.done_units += 1
+                activity = self.fit_activity.get(model_key, set())
+                # A final-refit cache hit does not imply its candidate search
+                # was cached. Conversely, a rebuilt model wrapper can report
+                # "fitted" although every candidate/refit was reused.
+                if "new" in activity:
+                    accounting = "new_or_mixed"
+                    self.new_or_mixed_units += 1
+                elif "unknown" not in activity and (
+                    "reused" in activity or row.get("cache_status") in ("checkpoint", "memory")
+                ):
+                    accounting = "reused_fits"
+                    self.reused_fit_units += 1
+                else:
+                    accounting = "unknown"
+                    self.unknown_units += 1
+                self.model_accounting.append({
+                    **{key: row.get(key) for key in self._SCENARIO_KEYS},
+                    "model": row["model"], "accounting": accounting})
             self.active.pop(unit, None)
         if event == "calibration_failed":
             self.failed_scenarios.add(self._event_key(row))
@@ -133,6 +163,10 @@ class ProgressRelay:
         local_time = datetime.fromtimestamp(time.time(), ZoneInfo("America/Los_Angeles"))
         message = (f"[{label} {minutes}min] finished units {self.done_units}/{self.total_units}, "
                    f"current time {local_time:%Y-%m-%d %H:%M:%S %Z}")
+        message += (f"; restored results {self.cached_units}, reused fits {self.reused_fit_units}, "
+                    f"new/mixed {self.new_or_mixed_units}")
+        if self.unknown_units:
+            message += f", fit status unknown {self.unknown_units}"
         if self.failed_scenarios:
             message += f"; failed calibration scenarios {len(self.failed_scenarios)}"
         print(message, flush=True)
@@ -168,10 +202,10 @@ class ProgressRelay:
 
     def __enter__(self):
         if self.enabled:
-            print(f"[cache] {self.cached_units}/{self.total_units} model evaluations reusable "
-                  f"from verified complete scenario summaries; "
-                  f"{self.total_units-self.cached_units} still to process "
-                  "(may reuse model/candidate/refit caches).", flush=True)
+            print(f"[cache] verified result summaries {self.cached_units}/{self.total_units}; "
+                  f"remaining {self.total_units-self.cached_units} require cache checks or processing. "
+                  "Model/candidate/refit reuse is counted during execution; unchecked does not mean uncached.",
+                  flush=True)
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
         return self

@@ -20,7 +20,8 @@ def test_whole_unit_inventory_and_missing_export_recovery(tmp_path, capsys):
     kwargs = dict(checkpoint_dir=tmp_path / 'checkpoints', export_dir=tmp_path / 'exports')
     first = run_experiment(data, settings, **kwargs)
     output = capsys.readouterr().out
-    assert '0/18 model evaluations reusable' in output
+    assert 'verified result summaries 0/18' in output
+    assert 'unchecked does not mean uncached' in output
     assert 'finished units 18/18' in output
     assert '[start]' not in output and '[done]' not in output and '[trial]' not in output
     assert not first.tables['checkpoint_inventory']['fully_cached'].any()
@@ -31,13 +32,20 @@ def test_whole_unit_inventory_and_missing_export_recovery(tmp_path, capsys):
         second = run_experiment(data, settings, **kwargs)
         assert second.tables['checkpoint_inventory']['fully_cached'].all()
         assert second.tables['selected']['resumed'].all()
-        assert '18/18 model evaluations reusable' in capsys.readouterr().out
+        assert 'verified result summaries 18/18' in capsys.readouterr().out
         prediction = next(first.export_dir.rglob('PU-Joint_predictions.npz'))
         with np.load(prediction) as archive:
             expected = archive['prediction'].copy()
         prediction.unlink()
         rebuilt = run_experiment(data, settings, progress=False, **kwargs)
         assert rebuilt.tables['checkpoint_inventory']['fully_cached'].sum() == 2
+        assert len(rebuilt.tables['model_evaluation_plan']) == 18
+        assert rebuilt.manifest['cached_model_evaluations'] == 12
+        assert rebuilt.manifest['reused_fit_model_evaluations'] == 6
+        assert rebuilt.manifest['new_or_mixed_model_evaluations'] == 0
+        assert rebuilt.manifest['unknown_fit_model_evaluations'] == 0
+        assert rebuilt.tables['model_cache_accounting']['accounting'].value_counts().to_dict() == {
+            'restored_results': 12, 'reused_fits': 6}
         with np.load(prediction) as archive:
             np.testing.assert_array_equal(archive['prediction'], expected)
     assert first.manifest['run_id'] == second.manifest['run_id'] == rebuilt.manifest['run_id']
@@ -96,7 +104,7 @@ def test_summary_final_and_disabled_output(tmp_path, capsys):
         pass
     lines = capsys.readouterr().out.splitlines()
     assert len(lines) == 2
-    assert '[cache] 2/2' in lines[0] and '[finished 0min] finished units 2/2' in lines[1]
+    assert '[cache] verified result summaries 2/2' in lines[0] and '[finished 0min] finished units 2/2' in lines[1]
     with ProgressRelay(tmp_path / 'quiet', enabled=False, total_units=2) as relay:
         relay.writer('x', work_id='x')({'event': 'model_complete', 'model': 'PU'})
     assert capsys.readouterr().out == ''

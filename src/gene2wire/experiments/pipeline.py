@@ -538,7 +538,7 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
     # independently of how those units are grouped for scheduling. The default
     # exposes loss rates to the outer process pool without nesting parallelism.
     store = AtomicCheckpointStore(Path(checkpoint_dir) / "experiment_units" / run_id)
-    results, pending, inventory = [], [], []
+    results, pending, inventory, evaluation_plan = [], [], [], []
     for fold_group, (prepared, repetition) in enumerate(contexts):
         planned_models = _planned_models(prepared, settings)
         for scenario in scenarios(settings, natural=prepared.natural_observed is not None,
@@ -555,10 +555,18 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
                               for row in planned_models)
             inventory.append({**unit_context, "work_id": key, "fully_cached": cached is not None,
                               "planned_model_evaluations": model_count})
+            evaluation_plan.extend({**unit_context, "work_id": key, "model": row["model"],
+                                    "complete_summary_cached": cached is not None}
+                                   for row in planned_models
+                                   if all(row[name] == value for name, value in scenario.items()))
             results.append(cached)
             if cached is None:
                 pending.append((index, prepared, repetition, key, unit_context, scenario, fold_group))
     planned_model_count = sum(row["planned_model_evaluations"] for row in inventory)
+    if len(evaluation_plan) != planned_model_count or pd.DataFrame(evaluation_plan).duplicated(
+        ["work_id", "model"]).any():
+        raise ValueError("Progress plan contains duplicate or inconsistent model evaluation units")
+    _atomic_csv(pd.DataFrame(evaluation_plan), export_path / "model_evaluation_plan.csv")
     cached_model_count = sum(row["planned_model_evaluations"] for row in inventory
                              if row["fully_cached"])
     event_dir = export_path / "progress" / uuid.uuid4().hex
@@ -595,6 +603,16 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
     names = results[0].keys()
     tables = {name: pd.DataFrame([row for result in results for row in result[name]]) for name in names}
     tables["checkpoint_inventory"] = pd.DataFrame(inventory)
+    tables["model_evaluation_plan"] = pd.DataFrame(evaluation_plan)
+    accounting = [{**row, "accounting": "restored_results"} for row in evaluation_plan
+                  if row["complete_summary_cached"]]
+    tables["model_cache_accounting"] = pd.DataFrame(accounting + relay.model_accounting)
+    expected_units = {(row["work_id"], row["model"]) for row in evaluation_plan}
+    processed_units = [(row["work_id"], row["model"])
+                       for row in accounting + relay.model_accounting]
+    if (len(processed_units) != relay.done_units or len(set(processed_units)) != len(processed_units)
+        or not set(processed_units).issubset(expected_units)):
+        raise ValueError("Processed model units do not match the exported progress plan")
     tables["progress_events"] = pd.DataFrame(relay.rows)
     if len(datasets) == 1 and datasets[0].natural_observed is not None:
         data = datasets[0]
@@ -613,6 +631,9 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
                     planned_model_evaluations=planned_model_count,
                     completed_model_evaluations=relay.done_units,
                     cached_model_evaluations=cached_model_count,
+                    reused_fit_model_evaluations=relay.reused_fit_units,
+                    new_or_mixed_model_evaluations=relay.new_or_mixed_units,
+                    unknown_fit_model_evaluations=relay.unknown_units,
                     metric_rows=len(tables["metrics"]), table_files=[f"{name}.csv" for name in tables])
     atomic_json(manifest, export_path / "manifest.json")
     print(f"All results exported to: {export_path}")
@@ -787,8 +808,16 @@ def _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
                 best = (key, config)
         if best is None:
             raise ValueError("Qiao has no valid candidates under the current feature dimensions")
+        refit_started = time.monotonic()
+        if on_progress is not None:
+            on_progress({"event": "refit_start", "model": name, "stage": "refit",
+                         "config": dict(best[1])})
         prediction, ranking_score, diagnostics = cached_fit("final", refit_features,
                                                            dev, test, best[1])
+        if on_progress is not None:
+            on_progress({"event": "refit_complete", "model": name, "stage": "refit",
+                         "cache_status": "checkpoint" if diagnostics["resumed"] else "fitted",
+                         "elapsed_seconds": time.monotonic() - refit_started})
         extra = {"use_target_features": settings.use_target_features,
                  "target_input_kind": target_input_kind,
                  "probability_transform": "sigmoid" if objective == "logit" else "clip_linear_score",

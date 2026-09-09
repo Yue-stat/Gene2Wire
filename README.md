@@ -184,6 +184,13 @@ not equivalent to the original model's postsynaptic expression inputs.
 Default progress is one summary line per minute in `America/Los_Angeles` time.
 Its unit is one model at one repetition/fold/scenario, including selection and
 refit; optimizer candidates are recorded in detailed events rather than printed.
+The startup count covers verified complete result summaries only; other cache
+status is initially unchecked. Each heartbeat partitions completed units into
+restored results, reused fits (disk or memory), and new/mixed fitting. A final
+refit cache hit alone cannot classify the entire model as reused. Incomplete
+telemetry is explicitly unknown. `model_evaluation_plan.csv` lists the exact
+denominator and `model_cache_accounting.csv` records the completed-unit breakdown.
+Duplicate calibration fractions are rejected before scheduling.
 Notebook reports show compact endpoint, information-budget and convergence
 summaries. Complete CSV/NPZ exports remain available, and
 `SHOW_FULL_DIAGNOSTICS=True` restores the full table display.
