@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 from itertools import product
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable, Iterable, Mapping, MutableMapping
 
 import numpy as np
@@ -14,6 +15,7 @@ from .checkpoint import (
     sha256_array, sha256_source_tree, unit_key,
 )
 from .config import FitConfig, ModelConfig, TuningConfig
+from .candidate_design import select_balanced_candidates
 from .data import DatasetBundle
 from .metrics import masked_log_loss
 from .models import DirectWarmStartCache, UnifiedPUModel, canonical_model_config, model_identity
@@ -94,7 +96,7 @@ class TuningResult:
 def full_joint_candidates(base: ModelConfig, tuning: TuningConfig) -> tuple[ModelConfig, ...]:
     """Enumerate the relevant grid, with optional exact endpoints and budget cap.
 
-    A finite budget selects a deterministic, evenly spaced subset of each
+    A finite budget selects a deterministic, balanced subset of each
     structural family.  It is a bounded Cartesian search, not a staged fit.
     """
 
@@ -195,8 +197,7 @@ def _budget_candidates(
         allocation[chosen] += 1
     chosen = []
     for kind, values in groups.items():
-        indices = np.linspace(0, len(values) - 1, allocation[kind], dtype=int)
-        chosen.extend(values[int(index)] for index in indices)
+        chosen.extend(select_balanced_candidates(values, allocation[kind]))
     return tuple(chosen)
 
 
@@ -311,11 +312,14 @@ def tune_model(
     checkpoint_context: Mapping[str, Any] | None = None,
     warm_start_cache: DirectWarmStartCache | None = None,
     candidate_cache: MutableMapping[str, TrialResult] | None = None,
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> TuningResult:
     """Tune only on explicitly supplied train and validation bundles.
 
     Reference truth is stripped before every fit.  The selection score is the
     observed-label log loss for ``q=e*p`` on measured validation entries.
+    ``on_progress`` receives stage-specific cache inventories and timed candidate
+    events. Its diagnostics do not participate in fitting or cache identity.
     """
 
     _validate_schema_alignment(train, validation, base_model)
@@ -360,11 +364,18 @@ def tune_model(
 
     memory = {} if candidate_cache is None else candidate_cache
 
+    def emit(event: str, **details: Any) -> None:
+        if on_progress is not None:
+            on_progress({"event": event, "model": base_model.name, **details})
+
     def evaluate(candidates: Iterable[ModelConfig], stage: str) -> tuple[TrialResult, ...]:
         stage_trials: list[TrialResult] = []
+        # Inspect each candidate using the exact lookup used for evaluation, so
+        # an incompatible file never appears in the resume count. Retain these
+        # small TrialResult records to avoid reading checkpoint files twice.
+        prepared = []
         for requested_config in candidates:
             config = canonical_model_config(requested_config)
-            trial_index = len(trials)
             identity = model_identity(config)
             # Matched PU/non-PU fits use the same starting randomness.  The
             # likelihood, not an unrelated seed, is their experimental contrast.
@@ -383,6 +394,7 @@ def tune_model(
             # supplied fingerprint also protects explicitly shared caller caches.
             cache_key = canonical_json([cache_fingerprint, coordinates])
             previous = memory.get(cache_key)
+            cache_status = "memory" if previous is not None else "pending"
             if previous is None and checkpoint_store is not None:
                 cached = checkpoint_store.load(checkpoint_key, fingerprint=cache_fingerprint)
                 if cached is not None:
@@ -390,6 +402,7 @@ def tune_model(
                     if not isinstance(payload, Mapping) or not isinstance(payload.get("trial"), Mapping):
                         raise ValueError("checkpoint payload does not contain a trial")
                     previous = TrialResult.from_dict(payload["trial"])
+                    cache_status = "checkpoint"
             if previous is not None:
                 if (
                     model_identity(previous.config) != identity
@@ -397,6 +410,23 @@ def tune_model(
                     or not np.isfinite(previous.validation_loss)
                 ):
                     raise ValueError("checkpointed trial does not match requested candidate")
+            prepared.append((config, trial_seed, checkpoint_key, cache_key, previous, cache_status))
+
+        memory_cached = sum(item[-1] == "memory" for item in prepared)
+        checkpoint_cached = sum(item[-1] == "checkpoint" for item in prepared)
+        cached_count = memory_cached + checkpoint_cached
+        emit("candidate_inventory", stage=stage, strategy=tuning.strategy,
+             total=len(prepared), cached=cached_count, memory_cached=memory_cached,
+             checkpoint_cached=checkpoint_cached, pending=len(prepared) - cached_count)
+        stage_started = perf_counter()
+        for stage_index, (config, trial_seed, checkpoint_key, cache_key, previous,
+                          cache_status) in enumerate(prepared, start=1):
+            trial_index = len(trials)
+            candidate_started = perf_counter()
+            details = {"stage": stage, "index": stage_index, "total": len(prepared),
+                       "trial_index": trial_index, "config": asdict(config)}
+            emit("candidate_start", **details, cache_status=cache_status)
+            if previous is not None:
                 trial = replace(previous, stage=stage, index=trial_index, config=config)
             else:
                 fitted = UnifiedPUModel(config, fit_config, warm_start_cache=warm_start_cache).fit(
@@ -411,11 +441,18 @@ def tune_model(
                 )
                 if checkpoint_store is not None:
                     checkpoint_store.save_complete(checkpoint_key, cache_fingerprint, {"trial": trial.to_dict()})
+                cache_status = "fitted"
             memory[cache_key] = trial
             trials.append(trial)
             stage_trials.append(trial)
             if on_trial is not None:
                 on_trial(trial)
+            emit("candidate_complete", **details, cache_status=cache_status,
+                 elapsed_seconds=perf_counter() - candidate_started,
+                 validation_loss=trial.validation_loss, converged=trial.converged,
+                 iterations=trial.iterations, seed=trial.seed)
+        emit("stage_complete", stage=stage, total=len(stage_trials),
+             elapsed_seconds=perf_counter() - stage_started)
         return tuple(stage_trials)
 
     if tuning.strategy == "full_joint" or base_model.kind == "direct":

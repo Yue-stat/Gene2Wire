@@ -108,3 +108,87 @@ def test_raw_metric_fallback_averages_folds_before_repetitions():
                           "repetition": [0, 0, 0, 0, 0, 1], "macro_auprc": [0, 0, 0, 0, 0, 1]})
     result = _aggregate({"metrics": frame})
     assert result.iloc[0]["macro_auprc"] == pytest.approx(.5)
+
+
+def test_benchmark_figures_add_every_available_model_without_replacing_paper_plots(tmp_path, monkeypatch):
+    from gene2wire.experiments.plotting import plot_benchmark_results
+    figures = _capture_show(monkeypatch)
+    artifacts = _artifacts()
+    primary = artifacts.tables["aggregate"].query("analysis == 'primary'").copy()
+    extras = []
+    for model in ("RF-observed", "RF-reference", "Prevalence-observed", "Prevalence-reference",
+                  "Reference-only", "Reference+PU", "Qiao-squared", "Qiao-logit", "Future baseline"):
+        for rate in ((0., .8) if model.startswith(("RF", "Prevalence")) else (.8,)):
+            extras.append({**primary.iloc[0].to_dict(), "model": model, "loss_rate": rate})
+    artifacts.tables["aggregate"] = pd.concat([primary, pd.DataFrame(extras)], ignore_index=True)
+    old_paths = plot_results(artifacts, tmp_path)
+    old_files = {key: path.read_bytes() for key, path in old_paths.items()}
+    paths = plot_benchmark_results(artifacts, tmp_path)
+    assert len(paths) == 1
+    assert len(figures) == 3  # Two unchanged paper figures, then the additional diagnostic.
+    assert {key: path.read_bytes() for key, path in old_paths.items()} == old_files
+    assert all(path.suffix == ".pdf" and path.parent.name == "all_benchmarks" for path in paths.values())
+    assert not list(tmp_path.rglob("*.png"))
+    benchmark = figures[-1]
+    assert len(benchmark.legends[0].get_texts()) == len(MODEL_ORDER) + 9
+    legend_labels = {text.get_text() for text in benchmark.legends[0].get_texts()}
+    assert {"PU-Joint", "Future baseline", "RF (paired references)", "Reference + PU logistic"} <= legend_labels
+    curves = {line.get_label(): line for line in benchmark.axes[0].lines}
+    forest = curves["RF (observed labels)"]
+    assert forest.get_linestyle() == "None"
+    assert np.isfinite(forest.get_ydata()).sum() == 2
+    assert np.isnan(forest.get_ydata()[1:-1]).all()
+    assert curves["PU-Joint"].get_linestyle() == "-"
+    assert len(curves["PU-Joint"].get_ydata()) == 5
+
+
+def test_benchmark_controls_are_separate_by_rho_mechanism_fraction_and_spec(tmp_path, monkeypatch):
+    from gene2wire.experiments.plotting import plot_benchmark_results
+    figures = _capture_show(monkeypatch)
+    row = _artifacts().tables["aggregate"].query("model == 'PU-Joint'").iloc[0].to_dict()
+    rows = [
+        {**row, "sharing_strength": 0., "loss_rate": .8, "macro_auprc": .1},
+        {**row, "sharing_strength": .5, "loss_rate": .8, "macro_auprc": .2},
+        {**row, "sharing_strength": 1., "loss_rate": .8, "macro_auprc": .3},
+        {**row, "sharing_strength": 1., "loss_rate": .8, "macro_auprc": .4,
+         "analysis": "mechanism", "mechanism": "target_sar"},
+        {**row, "sharing_strength": 1., "loss_rate": .8, "macro_auprc": .5,
+         "analysis": "calibration_size", "calibration_fraction": .1},
+        {**row, "sharing_strength": 1., "loss_rate": .8, "macro_auprc": .6,
+         "analysis": "calibration_misspecification", "calibration_spec": "omit_technical"},
+    ]
+    artifacts = SimpleNamespace(tables={"aggregate": pd.DataFrame(rows)}, manifest={})
+    paths = plot_benchmark_results(artifacts, tmp_path)
+    assert len(paths) == len(figures) == 6
+    assert {round(float(figure.axes[0].lines[0].get_xdata()[0]), 5) for figure in figures} == {.1, .2, .3, .4, .5, .6}
+    assert all(figure.axes[0].get_xlabel() != "Positive-label loss" for figure in figures)
+
+
+def test_benchmark_natural_all_models_no_loss_axis_and_undefined_scores(tmp_path, monkeypatch):
+    from gene2wire.experiments.plotting import plot_benchmark_results
+    figures = _capture_show(monkeypatch)
+    artifacts = _artifacts(natural=True, datasets=("Projection_TAGs",))
+    artifacts.tables["aggregate"] = artifacts.tables["aggregate"].query("analysis == 'primary'").copy()
+    artifacts.tables["aggregate"]["hidden_recall_at_h"] = np.nan
+    paths = plot_benchmark_results(artifacts, tmp_path)
+    assert len(paths) == 1
+    assert all(axis.get_xlabel() != "Positive-label loss" for axis in figures[0].axes)
+    assert [tick.get_text() for tick in figures[0].axes[2].get_yticklabels()] == [
+        "Logistic", "MIRT", "Joint", "PU logistic", "PU-MIRT", "PU-Joint"]
+    assert any(text.get_text() == "No defined estimates" for text in figures[0].axes[2].texts)
+
+
+def test_benchmark_aggregation_respects_repeat_units_and_refuses_mixed_semantics(tmp_path):
+    from gene2wire.experiments.plotting import _benchmark_aggregate, plot_benchmark_results
+    metrics = pd.DataFrame({"dataset": ["d"] * 6, "analysis": ["mechanism"] * 6,
+        "mechanism": ["target_sar"] * 6, "model": ["Logistic-rescaled"] * 6,
+        "loss_rate": [.8] * 6, "outer_fold": [0, 1, 2, 3, 4, 0],
+        "repetition": [0, 0, 0, 0, 0, 1], "macro_auprc": [0, 0, 0, 0, 0, 1]})
+    summary = _benchmark_aggregate({"metrics": metrics})
+    assert summary.iloc[0]["macro_auprc"] == pytest.approx(.5)
+    assert summary.iloc[0]["analysis"] == "mechanism"
+    mixed = pd.concat([summary.assign(probability_semantics="reference"),
+                       summary.assign(probability_semantics="observed")], ignore_index=True)
+    with pytest.raises(ValueError, match="Duplicate model/loss estimates"):
+        plot_benchmark_results(SimpleNamespace(tables={"aggregate": mixed}), tmp_path,
+                               show=False, metrics=("macro_auprc",))

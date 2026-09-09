@@ -76,7 +76,7 @@ def _instrument(monkeypatch):
     def baseline(*args, **kwargs):
         calls["baselines"].append((args, kwargs))
         return SimpleNamespace(prediction=np.full((len(args[7]), args[1].shape[1]), .3),
-                               selected_config={}, candidate_records=[])
+                               selected_config={}, candidate_records=[], diagnostics={})
 
     def evaluation(*args, **kwargs):
         return {"summary": {"macro_auprc": .5}, "per_target": [],

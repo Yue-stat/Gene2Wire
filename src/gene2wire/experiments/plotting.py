@@ -365,3 +365,240 @@ def plot_results(artifacts: Any, output_dir: str | Path, *, show: bool = True,
                     _real_curves(selected, all_models, show=show, models=MODEL_ORDER)
                     paths[f"{stem}_all_models"] = all_models
     return paths
+
+
+# Diagnostic figures deliberately discover models from the exported results.
+# Keep MODEL_ORDER above fixed: changing it would alter the existing paper plots.
+_BENCHMARK_ORDER = MODEL_ORDER + (
+    "Reference-only", "Reference+PU", "Logistic-rescaled",
+    "RF-observed", "RF-reference", "Prevalence-observed", "Prevalence-reference",
+    "Qiao-squared", "Qiao-logit",
+)
+_BENCHMARK_LABELS = {**MODEL_LABELS,
+    "Reference-only": "Reference-only logistic",
+    "Reference+PU": "Reference + PU logistic",
+    "Logistic-rescaled": "Logistic + sensitivity rescaling",
+    "RF-observed": "RF (observed labels)",
+    "RF-reference": "RF (paired references)",
+    "Prevalence-observed": "Prevalence (observed labels)",
+    "Prevalence-reference": "Prevalence (paired references)",
+    "Qiao-squared": "Qiao bilinear (squared error)",
+    "Qiao-logit": "Qiao bilinear (logistic)",
+}
+_BENCHMARK_COLORS = {**COLORS,
+    "Reference-only": "#9467BD", "Reference+PU": "#332288",
+    "Logistic-rescaled": "#CC79A7", "RF-observed": "#AA4499",
+    "RF-reference": "#882255", "Prevalence-observed": "#AA8833",
+    "Prevalence-reference": "#665522", "Qiao-squared": "#44AA99",
+    "Qiao-logit": "#117733",
+}
+_BENCHMARK_MARKERS = {**MARKERS,
+    "Reference-only": "D", "Reference+PU": "P", "Logistic-rescaled": "*",
+    "RF-observed": "v", "RF-reference": "D", "Prevalence-observed": "X",
+    "Prevalence-reference": "P", "Qiao-squared": "<", "Qiao-logit": ">",
+}
+_BENCHMARK_SCOPES = ("dataset", "sharing_strength", "analysis", "mechanism",
+                     "calibration_fraction", "calibration_spec")
+
+
+def _benchmark_aggregate(tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Keep every analysis, averaging folds within each repetition first."""
+    for source in ("aggregate", "per_repetition", "metrics"):
+        frame = tables.get(source, pd.DataFrame())
+        if not frame.empty:
+            frame = frame.copy()
+            break
+    else:
+        return pd.DataFrame()
+    if "model" not in frame:
+        raise ValueError("Benchmark result tables must identify the fitted model")
+    if source == "aggregate":
+        return frame
+    groups = [key for key in _GROUPS if key in frame]
+    numeric = [key for key in frame.select_dtypes(include="number")
+               if key not in set(groups) | {"repetition", "outer_fold"}]
+    if "repetition" in frame:
+        frame = frame.groupby(groups + ["repetition"], observed=True, dropna=False)[numeric].mean().reset_index()
+    return frame.groupby(groups, observed=True, dropna=False)[numeric].mean().reset_index()
+
+
+def _benchmark_models(frame: pd.DataFrame) -> tuple[str, ...]:
+    available = set(frame["model"].dropna().astype(str))
+    return tuple(model for model in _BENCHMARK_ORDER if model in available) + tuple(
+        sorted(available.difference(_BENCHMARK_ORDER)))
+
+
+def _benchmark_style(model: str, models: tuple[str, ...]) -> dict[str, Any]:
+    # Unknown future baselines remain visible and receive deterministic styles.
+    index = models.index(model)
+    return {"color": _BENCHMARK_COLORS.get(model, plt.get_cmap("tab20")(index % 20)),
+            "marker": _BENCHMARK_MARKERS.get(model, ("o", "s", "D", "v", "P")[index % 5]),
+            "label": _BENCHMARK_LABELS.get(model, model),
+            "linewidth": 2.4 if model == "PU-Joint" else 1.3,
+            "markersize": 6 if model == "PU-Joint" else 4.8,
+            "zorder": 5 if model == "PU-Joint" else 3}
+
+
+def _benchmark_metric_title(metric: str, *, simulation: bool) -> str:
+    extra = {"macro_auroc": "Macro AUROC ↑", "macro_brier": "Brier score ↓",
+             "macro_ece": "Expected calibration error ↓",
+             "macro_prevalence_absolute_error": "Prevalence absolute error ↓"}
+    if metric in PRIMARY_METRICS or metric == "macro_predicted_prevalence":
+        return _metric_title(metric, simulation=simulation)
+    return extra.get(metric, metric.replace("_", " ").capitalize())
+
+
+def _benchmark_curve(axis, frame, metric, models):
+    rates = np.sort(pd.to_numeric(frame["loss_rate"], errors="coerce").dropna().unique())
+    if metric.startswith("hidden_"):
+        rates = rates[rates > 0]
+    any_data = False
+    for model in models:
+        style = _benchmark_style(model, models)
+        selected = frame.loc[frame["model"].eq(model), ["loss_rate", metric]].copy()
+        selected["loss_rate"] = pd.to_numeric(selected["loss_rate"], errors="coerce")
+        selected[metric] = pd.to_numeric(selected[metric], errors="coerce")
+        # Reindexing inserts NaNs at missing rates and breaks any interpolated
+        # segment. In particular, 0%/80%-only RF fits are disconnected points.
+        values = selected.set_index("loss_rate")[metric].reindex(rates).to_numpy(float)
+        values[~np.isfinite(values)] = np.nan
+        count = int(np.isfinite(values).sum())
+        if not count:
+            continue
+        linestyle = "-" if model.startswith("PU") else "--"
+        if count < 3:
+            linestyle = "None"
+        axis.plot(rates, values, **style, linestyle=linestyle, markeredgewidth=.7)
+        any_data = True
+    _style_axis(axis)
+    if not any_data:
+        axis.text(.5, .5, "No defined estimates", transform=axis.transAxes,
+                  ha="center", va="center", color="#777777", fontsize=9)
+
+
+def _benchmark_dots(axis, frame, metric, models):
+    any_data = False
+    for index, model in enumerate(models):
+        values = pd.to_numeric(frame.loc[frame["model"].eq(model), metric], errors="coerce")
+        if len(values) != 1:
+            raise ValueError("Benchmark dot panels require one estimate per model and scientific setting")
+        value = float(values.iloc[0])
+        if np.isfinite(value):
+            style = _benchmark_style(model, models)
+            axis.plot(value, index, **style, linestyle="None", markeredgewidth=.7)
+            any_data = True
+    _style_axis(axis, loss_axis=False)
+    axis.set_yticks(np.arange(len(models)), [_BENCHMARK_LABELS.get(model, model) for model in models])
+    axis.invert_yaxis()
+    axis.set_ylim(len(models) - .5, -.5)
+    axis.grid(False, axis="y")
+    axis.grid(axis="x", color="#E6E6E6", linewidth=.6)
+    axis.xaxis.set_major_locator(MaxNLocator(nbins=4))
+    if not any_data:
+        axis.text(.5, .5, "No defined estimates", transform=axis.transAxes,
+                  ha="center", va="center", color="#777777", fontsize=9)
+
+
+def plot_benchmark_results(artifacts: Any, output_dir: str | Path, *,
+                           show: bool = True,
+                           metrics: tuple[str, ...] = PRIMARY_METRICS) -> dict[str, Path]:
+    """Add diagnostic PDFs comparing PU-Joint with every available model.
+
+    Call this *after* :func:`plot_results` to retain existing paper figures.
+    Output lives under ``output_dir/all_benchmarks``. A separate figure is
+    drawn for each dataset, sharing strength, analysis, mechanism, paired
+    fraction and calibration specification: no controls are averaged into
+    primary estimates. Three or more measured loss rates produce curves;
+    endpoint-only models have disconnected markers. Natural and single-rate
+    comparisons use categorical dot panels. All exported model names are
+    discovered dynamically, so optional and future baselines are included.
+
+    Diagnostic means follow the same fold-then-repetition aggregation as the
+    main plots. They carry no confidence intervals; formal simulation intervals
+    remain in the preserved main plots and exported tables.
+    """
+    frame = _benchmark_aggregate(artifacts.tables)
+    if frame.empty:
+        return {}
+    missing = set(metrics).difference(frame.columns)
+    if missing:
+        raise ValueError(f"Benchmark metrics are missing from the results: {sorted(missing)}")
+    if not metrics:
+        raise ValueError("Select at least one benchmark metric")
+    scope_columns = [key for key in _BENCHMARK_SCOPES if key in frame]
+    grouping = (frame.groupby(scope_columns, observed=True, dropna=False, sort=True)
+                if scope_columns else [((), frame)])
+    directory = Path(output_dir) / "all_benchmarks"
+    paths = {}
+    with plt.rc_context(_STYLE):
+        for scope_key, selected in grouping:
+            key = scope_key if isinstance(scope_key, tuple) else (scope_key,)
+            scope = dict(zip(scope_columns, key))
+            # Loss rate is the only scientific coordinate allowed to vary in
+            # a figure. A duplicated model/rate often means that outputs from
+            # distinct information budgets or probability meanings were mixed.
+            identifiers = ["model"] + (["loss_rate"] if "loss_rate" in selected else [])
+            if selected.duplicated(identifiers).any():
+                raise ValueError("Duplicate model/loss estimates within a benchmark setting; "
+                                 "keep distinct scientific configurations in separate artifacts")
+            models = _benchmark_models(selected)
+            if not models:
+                continue
+            finite_rates = (pd.to_numeric(selected["loss_rate"], errors="coerce").dropna().unique()
+                            if "loss_rate" in selected else np.array([]))
+            natural = scope.get("mechanism") == "natural" or len(finite_rates) == 0
+            curves = not natural and len(finite_rates) > 1
+            simulation = pd.notna(scope.get("sharing_strength", np.nan))
+            title_parts = []
+            for label, value in scope.items():
+                if pd.isna(value):
+                    continue
+                if label == "sharing_strength":
+                    title_parts.append(rf"$\rho={float(value):g}$")
+                elif label == "calibration_fraction":
+                    title_parts.append(f"paired = {float(value):.0%}")
+                else:
+                    title_parts.append(str(value).replace("_", " "))
+            if not curves and len(finite_rates) == 1:
+                title_parts.append(f"loss = {float(finite_rates[0]):.0%}")
+            title = " · ".join(title_parts)
+            stem = "__".join(f"{label}_{_slug(value)}" for label, value in scope.items() if pd.notna(value)) or "results"
+            destination = directory / f"{stem}__all_benchmarks_0908.pdf"
+            count = len(metrics)
+            if curves:
+                legend_columns = min(4, max(1, int(4.2 * count / 2.8)))
+                legend_rows = int(np.ceil(len(models) / legend_columns))
+                figure, axes = plt.subplots(1, count, squeeze=False,
+                    figsize=(4.2 * count, 3.5 + .27 * legend_rows))
+                for axis, metric in zip(axes[0], metrics):
+                    _benchmark_curve(axis, selected, metric, models)
+                    axis.set_title(_benchmark_metric_title(metric, simulation=simulation), loc="left", pad=9)
+                from matplotlib.lines import Line2D
+                handles = [Line2D([], [], **_benchmark_style(model, models), linestyle="None")
+                           for model in models]
+                legend = figure.legend(handles, [_BENCHMARK_LABELS.get(model, model) for model in models],
+                              loc="upper center", bbox_to_anchor=(.5, .94), frameon=False,
+                              ncol=min(legend_columns, len(models)), fontsize=8.5, columnspacing=1.5,
+                              handlelength=1.2)
+                figure.suptitle(title, fontsize=10, y=.995)
+                figure.text(.5, .012, "Points show evaluated loss rates; endpoint-only fits are not connected. "
+                            "Means over folds and repetitions; no diagnostic confidence intervals.",
+                            ha="center", va="bottom", fontsize=8, color="#555555")
+                figure.canvas.draw()
+                legend_bottom = legend.get_window_extent(figure.canvas.get_renderer()).transformed(
+                    figure.transFigure.inverted()).y0
+                figure.subplots_adjust(left=.065, right=.985, bottom=.18,
+                                       top=legend_bottom - .10, wspace=.33)
+            else:
+                figure, axes = plt.subplots(1, count, squeeze=False,
+                    figsize=(5.6 * count, max(3.4, .30 * len(models) + 1.1)))
+                for axis, metric in zip(axes[0], metrics):
+                    _benchmark_dots(axis, selected, metric, models)
+                    axis.set_xlabel(_benchmark_metric_title(metric, simulation=simulation))
+                figure.suptitle(title, fontsize=10, y=.995)
+                figure.text(.5, .01, "Means over folds and repetitions; no diagnostic confidence intervals.",
+                            ha="center", va="bottom", fontsize=8, color="#555555")
+                figure.tight_layout(rect=(0, .04, 1, .94), w_pad=2.)
+            _save_display(figure, destination, show)
+            paths[stem] = destination
+    return paths

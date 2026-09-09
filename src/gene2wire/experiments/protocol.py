@@ -10,7 +10,7 @@ import numpy as np
 
 from ..config import FitConfig, ModelConfig, TuningConfig
 
-PROTOCOL_VERSION = "0908-v1"
+PROTOCOL_VERSION = "0908-v2-balanced"
 MODEL_ORDER = ("Logistic", "MIRT", "Joint", "PU", "PU-MIRT", "PU-Joint")
 
 

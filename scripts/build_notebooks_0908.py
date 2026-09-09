@@ -42,12 +42,22 @@ RUN_MECHANISM_CONTROLS = True
 RUN_CALIBRATION_CONTROLS = True
 RUN_QIAO = False
 
+# Display settings do not change scientific settings or invalidate fit checkpoints.
+SHOW_PROGRESS = True
+PROGRESS_LEVEL = 'model'  # Use 'trial' to also print individual tuning trials.
+PROGRESS_INTERVAL_SECONDS = 30.0
+
 BASE_DIR = Path('/home/yueyue/gene2wire').expanduser()
 RAW_DATA_DIR = BASE_DIR / 'raw_data'
 CHECKPOINT_DIR = BASE_DIR / 'checkpoints' / '0908'
 EXPORT_DIR = BASE_DIR / 'paper_figure_exports'
 FIGURE_DIR = BASE_DIR / 'figures' / '0908'
 CODE_CACHE_DIR = BASE_DIR / 'code'
+
+# Reload a completed export to add figures/diagnostics without fitting or raw downloads.
+# Each value must be the exact run directory containing manifest.json and metrics.csv.
+RESULTS_ONLY = False
+EXISTING_EXPORT_DIRS = __EXISTING_EXPORT_DIRS_0908__
 
 CORE_COMMIT = '__CORE_COMMIT_0908__'
 EXPECTED_SOURCE_HASH = '__SOURCE_HASH_0908__'
@@ -162,9 +172,13 @@ import numpy as np
 import pandas as pd
 from IPython.display import display
 from gene2wire.experiments.pipeline import run_experiment, run_simulation_experiments
-from gene2wire.experiments.plotting import plot_results
+from gene2wire.experiments.plotting import plot_results, plot_benchmark_results
+from gene2wire.experiments.reporting import (
+    configure_full_display, display_diagnostics, load_existing_exports,
+)
 from gene2wire.tuning import full_joint_candidates
 
+configure_full_display()
 settings = Settings(
     n_outer_folds=N_OUTER_FOLDS, use_location=USE_LOCATION,
     use_target_features=USE_TARGET_FEATURES, n_jobs=N_JOBS,
@@ -176,6 +190,11 @@ settings = Settings(
     run_qiao=RUN_QIAO,
 )
 display(pd.DataFrame([asdict(settings)]).T.rename(columns={0: 'setting'}))
+if RESULTS_ONLY:
+    all_artifacts = load_existing_exports(
+        EXISTING_EXPORT_DIRS, expected_labels=EXPECTED_EXPORT_LABELS)
+    print('RESULTS_ONLY: loaded completed exports; raw loading, preflight and fitting are skipped.')
+    print('Plots and diagnostics use the SAVED manifest, not the current settings printed above.')
 '''
 
 
@@ -214,6 +233,19 @@ def preflight(dataset):
          'eligible_structures': sorted({c.kind for c in full_joint_candidates(model, tuning)})}
         for model in settings.models()
     ]))
+    actual_candidates = []
+    for model in settings.models():
+        for candidate_index, candidate in enumerate(full_joint_candidates(model, tuning), start=1):
+            actual_candidates.append({
+                'dataset': dataset.name, 'outer_fold': folds[0].outer_fold,
+                'model': model.name, 'candidate_index': candidate_index,
+                **asdict(candidate),
+            })
+    print('Exact bounded full-joint candidates for the first inner-training fold:')
+    print('For staged_rank_l2, this is grid support; realized adaptive trials are in tuning below.')
+    display(pd.DataFrame(actual_candidates))
+    print('Shared optimizer configuration:')
+    display(pd.DataFrame([asdict(settings.fit_config())]))
     print('Features above are fitted on inner-training cells only. Final refit uses the development cells.')
     print('Repeated masks share a biological dataset; they are not additional independent animals.')
     return folds
@@ -221,20 +253,10 @@ def preflight(dataset):
 
 
 FINAL = '''
-# Full tables and predictions are already exported by the shared pipeline.
-# The notebook presents one wide metric summary; every detailed table remains on disk.
+# Every selected configuration, tuning trial and exported metric is displayed.
+# Empty tables are explicit; rows, columns and cell widths are never truncated.
 for label, artifacts in all_artifacts.items():
-    print(label)
-    candidate_names = ('aggregate', 'summary', 'summary_metrics', 'metrics_summary', 'aggregate_metrics', 'metrics')
-    chosen = next((artifacts.tables[name] for name in candidate_names
-                   if name in artifacts.tables), None)
-    if chosen is None:
-        chosen = next((value for value in artifacts.tables.values()
-                       if isinstance(value, pd.DataFrame)), None)
-    if chosen is not None:
-        display(chosen)
-    print('Full result export:', artifacts.export_dir)
-    print('Saved table names:', list(artifacts.tables))
+    display_diagnostics(artifacts, label=label)
 print('Figure PDFs:', FIGURE_DIR)
 print('Reusable raw cache:', RAW_DATA_DIR)
 print('Resumable checkpoints:', CHECKPOINT_DIR)
@@ -274,6 +296,8 @@ def dataset_cells(name):
                 checkpoint_dir=CHECKPOINT_DIR, export_dir=EXPORT_DIR,
                 sharing_strengths=SHARING_STRENGTHS,
                 simulation_options=SIMULATION_OPTIONS,
+                progress=SHOW_PROGRESS, progress_level=PROGRESS_LEVEL,
+                progress_interval=PROGRESS_INTERVAL_SECONDS,
             )
             all_artifacts = {'simulation': artifacts}
             '''),
@@ -298,7 +322,9 @@ def dataset_cells(name):
             for panel in PANELS:
                 all_artifacts[panel] = run_experiment(
                     dataset=datasets[panel], settings=settings,
-                    checkpoint_dir=CHECKPOINT_DIR, export_dir=EXPORT_DIR)
+                    checkpoint_dir=CHECKPOINT_DIR, export_dir=EXPORT_DIR,
+                    progress=SHOW_PROGRESS, progress_level=PROGRESS_LEVEL,
+                    progress_interval=PROGRESS_INTERVAL_SECONDS)
             '''),
         ]
     if name == "SPIDER":
@@ -355,13 +381,17 @@ def dataset_cells(name):
         ("code", '''
         artifacts = run_experiment(
             dataset=dataset, settings=settings,
-            checkpoint_dir=CHECKPOINT_DIR, export_dir=EXPORT_DIR)
+            checkpoint_dir=CHECKPOINT_DIR, export_dir=EXPORT_DIR,
+            progress=SHOW_PROGRESS, progress_level=PROGRESS_LEVEL,
+            progress_interval=PROGRESS_INTERVAL_SECONDS)
         all_artifacts = {dataset.name: artifacts}
         '''),
     ]
 
 
 def notebook(name, commit, source_hash):
+    expected_labels = {"BARseq": ("A1", "M1"), "Projection_TAGs": ("Projection-TAGs",),
+                       "MERGE_seq": ("MERGE-seq",)}.get(name, (name,))
     modules = ["numpy", "scipy", "pandas", "sklearn", "joblib", "matplotlib", "yaml", "IPython"]
     if name in {"SPIDER", "Projection_TAGs"}:
         modules.append("rdata")
@@ -379,10 +409,15 @@ def notebook(name, commit, source_hash):
         disconnects. All result tables and predictions go beneath
         `/home/yueyue/gene2wire/paper_figure_exports`; plots display here and save as PDF only.
 
+        For completed results, set `RESULTS_ONLY=True` and fill `EXISTING_EXPORT_DIRS`
+        with exact run directories. This skips raw-data loading and fitting, preserves the
+        saved scientific settings, and adds all figures and full diagnostic tables.
+
         Outputs are deliberately cleared. Earlier paper numbers remain provisional until
         the harmonized reruns and their diagnostics have been reviewed."""),
         ("code", CONFIG.replace("__CORE_COMMIT_0908__", commit).replace("__SOURCE_HASH_0908__", source_hash)
-         + f"\nREQUIRED_MODULES = {modules!r}\n"),
+         .replace("__EXISTING_EXPORT_DIRS_0908__", repr(dict.fromkeys(expected_labels)))
+         + f"\nREQUIRED_MODULES = {modules!r}\nEXPECTED_EXPORT_LABELS = {expected_labels!r}\n"),
         ("markdown", """**Load the pinned code.** A verified local checkout works offline.
         A stale package already imported in this kernel requires a kernel restart;
         the notebook never reloads or rewrites installed model source."""),
@@ -396,7 +431,12 @@ def notebook(name, commit, source_hash):
         ("code", SETTINGS),
         ("code", PREFLIGHT),
     ]
-    parts.extend(dataset_cells(name))
+    # Keep the results-only branch free of any raw loader, simulation generation,
+    # preflight transformation or fit call. Plot/report cells run in either mode.
+    for kind, source in dataset_cells(name):
+        if kind == "code":
+            source = "if not RESULTS_ONLY:\n" + textwrap.indent(textwrap.dedent(source).strip(), "    ")
+        parts.append((kind, source))
     parts.extend([
         ("markdown", """**Loss-rate curves and PDF figures.** Curves retain the complete configured
         loss-rate grid. Simulation includes all three sharing strengths; BARseq includes both panels.
@@ -406,13 +446,26 @@ def notebook(name, commit, source_hash):
         for label, artifacts in all_artifacts.items():
             plot_results(artifacts, output_dir=FIGURE_DIR)
         '''),
-        ("markdown", "**Result tables and reusable exports.**"),
+        ("markdown", """**PU-Joint and every recorded benchmark.** These additional figures
+        retain every available benchmark at its actually evaluated loss rates. Endpoint-only
+        controls are shown at those endpoints; missing intermediate experiments are not invented.
+        Existing primary figures above are retained. Figures display here and save as PDF."""),
+        ("code", '''
+        benchmark_figure_paths = {}
+        for label, artifacts in all_artifacts.items():
+            benchmark_figure_paths[label] = plot_benchmark_results(artifacts, output_dir=FIGURE_DIR, show=True)
+        display(benchmark_figure_paths)
+        '''),
+        ("markdown", """**Complete diagnostics and reusable exports.** All result rows and columns
+        are displayed, including chosen parameters, each recorded trial, convergence, probability
+        calibration, per-target metrics, thinning and failures. Empty exports remain visible.
+        The saved manifest records the exact settings that produced these results."""),
         ("code", FINAL),
     ])
     return {"cells": [cell(kind, source, i) for i, (kind, source) in enumerate(parts)],
             "metadata": {"kernelspec": {"display_name": "Python 3 (OnDemand)", "language": "python", "name": "python3"},
                          "language_info": {"name": "python", "version": "3.10"},
-                         "gene2wire": {"protocol": "0908-v1", "core_commit": commit,
+                         "gene2wire": {"protocol": "0908-v2-balanced", "core_commit": commit,
                                        "source_hash": source_hash, "dataset": name,
                                        "environment": "OnDemand"}},
             "nbformat": 4, "nbformat_minor": 5}

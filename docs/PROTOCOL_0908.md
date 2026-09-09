@@ -30,6 +30,19 @@ The common primary search has a maximum of 32 selectable candidates per method;
 actual, reused, and converged candidate counts must accompany results. A direct
 model with fewer distinct configurations does not repeat fits to exhaust its cap.
 
+The September 9 correction is `0908-v2-balanced`. Within each structural family,
+candidate selection balances the marginal coverage of rank and each penalty,
+then pairwise level coverage and geometric separation (log distance for positive
+penalties). It replaces evenly spaced indices of a flattened Cartesian product,
+which could alias onto a single residual penalty. The declared rank/penalty
+support and 32-candidate cap are unchanged. With target features disabled, Joint
+still has 6 direct, 13 low-rank and 13 shared-plus-residual candidates. Its 13
+low-rank endpoints do not contain every standalone MIRT candidate; exact
+endpoints therefore do not guarantee inclusion of MIRT's validation winner or
+superior held-out performance. Actual candidate tuples are printed before fits
+and recorded in tuning exports. Revised search results require fresh runs and
+must not be relabeled as outputs of the earlier flattened-grid protocol.
+
 `N_JOBS` controls hardware concurrency and is excluded from scientific identity.
 Changing it must not change masks, paired IDs, seeds, or which learned fits can
 be resumed. Scientific settings, source contents, inputs, and split identities

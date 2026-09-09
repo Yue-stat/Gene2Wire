@@ -8,6 +8,8 @@ import platform
 from pathlib import Path
 import re
 import tempfile
+import time
+import uuid
 from typing import Any, Mapping
 
 import numpy as np
@@ -15,7 +17,7 @@ import pandas as pd
 from joblib import Parallel, delayed, parallel_config
 from scipy.stats import t as student_t
 
-from ..checkpoint import sha256_array
+from ..checkpoint import AtomicCheckpointStore, sha256_array, sha256_file
 from ..data import DatasetBundle
 from ..runner import run_model_grid
 from ..seeds import stable_seed
@@ -26,6 +28,7 @@ from .evaluation import evaluate_detection_calibration, evaluate_predictions
 from .io import atomic_json, atomic_npz, jsonable
 from .observation import make_observation_design, thin_reference
 from .protocol import Settings, fingerprint, scenarios, source_hash
+from .progress import ProgressRelay
 from .supervision import compile_training_bundle
 
 
@@ -125,7 +128,8 @@ def _compile(prepared, features, observed, estimated, rows, paired, mode):
     return compiled.subset_rows(rows), exposure[rows]
 
 
-def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_hash):
+def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_hash,
+              on_progress=None):
     fold = prepared.fold
     train, validation, test = fold.train_rows, fold.validation_rows, fold.test_rows
     development = np.sort(np.r_[train, validation])
@@ -148,6 +152,10 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
     for scenario in scenarios(settings, natural=prepared.natural_observed is not None,
                               simulation=is_simulation, sharing_strength=rho):
         context = {**source_context, **scenario}
+        def emit(event):
+            if on_progress is not None:
+                on_progress({**context, **event})
+        emit({"event": "scenario_start"})
         paired = sample_paired_rows(development, scenario["calibration_fraction"], paired_seed,
                                     groups=None if groups is None else groups[development])
         paired_train = np.intersect1d(paired, train)
@@ -164,6 +172,7 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
             final_e, final_detector = _detector(prepared, observed, paired, scenario, design.technical_score)
         except CalibrationNotEstimable as error:
             tables["failures"].append({**context, "stage": "calibration", "error": str(error)})
+            emit({"event": "calibration_failed", "error": str(error)})
             continue
         unit_id = fingerprint(context)
         audit_dir = Path(export_dir) / "units" / unit_id
@@ -243,7 +252,7 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                 test_cell_ids=np.asarray(prepared.cell_ids)[test],
                 checkpoint_dir=model_checkpoint, unit_context={**runner_context, "supervision": role},
                 seed=stable_seed(settings.seed, prepared.name, repetition, fold.outer_fold),
-                code_version=code_hash)
+                code_version=code_hash, on_progress=emit)
 
         result = core_run(models, train_bundle, train_e, refit_bundle, refit_e, "calibrated_pu")
         for name, model_result in result.models.items():
@@ -303,6 +312,8 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                     tb, rb = ((train_bundle, refit_bundle) if semantics == "observed"
                               else (reference_bundles[0], reference_bundles[2]))
                     name = ("RF" if kind == "random_forest" else "Prevalence") + ("-reference" if semantics == "reference" else "-observed")
+                    baseline_started = time.monotonic()
+                    emit({"event": "model_start", "model": name})
                     baseline = fit_baseline(tb.X_cell, tb.S_observed, tb.W_measured,
                         safe_validation.X_cell, safe_validation.S_observed, safe_validation.W_measured,
                         tuning_e[validation], prepared.refit_features.X[test], final_e[test],
@@ -310,14 +321,19 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                         candidate_budget=settings.candidate_budget,
                         seed=stable_seed(settings.seed, repetition, fold.outer_fold, kind),
                         checkpoint_dir=model_checkpoint / "baselines" / fingerprint({**runner_context, "kind": kind, "semantics": semantics}),
-                        refit_X=rb.X_cell, refit_labels=rb.S_observed, refit_measured=rb.W_measured)
+                        refit_X=rb.X_cell, refit_labels=rb.S_observed, refit_measured=rb.W_measured,
+                        on_progress=lambda event: emit({**event, "model": name}))
+                    emit({"event": "model_complete", "model": name,
+                          "elapsed_seconds": time.monotonic()-baseline_started,
+                          "cache_status": "checkpoint" if baseline.diagnostics.get("final_fit_resumed") else "fitted",
+                          "summary": dict(baseline.selected_config)})
                     record(name, baseline.prediction, semantics)
                     tables["selected"].append({**context, "model": name, **baseline.selected_config,
                                                 "tuning_trials": len(baseline.candidate_records)})
                     tables["tuning"].extend({**context, "model": name, **row} for row in baseline.candidate_records)
         if settings.run_qiao and is_simulation and scenario["analysis"] == "primary":
             _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
-                               record, tables, model_checkpoint)
+                               record, tables, model_checkpoint, on_progress=emit)
     return tables
 
 
@@ -367,7 +383,79 @@ def _summarize(tables, *, simulation):
                                             var_name="metric", value_name="value")
 
 
-def _execute(datasets, settings, checkpoint_dir, export_dir):
+def _planned_models(prepared, settings):
+    """Model evaluations per fold/repetition, before any outcome is examined."""
+    rows = []
+    simulation = prepared.metadata.get("independent_unit") == "generated_dataset"
+    for scenario in scenarios(settings, natural=prepared.natural_observed is not None,
+                              simulation=simulation,
+                              sharing_strength=prepared.metadata.get("sharing_strength")):
+        names = [m.name for m in settings.models()
+                 if m.pu or not scenario["analysis"].startswith("calibration")]
+        if scenario["analysis"] == "primary":
+            if scenario["loss_rate"] in (None, .8) and settings.run_information_controls:
+                names += ["Reference-only", "Reference+PU"]
+            if scenario["loss_rate"] in (None, 0., .8):
+                names += ["Prevalence-observed", "Prevalence-reference"]
+                if settings.run_random_forest:
+                    names += ["RF-observed", "RF-reference"]
+            if simulation and settings.run_qiao:
+                names += ["Qiao-squared", "Qiao-logit"]
+        rows.extend({**scenario, "model": name} for name in names)
+    return rows
+
+
+def _load_unit_result(store, key, run_id, export_path):
+    cached = store.load(key, run_id)
+    if cached is None:
+        return None
+    payload = cached["payload"]
+    # A complete summary is reusable only while its predictions/audits exist
+    # unchanged. Missing exports can be rebuilt from the finer model caches.
+    for relative, digest in payload["artifact_hashes"].items():
+        path = export_path / relative
+        if not path.is_file() or sha256_file(path) != digest:
+            return None
+    tables = payload["tables"]
+    for name, columns in payload.get("numeric_columns", {}).items():
+        for row in tables[name]:
+            for column in columns:
+                if column in row and row[column] is None:
+                    row[column] = np.nan
+    for row in tables["selected"]:
+        row["resumed"] = True
+    return tables
+
+
+def _run_checkpointed_fold(prepared, repetition, settings, checkpoint_dir,
+                           export_path, fit_version, run_id, key, writer):
+    started = time.monotonic()
+    writer({"event": "unit_start"})
+    tables = _run_fold(prepared, repetition, settings, checkpoint_dir, export_path,
+                       fit_version, on_progress=writer)
+    if not tables["failures"]:
+        prefix = {"dataset": prepared.name, "repetition": repetition,
+                  "outer_fold": prepared.fold.outer_fold,
+                  "sharing_strength": prepared.metadata.get("sharing_strength")}
+        files = []
+        for scenario in scenarios(settings, natural=prepared.natural_observed is not None,
+                                  simulation=prepared.metadata.get("independent_unit") == "generated_dataset",
+                                  sharing_strength=prepared.metadata.get("sharing_strength")):
+            files.extend((export_path / "units" / fingerprint({**prefix, **scenario})).glob("*"))
+        numeric = {name: list(pd.DataFrame(rows).select_dtypes(include="number").columns)
+                   for name, rows in tables.items()}
+        payload = {"tables": tables, "numeric_columns": numeric,
+                   "artifact_hashes": {p.relative_to(export_path).as_posix(): sha256_file(p)
+                                       for p in files if p.is_file()}}
+        store = AtomicCheckpointStore(Path(checkpoint_dir) / "experiment_units" / run_id)
+        store.save_complete(key, run_id, jsonable(payload))
+    writer({"event": "unit_complete", "elapsed_seconds": time.monotonic()-started,
+            "failed_scenarios": len(tables["failures"])})
+    return tables
+
+
+def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
+             progress_interval=30., progress_level="model"):
     code_hash = source_hash()
     contexts = []
     metadata = []
@@ -427,15 +515,49 @@ def _execute(datasets, settings, checkpoint_dir, export_dir):
     # One parallel level only: workers receive prepared dense arrays, not raw
     # high-dimensional sequencing objects; joblib can memory-map large arrays.
     workers = min(settings.n_jobs, len(contexts))
-    print(f"{len(contexts)} fold/repetition units; {workers} workers; checkpoints: {checkpoint_dir}")
-    if workers == 1:
-        results = [_run_fold(p, r, settings, checkpoint_dir, export_path, fit_version) for p, r in contexts]
-    else:
-        with parallel_config(backend="loky", inner_max_num_threads=1):
-            results = Parallel(n_jobs=workers, verbose=10, max_nbytes="10M")(
-                delayed(_run_fold)(p, r, settings, checkpoint_dir, export_path, fit_version) for p, r in contexts)
+    store = AtomicCheckpointStore(Path(checkpoint_dir) / "experiment_units" / run_id)
+    results, pending, inventory = [None] * len(contexts), [], []
+    for index, (prepared, repetition) in enumerate(contexts):
+        unit_context = {"dataset": prepared.name, "repetition": repetition,
+                        "outer_fold": prepared.fold.outer_fold,
+                        "sharing_strength": prepared.metadata.get("sharing_strength")}
+        key = fingerprint({"run_id": run_id, **unit_context})
+        cached = _load_unit_result(store, key, run_id, export_path)
+        inventory.append({**unit_context, "work_id": key, "fully_cached": cached is not None,
+                          "planned_model_evaluations": len(_planned_models(prepared, settings))})
+        if cached is not None:
+            results[index] = cached
+        else:
+            pending.append((index, prepared, repetition, key, unit_context))
+    cached_count = len(contexts)-len(pending)
+    if progress:
+        print(f"[checkpoint inventory] {cached_count}/{len(contexts)} complete fold/repetition units "
+              f"reusable; {len(pending)} units remaining; up to {workers} workers.", flush=True)
+        print(f"[work plan] {sum(r['planned_model_evaluations'] for r in inventory)} model evaluations; "
+              f"{sum(r['planned_model_evaluations'] for r in inventory if r['fully_cached'])} in fully cached units. "
+              "Partial candidate/refit caches are verified against exact fingerprints per model below; "
+              "remaining units need not require all-new fits.", flush=True)
+        print(f"Checkpoints: {checkpoint_dir}", flush=True)
+    event_dir = export_path / "progress" / uuid.uuid4().hex
+    relay = ProgressRelay(event_dir, enabled=progress, interval=progress_interval,
+                          level=progress_level, total_units=len(contexts), cached_units=cached_count)
+    with relay:
+        tasks = [(index, p, r, key, relay.writer(key, **context, work_id=key))
+                 for index, p, r, key, context in pending]
+        if workers == 1:
+            new_results = [_run_checkpointed_fold(p, r, settings, checkpoint_dir, export_path,
+                           fit_version, run_id, key, writer) for _, p, r, key, writer in tasks]
+        else:
+            with parallel_config(backend="loky", inner_max_num_threads=1):
+                new_results = Parallel(n_jobs=workers, verbose=0, max_nbytes="10M")(
+                    delayed(_run_checkpointed_fold)(p, r, settings, checkpoint_dir, export_path,
+                        fit_version, run_id, key, writer) for _, p, r, key, writer in tasks)
+        for task, result in zip(tasks, new_results):
+            results[task[0]] = result
     names = results[0].keys()
     tables = {name: pd.DataFrame([row for result in results for row in result[name]]) for name in names}
+    tables["checkpoint_inventory"] = pd.DataFrame(inventory)
+    tables["progress_events"] = pd.DataFrame(relay.rows)
     if len(datasets) == 1 and datasets[0].natural_observed is not None:
         data = datasets[0]
         standard = (data.natural_observed * data.measured).sum(axis=0)
@@ -458,12 +580,15 @@ def _execute(datasets, settings, checkpoint_dir, export_dir):
     return Artifacts(tables, export_path, manifest)
 
 
-def run_experiment(dataset: ExperimentDataset, settings: Settings, *, checkpoint_dir, export_dir):
-    return _execute([dataset], settings, checkpoint_dir, export_dir)
+def run_experiment(dataset: ExperimentDataset, settings: Settings, *, checkpoint_dir, export_dir,
+                   progress=True, progress_interval=30., progress_level="model"):
+    return _execute([dataset], settings, checkpoint_dir, export_dir, progress=progress,
+                    progress_interval=progress_interval, progress_level=progress_level)
 
 
 def run_simulation_experiments(settings: Settings, *, raw_cache_dir, checkpoint_dir, export_dir,
-                               sharing_strengths=(0., .5, 1.), simulation_options=None):
+                               sharing_strengths=(0., .5, 1.), simulation_options=None,
+                               progress=True, progress_interval=30., progress_level="model"):
     from .datasets.simulation import generate_simulation
     options = {"truth_uses_location": settings.use_location, **(simulation_options or {})}
     datasets = []
@@ -484,11 +609,12 @@ def run_simulation_experiments(settings: Settings, *, raw_cache_dir, checkpoint_
                            **{k: v for k, v in dataset.metadata.items()
                               if isinstance(v, np.ndarray) and k != "target_descriptors"})
             datasets.append(dataset)
-    return _execute(datasets, settings, checkpoint_dir, export_dir)
+    return _execute(datasets, settings, checkpoint_dir, export_dir, progress=progress,
+                    progress_interval=progress_interval, progress_level=progress_level)
 
 
 def _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
-                       record, tables, checkpoint_dir):
+                       record, tables, checkpoint_dir, on_progress=None):
     """Same-input bilinear controls with independent candidate/final checkpoints.
 
     Fits see only measured detections. Selection always uses the original
@@ -593,8 +719,12 @@ def _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
         return prediction, ranking_score, diagnostics
 
     for objective, name in (("squared_error", "Qiao-squared"), ("logit", "Qiao-logit")):
+        model_started = time.monotonic()
+        if on_progress is not None:
+            on_progress({"event": "model_start", "model": name})
         trials, best = [], None
         for index, candidate in enumerate(candidates):
+            candidate_started = time.monotonic()
             config = {**candidate, "objective": objective}
             probability, _, diagnostics = cached_fit("candidate", prepared.train_features,
                                                      train, validation, config)
@@ -604,6 +734,11 @@ def _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
                      "validation_loss": loss, "selection_metric": "observed_log_loss",
                      "stage": "qiao_candidate"}
             trials.append(trial)
+            if on_progress is not None:
+                on_progress({"event": "candidate_complete", "model": name, "index": index+1,
+                             "total": len(candidates), "config": config,
+                             "cache_status": "checkpoint" if diagnostics["resumed"] else "fitted",
+                             "elapsed_seconds": time.monotonic()-candidate_started})
             key = (not diagnostics["converged"], loss, config["rank"], -config["l2"])
             if best is None or key < best[0]:
                 best = (key, config)
@@ -623,3 +758,8 @@ def _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
                                     "validation_loss": best[0][1],
                                     "tuning_trials": len(trials), "candidate_budget": budget})
         tables["tuning"].extend({**context, "model": name, **trial} for trial in trials)
+        if on_progress is not None:
+            on_progress({"event": "model_complete", "model": name,
+                         "elapsed_seconds": time.monotonic()-model_started,
+                         "cache_status": "checkpoint" if diagnostics["resumed"] else "fitted",
+                         "summary": {**best[1], "final_converged": diagnostics["converged"]}})

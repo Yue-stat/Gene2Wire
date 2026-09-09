@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 import hashlib
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
@@ -31,7 +32,7 @@ from .seeds import stable_seed
 from .tuning import TuningResult, tune_model
 
 
-CORE_API_VERSION = "0.3.1"
+CORE_API_VERSION = "0.3.2"
 
 
 @dataclass(frozen=True)
@@ -226,6 +227,7 @@ def run_model_grid(
     code_version: str = CORE_API_VERSION,
     run_fingerprint: str | None = None,
     on_model: Callable[[str, str], None] | None = None,
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> GridRunResult:
     """Tune and refit multiple models without access to evaluation truth.
 
@@ -238,7 +240,9 @@ def run_model_grid(
     so hidden masks and pre-hide reference labels cannot enter model selection.
     Candidate trials, reusable direct warm starts, and completed fitted
     models/predictions are checkpointed independently when ``checkpoint_dir``
-    is supplied.
+    is supplied. ``on_progress`` reports timed model, candidate, and final-refit
+    events, including compatible checkpoint and in-memory reuse. It supplements
+    the existing ``on_model`` callback without changing its behavior.
     """
 
     _require_reference_free("train", train)
@@ -386,10 +390,18 @@ def run_model_grid(
                         fit=asdict(fit_config), seed=final_seed), final_seed
 
     results: dict[str, ModelRunResult] = {}
-    for base_model in base_models:
+
+    def emit(event: str, model: str, **details: Any) -> None:
+        if on_progress is not None:
+            on_progress({"event": event, "model": model, **details})
+
+    for model_index, base_model in enumerate(base_models, start=1):
+        model_started = perf_counter()
         model_key = unit_key(task="completed_model", **context, model=base_model.name)
         model_fingerprint = model_fingerprints[base_model.name]
         cached = None if model_store is None else model_store.load(model_key, model_fingerprint)
+        emit("model_start", base_model.name, index=model_index, total=len(base_models),
+             cache_status="checkpoint" if cached is not None else "pending")
         if cached is not None:
             payload = cached["payload"]
             arrays = cached["arrays"]
@@ -419,6 +431,9 @@ def run_model_grid(
             final_fit_cache[refit_key] = fitted_model
             if on_model is not None:
                 on_model(base_model.name, "resumed")
+            emit("model_complete", base_model.name, index=model_index, total=len(base_models),
+                 cache_status="checkpoint", elapsed_seconds=perf_counter() - model_started,
+                 resumed=True, summary=result.summary())
             continue
 
         if on_model is not None:
@@ -440,15 +455,21 @@ def run_model_grid(
             checkpoint_context=context,
             warm_start_cache=tuning_warm_starts,
             candidate_cache=candidate_cache,
+            on_progress=on_progress,
         )
+        refit_started = perf_counter()
         refit_key, final_seed = final_coordinates(tuned.best_config, model_fit)
         fitted_model = final_fit_cache.get(refit_key)
+        refit_cache_status = "memory" if fitted_model is not None else "pending"
         if fitted_model is None and refit_store is not None:
             cached_refit = refit_store.load(refit_key, data_fingerprint)
             if cached_refit is not None:
                 fitted_model = _state_from_checkpoint(cached_refit["payload"]["fitted"], cached_refit["arrays"])
                 if model_identity(fitted_model.config) != model_identity(tuned.best_config):
                     raise ValueError("canonical refit checkpoint configuration does not match")
+                refit_cache_status = "checkpoint"
+        emit("refit_start", base_model.name, cache_status=refit_cache_status,
+             config=asdict(tuned.best_config), seed=final_seed)
         if fitted_model is None:
             fitted_model = UnifiedPUModel(tuned.best_config, model_fit, warm_start_cache=refit_warm_starts).fit(
                 development, exposure=development_e, seed=final_seed,
@@ -456,7 +477,13 @@ def run_model_grid(
             if refit_store is not None:
                 metadata, arrays = _state_to_checkpoint(fitted_model)
                 refit_store.save_complete(refit_key, data_fingerprint, {"fitted": metadata}, arrays)
+            refit_cache_status = "fitted"
         final_fit_cache[refit_key] = fitted_model
+        emit("refit_complete", base_model.name, cache_status=refit_cache_status,
+             elapsed_seconds=perf_counter() - refit_started,
+             config=asdict(tuned.best_config), seed=final_seed,
+             converged=fitted_model.converged, iterations=fitted_model.iterations,
+             objective=fitted_model.objective)
         # Preserve the reporting alias while reusing the exact canonical fit.
         fitted_model = replace(fitted_model, config=tuned.best_config)
         latent = fitted_model.predict_proba(final_test_array)
@@ -490,6 +517,9 @@ def run_model_grid(
         results[base_model.name] = result
         if on_model is not None:
             on_model(base_model.name, "completed")
+        emit("model_complete", base_model.name, index=model_index, total=len(base_models),
+             cache_status="fitted", elapsed_seconds=perf_counter() - model_started,
+             resumed=False, summary=result.summary())
 
     return GridRunResult(
         fingerprint=fingerprint,

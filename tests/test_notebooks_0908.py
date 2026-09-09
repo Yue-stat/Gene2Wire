@@ -63,13 +63,57 @@ def test_clean_valid_python_and_shared_defaults(name):
 def test_location_switch_controls_simulation_truth_and_fitted_features():
     code = "\n".join(text(cell) for cell in load("simulation")["cells"] if cell["cell_type"] == "code")
     parsed = ast.parse(code)
-    options = next(node.value for node in parsed.body if isinstance(node, ast.Assign)
+    options = next(node.value for node in ast.walk(parsed) if isinstance(node, ast.Assign)
                    and any(isinstance(t, ast.Name) and t.id == "SIMULATION_OPTIONS" for t in node.targets))
     mapping = dict(zip((key.value for key in options.keys), options.values))
     assert isinstance(mapping["truth_uses_location"], ast.Name)
     assert mapping["truth_uses_location"].id == "USE_LOCATION"
     assert "use_location=USE_LOCATION" in code
     assert "SHARING_STRENGTHS = (0.0, 0.5, 1.0)" in code
+
+
+def builder():
+    spec = importlib.util.spec_from_file_location("notebook_diagnostics_builder", ROOT / "scripts" / "build_notebooks_0908.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("name", NAMES)
+def test_generated_results_only_skips_all_raw_and_fit_cells(name):
+    module = builder()
+    nb = module.notebook(name, "a" * 40, "b" * 64)
+    guarded = [text(cell) for cell in nb["cells"]
+               if cell["cell_type"] == "code" and text(cell).startswith("if not RESULTS_ONLY:")]
+    assert len(guarded) >= 2
+    namespace = {"RESULTS_ONLY": True}
+    for source in guarded:
+        # No loader, Settings, paths or fit names exist: execution must be a no-op.
+        exec(compile(source, "results-only-cell", "exec"), namespace)
+    assert "all_artifacts" not in namespace
+    assert "dataset" not in namespace and "datasets" not in namespace
+    all_code = "\n".join(text(cell) for cell in nb["cells"] if cell["cell_type"] == "code")
+    assert "RESULTS_ONLY = False" in all_code
+    assert "load_existing_exports(" in all_code
+    assert "configure_full_display()" in all_code
+    assert "display_diagnostics(artifacts, label=label)" in all_code
+    assert "plot_results(artifacts, output_dir=FIGURE_DIR)" in all_code
+    assert "plot_benchmark_results(artifacts, output_dir=FIGURE_DIR, show=True)" in all_code
+    assert "SHOW_PROGRESS = True" in all_code
+    assert "PROGRESS_LEVEL = 'model'" in all_code
+    assert "PROGRESS_INTERVAL_SECONDS = 30.0" in all_code
+    run_calls = [node for node in ast.walk(ast.parse(all_code))
+                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                 and node.func.id in {"run_experiment", "run_simulation_experiments"}]
+    assert run_calls
+    for call in run_calls:
+        values = {keyword.arg: keyword.value.id for keyword in call.keywords
+                  if isinstance(keyword.value, ast.Name)}
+        assert values["progress"] == "SHOW_PROGRESS"
+        assert values["progress_level"] == "PROGRESS_LEVEL"
+        assert values["progress_interval"] == "PROGRESS_INTERVAL_SECONDS"
+    if name == "BARseq":
+        assert "EXISTING_EXPORT_DIRS = {'A1': None, 'M1': None}" in all_code
 
 
 def test_generator_reproduces_checked_in_notebooks(tmp_path):

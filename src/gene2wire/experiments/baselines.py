@@ -13,7 +13,9 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from typing import Any, Literal, Mapping, Sequence
+from time import perf_counter
+from typing import Any, Callable, Literal, Mapping, Sequence
+from zipfile import BadZipFile
 
 import numpy as np
 import sklearn
@@ -125,22 +127,42 @@ def _fit_identity(x: np.ndarray, y: np.ndarray, mask: np.ndarray, x_predict: np.
     return hashlib.sha256(canonical_json(payload).encode()).hexdigest()
 
 
-def _cached_fit_predict(x: np.ndarray, y: np.ndarray, mask: np.ndarray, x_predict: np.ndarray,
-                        *, kind: str, config: Mapping[str, Any], seed: int,
-                        checkpoint_dir: Path | None) -> tuple[np.ndarray, dict[str, Any], bool]:
-    identity = _fit_identity(x, y, mask, x_predict, kind=kind, config=config, seed=seed)
-    path = checkpoint_dir / f"baseline_{identity}.npz" if checkpoint_dir is not None else None
+def _read_fit_checkpoint(path: Path | None, identity: str, shape: tuple[int, int]
+                         ) -> tuple[np.ndarray, dict[str, Any]] | None:
+    """Apply the same integrity checks to inventories and actual checkpoint reads."""
     if path is not None and path.exists():
         try:
             with np.load(path, allow_pickle=False) as saved:
                 prediction = saved["prediction"]
                 metadata = json.loads(str(saved["metadata"].item()))
-            if (metadata["identity"] == identity and prediction.shape == (len(x_predict), y.shape[1])
+            if (metadata["identity"] == identity and prediction.shape == shape
                 and metadata["prediction_hash"] == sha256_array(prediction)
+                and isinstance(metadata["diagnostics"], dict)
                 and np.all(np.isfinite(prediction)) and np.all((prediction >= 0) & (prediction <= 1))):
-                return prediction, metadata["diagnostics"], True
-        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                return prediction, metadata["diagnostics"]
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, EOFError, BadZipFile):
             pass  # Incomplete/corrupt caches are deterministically recomputed.
+    return None
+
+
+def _checkpoint_available(x: np.ndarray, y: np.ndarray, mask: np.ndarray, x_predict: np.ndarray,
+                          *, kind: str, config: Mapping[str, Any], seed: int,
+                          checkpoint_dir: Path | None) -> bool:
+    if checkpoint_dir is None:
+        return False
+    identity = _fit_identity(x, y, mask, x_predict, kind=kind, config=config, seed=seed)
+    return _read_fit_checkpoint(checkpoint_dir / f"baseline_{identity}.npz", identity,
+                                (len(x_predict), y.shape[1])) is not None
+
+
+def _cached_fit_predict(x: np.ndarray, y: np.ndarray, mask: np.ndarray, x_predict: np.ndarray,
+                        *, kind: str, config: Mapping[str, Any], seed: int,
+                        checkpoint_dir: Path | None) -> tuple[np.ndarray, dict[str, Any], bool]:
+    identity = _fit_identity(x, y, mask, x_predict, kind=kind, config=config, seed=seed)
+    path = checkpoint_dir / f"baseline_{identity}.npz" if checkpoint_dir is not None else None
+    cached = _read_fit_checkpoint(path, identity, (len(x_predict), y.shape[1]))
+    if cached is not None:
+        return cached[0], cached[1], True
     prediction, diagnostics = _fit_predict(x, y, mask, x_predict, kind=kind, config=config, seed=seed)
     if path is not None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -168,6 +190,7 @@ def fit_baseline(
     candidate_budget: int = 32, seed: int = 0, checkpoint_dir: str | Path | None = None,
     refit_X: Any | None = None, refit_labels: Any | None = None, refit_measured: Any | None = None,
     candidate_configs: Sequence[Mapping[str, Any]] | None = None,
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> BaselineResult:
     """Tune globally on observed validation labels, then refit the chosen config.
 
@@ -178,6 +201,8 @@ def fit_baseline(
     Candidate-level checkpoints contain numeric predictions and checksummed
     metadata, not executable estimator pickles. Every candidate and final fit is
     keyed by data, actual source, configuration, seed, and library versions.
+    ``on_progress`` receives candidate inventories and start/completion events
+    for tuning and the final refit. It does not enter fitting or cache identity.
     """
     if probability_semantics not in {"reference", "observed"}:
         raise ValueError("probability_semantics must be 'reference' or 'observed'")
@@ -215,9 +240,24 @@ def fit_baseline(
     else:
         xr, yr, mr = x, y, mask
     directory = Path(checkpoint_dir) if checkpoint_dir is not None else None
+    cached_candidates = [False] * len(candidates)
+    if on_progress is not None:
+        cached_candidates = [_checkpoint_available(x, y, mask, xv, kind=kind,
+            config=config, seed=int(seed), checkpoint_dir=directory) for config in candidates]
+        cached_count = sum(cached_candidates)
+        on_progress({"event": "candidate_inventory", "stage": "tuning",
+                     "total": len(candidates), "cached": cached_count,
+                     "memory_cached": 0, "checkpoint_cached": cached_count,
+                     "pending": len(candidates) - cached_count})
     records = []
     eps = np.finfo(np.float64).eps
     for index, config in enumerate(candidates):
+        started = perf_counter()
+        if on_progress is not None:
+            on_progress({"event": "candidate_start", "stage": "tuning",
+                         "index": index + 1, "total": len(candidates), "config": dict(config),
+                         "cache_status": "checkpoint" if cached_candidates[index] else "pending",
+                         "elapsed_seconds": 0.0})
         pred, diagnostics, resumed = _cached_fit_predict(x, y, mask, xv, kind=kind,
             config=config, seed=int(seed), checkpoint_dir=directory)
         qv = ev * pred if probability_semantics == "reference" else pred
@@ -226,10 +266,27 @@ def fit_baseline(
         records.append({"candidate_index": index, "config": dict(config),
                         "validation_observed_log_loss": loss, "resumed": resumed,
                         "n_validation_entries": int(np.sum(mv)), **diagnostics})
+        if on_progress is not None:
+            on_progress({"event": "candidate_complete", "stage": "tuning",
+                         "index": index + 1, "total": len(candidates), "config": dict(config),
+                         "cache_status": "checkpoint" if resumed else "fitted",
+                         "elapsed_seconds": perf_counter() - started,
+                         "validation_observed_log_loss": loss})
     winner = min(range(len(records)), key=lambda index: (records[index]["validation_observed_log_loss"], index))
     selected = candidates[winner]
+    started = perf_counter()
+    if on_progress is not None:
+        refit_cached = _checkpoint_available(xr, yr, mr, xt, kind=kind,
+            config=selected, seed=int(seed), checkpoint_dir=directory)
+        on_progress({"event": "refit_start", "stage": "refit", "config": dict(selected),
+                     "cache_status": "checkpoint" if refit_cached else "pending",
+                     "elapsed_seconds": 0.0})
     prediction, fit_diagnostics, resumed = _cached_fit_predict(xr, yr, mr, xt,
         kind=kind, config=selected, seed=int(seed), checkpoint_dir=directory)
+    if on_progress is not None:
+        on_progress({"event": "refit_complete", "stage": "refit", "config": dict(selected),
+                     "cache_status": "checkpoint" if resumed else "fitted",
+                     "elapsed_seconds": perf_counter() - started})
     q_test = et * prediction if probability_semantics == "reference" else prediction.copy()
     return BaselineResult(prediction=prediction, observed_prediction=q_test,
         selected_config=dict(selected), candidate_records=tuple(records),

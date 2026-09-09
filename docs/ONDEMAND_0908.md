@@ -177,3 +177,54 @@ download the full datasets or execute all formal reruns. All revised paper value
 must come from completed 0908 runs whose manifests and failure/convergence
 diagnostics have been reviewed. Mask repetitions are not new animals; simulation
 folds within one generated dataset are not independent Monte Carlo samples.
+
+## 8. September 9 diagnostics and existing results
+
+All five notebooks retain their `_0908` names. Their updated core includes the
+balanced candidate-selection correction described in `PROTOCOL_0908.md`. Source
+and protocol fingerprints change, so earlier fitted checkpoints are retained
+but are not silently counted as compatible with this corrected search.
+
+To display the already completed BARseq runs attached on September 9, set these
+variables in the first configuration cell, restart the kernel, and Run All:
+
+```python
+RESULTS_ONLY = True
+EXISTING_EXPORT_DIRS = {
+    'A1': BASE_DIR / 'paper_figure_exports/BARseq_A1_0908/9c6de5000d4e8a99e3b8',
+    'M1': BASE_DIR / 'paper_figure_exports/BARseq_M1_0908/8e3062511995d96ef8d7',
+}
+```
+
+The explicit run directories must exist on that machine. This mode reads their
+saved manifests and all CSVs, displays the existing plots plus new plots of all
+available benchmarks, and prints full diagnostics. It skips raw-data loading,
+preflight and training. The loaded run's saved protocol remains authoritative.
+Every benchmark actually present is plotted; disabled or unexecuted methods are
+not invented. Endpoint-only baselines use disconnected markers. Additional
+PDFs are saved in `figures/0908/all_benchmarks/`; no PNGs are written.
+
+For training, use `RESULTS_ONLY = False`. New progress switches are:
+
+```python
+SHOW_PROGRESS = True
+PROGRESS_LEVEL = 'model'       # 'trial' also prints individual candidate finishes
+PROGRESS_INTERVAL_SECONDS = 30.0
+```
+
+The initial inventory reports complete, compatible fold/repetition result
+checkpoints and remaining units. Completed unit summaries are accepted only
+when their exported predictions and audits still pass content checks. Remaining
+units can contain partial model/candidate caches; exact candidate hits, memory
+reuse and pending fits are reported when each model's identity is available.
+Final refit identities depend on model selection, so a global count of all final
+fits cannot be known before tuning. Worker events are relayed through the parent
+process and saved under the run's `progress/` directory and `progress_events.csv`.
+`checkpoint_inventory.csv` records the startup inventory. A heartbeat lists
+active model/scenario contexts even while one optimization is lengthy.
+
+The final notebook cells now display every row and column of all exported tables,
+including selected parameters, tuning trials, convergence, per-target metrics,
+calibration, failures and checkpoint diagnostics. These outputs can be large;
+they deliberately retain the user's requested complete display. Old clipped
+notebook displays can be regenerated from the full CSV exports without fitting.
