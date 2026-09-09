@@ -36,7 +36,7 @@ class Settings:
     run_mechanism_controls: bool = True
     run_calibration_controls: bool = True
     run_qiao: bool = True
-    calibration_fractions: tuple[float, ...] = (.1, .2, .4)
+    calibration_fractions: tuple[float, ...] = (.2,)
     protocol_version: str = PROTOCOL_VERSION
 
     def __post_init__(self):

@@ -502,6 +502,28 @@ def _benchmark_dots(axis, frame, metric, models):
                   ha="center", va="center", color="#777777", fontsize=9)
 
 
+def _benchmark_legend_handles(axes, models):
+    """Show line styles only when a plotted panel contains a visible segment."""
+    from matplotlib.lines import Line2D
+
+    handles = []
+    for model in models:
+        style = _benchmark_style(model, models)
+        linestyle = "None"
+        for axis in axes:
+            for line in axis.lines:
+                if line.get_label() != style["label"] or line.get_linestyle() == "None":
+                    continue
+                finite = np.isfinite(line.get_ydata())
+                if np.any(finite[:-1] & finite[1:]):
+                    linestyle = line.get_linestyle()
+                    break
+            if linestyle != "None":
+                break
+        handles.append(Line2D([], [], **style, linestyle=linestyle, markeredgewidth=.7))
+    return handles
+
+
 def plot_benchmark_results(artifacts: Any, output_dir: str | Path, *,
                            show: bool = True,
                            metrics: tuple[str, ...] = PRIMARY_METRICS) -> dict[str, Path]:
@@ -576,13 +598,11 @@ def plot_benchmark_results(artifacts: Any, output_dir: str | Path, *,
                 for axis, metric in zip(axes[0], metrics):
                     _benchmark_curve(axis, selected, metric, models)
                     axis.set_title(_benchmark_metric_title(metric, simulation=simulation), loc="left", pad=9)
-                from matplotlib.lines import Line2D
-                handles = [Line2D([], [], **_benchmark_style(model, models), linestyle="None")
-                           for model in models]
+                handles = _benchmark_legend_handles(axes[0], models)
                 legend = figure.legend(handles, [_BENCHMARK_LABELS.get(model, model) for model in models],
                               loc="upper center", bbox_to_anchor=(.5, .94), frameon=False,
                               ncol=min(legend_columns, len(models)), fontsize=8.5, columnspacing=1.5,
-                              handlelength=1.2)
+                              handlelength=2.5)
                 figure.suptitle(title, fontsize=10, y=.995)
                 figure.text(.5, .012, "Points show evaluated loss rates; endpoint-only fits are not connected. "
                             "Means over folds and repetitions; no diagnostic confidence intervals.",

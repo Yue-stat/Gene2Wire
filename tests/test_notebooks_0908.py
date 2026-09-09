@@ -48,7 +48,7 @@ def test_clean_valid_python_and_shared_defaults(name):
         "N_JOBS": 32, "N_REPETITIONS": 5, "STRATEGY": "full_joint",
         "RUN_INFORMATION_CONTROLS": True, "RUN_RANDOM_FOREST": True,
         "RUN_MECHANISM_CONTROLS": True, "RUN_CALIBRATION_CONTROLS": True,
-        "RUN_QIAO": True,
+        "RUN_QIAO": True, "PAIRED_FRACTION": .2,
     }.items():
         assert assignments[key] == expected
     joined = "\n".join(all_code)
@@ -163,3 +163,33 @@ subprocess.check_output = forbidden_network
     assert str(ROOT / "src" / "gene2wire") in result.stdout
     assert (tmp_path / "paper_figure_exports").is_dir()
     assert not (tmp_path / "code").exists()
+
+
+@pytest.mark.parametrize("name", NAMES)
+def test_every_code_cell_has_a_visible_section_in_the_toc(name):
+    nb = builder().notebook(name, "a" * 40, "b" * 64)
+    titles = []
+    for index, cell in enumerate(nb["cells"]):
+        if cell["cell_type"] == "code":
+            previous = nb["cells"][index - 1]
+            assert previous["cell_type"] == "markdown"
+            title = text(previous).splitlines()[0]
+            assert title.startswith("## "), (name, index, title)
+            titles.append(title)
+    assert len(set(titles)) == len(titles)
+
+
+def test_simulation_exposes_primary_budget_and_optional_size_sweep():
+    module = builder()
+    namespace = {"__file__": str(ROOT / "simulation_0908.ipynb")}
+    source = module.CONFIG.replace("__CORE_COMMIT_0908__", "a" * 40).replace(
+        "__SOURCE_HASH_0908__", "b" * 64).replace("__EXISTING_EXPORT_DIRS_0908__", "{}")
+    exec(source, namespace)
+    assert namespace["PAIRED_FRACTION"] == .2
+    assert namespace["CALIBRATION_FRACTIONS"] == (.2,)
+    namespace = {}
+    exec(source.replace("PAIRED_FRACTION = 0.20", "PAIRED_FRACTION = 0.30"), namespace)
+    assert namespace["CALIBRATION_FRACTIONS"] == (.3,)
+    code = module.SETTINGS
+    assert "paired_fraction=PAIRED_FRACTION" in code
+    assert "calibration_fractions=CALIBRATION_FRACTIONS" in code

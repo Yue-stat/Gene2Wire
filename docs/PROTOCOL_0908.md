@@ -193,7 +193,7 @@ restricted to the following scopes, rather than crossed with every dataset:
 |---|---|
 | Primary six-model curves | Synthetic Technical-SAR at all five rates; natural paired endpoint for Projection-TAGs |
 | Mechanism controls | Simulation only: SCAR and Target-SAR at 80%, all three sharing strengths |
-| Calibration-size controls | Simulation only: sharing 0 and 1, Technical-SAR 80%, correctly specified detector, 10/20/40% budget |
+| Calibration-size controls | Simulation only: sharing 0 and 1, Technical-SAR 80%, correctly specified detector; optional sizes from `CALIBRATION_FRACTIONS`, default `(0.20,)` reuses primary |
 | Calibration misspecification | Simulation only: sharing 0 and 1, Technical-SAR 80%, 20% budget; omit technical score or pool targets |
 | Independent information-budget controls | Natural endpoint or 80% artificial loss |
 | Observed-only/reference-only random forests | Natural endpoint or primary 0/80% endpoints |
@@ -202,9 +202,12 @@ restricted to the following scopes, rather than crossed with every dataset:
 | Qiao comparisons | Enabled by default on every primary rate/natural endpoint; target-ID adaptation when descriptors are disabled |
 
 Default scenario counts are one for natural paired data, five for each real-data
-thinning benchmark, seven for intermediate-sharing simulation, and eleven for
-zero/full-sharing simulation. The middle calibration fraction reuses the primary
-20% condition instead of adding a duplicate scenario. Information and RF controls
+thinning benchmark, seven for intermediate-sharing simulation, and nine for
+zero/full-sharing simulation. All default scenarios use the 20% paired budget.
+`PAIRED_FRACTION` sets the primary budget and `CALIBRATION_FRACTIONS` defaults to
+`(PAIRED_FRACTION,)`. Setting it to `(0.10, 0.20, 0.40)` restores the additional
+size comparison and eleven zero/full-sharing scenarios; the primary fraction
+is reused instead of adding a duplicate scenario. Information and RF controls
 are model-level additions at the stated endpoints, not extra missingness axes.
 
 Qiao's squared-error and logit variants use only observed training outcomes and

@@ -45,12 +45,16 @@ USE_TARGET_FEATURES = False
 N_JOBS = 32
 N_REPETITIONS = 5
 STRATEGY = 'full_joint'
+PAIRED_FRACTION = 0.20
+CALIBRATION_FRACTIONS = (PAIRED_FRACTION,)
 ```
 
 Choose a compute allocation that supports the requested worker count and memory.
 `N_JOBS=32` is a maximum: for a real dataset, three folds times five repetitions
 provide at most 15 concurrent fold/repetition units. BARseq processes A1 and M1
-separately. The simulation supplies more independent units. Reducing `N_JOBS`
+separately. Simulation has 3 sharing strengths × 5 generated datasets × 3 folds
+= 45 tasks, so it can use all 32 workers. Loss rates and models run sequentially
+inside each worker; increasing `N_JOBS` alone cannot exceed the available tasks. Reducing `N_JOBS`
 does not redraw masks or invalidate compatible fitted checkpoints. Threads inside
 each worker are limited to one; avoid importing NumPy before the configuration
 cell applies those thread settings.
@@ -60,6 +64,12 @@ calibration, and Qiao controls. Default mechanism/calibration stress
 tests are simulation-only; their switches do not add arbitrary new missingness
 axes to every real dataset. The complete matrix and search budgets are documented
 in [PROTOCOL_0908.md](PROTOCOL_0908.md).
+
+Every code cell has a Markdown section heading visible in the notebook table of
+contents. The first configuration section exposes the paired-reference variables.
+By default simulation uses only the 20% paired size, including its detector
+misspecification controls. Change `CALIBRATION_FRACTIONS` to `(0.10, 0.20, 0.40)`
+to restore the size comparison, or change `PAIRED_FRACTION` for the primary budget.
 
 For simulation, `SHARING_STRENGTHS = (0.0, 0.5, 1.0)` remains the default.
 `SIMULATION_OPTIONS['truth_uses_location'] = USE_LOCATION` keeps generated truth
@@ -204,7 +214,9 @@ saved manifests and all CSVs, displays the existing plots plus new plots of all
 available benchmarks, adds the same-information-budget plot, and prints concise diagnostics. It skips raw-data loading,
 preflight and training. The loaded run's saved protocol remains authoritative.
 Every benchmark actually present is plotted; disabled or unexecuted methods are
-not invented. Endpoint-only baselines use disconnected markers. Additional
+not invented. Endpoint-only baselines use disconnected markers. Curve methods show their
+actual solid/dashed line and marker in the legend; endpoint-only methods retain
+marker-only legend entries. Missing intermediate fits are never interpolated. Additional
 PDFs are saved in `figures/0908/all_benchmarks/`; no PNGs are written.
 
 For training, use `RESULTS_ONLY = False`. New progress switches are:

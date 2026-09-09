@@ -140,6 +140,37 @@ def test_benchmark_figures_add_every_available_model_without_replacing_paper_plo
     assert np.isnan(forest.get_ydata()[1:-1]).all()
     assert curves["PU-Joint"].get_linestyle() == "-"
     assert len(curves["PU-Joint"].get_ydata()) == 5
+    legend = benchmark.legends[0]
+    legend_lines = dict(zip([text.get_text() for text in legend.get_texts()], legend.get_lines()))
+    assert legend_lines["PU-Joint"].get_linestyle() == "-"
+    assert legend_lines["Logistic"].get_linestyle() == "--"
+    assert legend_lines["RF (observed labels)"].get_linestyle() == "None"
+    assert legend_lines["Reference + PU logistic"].get_linestyle() == "None"
+    for label in ("PU-Joint", "Logistic", "RF (observed labels)"):
+        assert legend_lines[label].get_marker() == curves[label].get_marker()
+        assert legend_lines[label].get_color() == curves[label].get_color()
+        assert legend_lines[label].get_linewidth() == curves[label].get_linewidth()
+
+
+def test_benchmark_legend_uses_visible_segments_across_metrics_and_respects_gaps(tmp_path, monkeypatch):
+    from gene2wire.experiments.plotting import plot_benchmark_results
+    figures = _capture_show(monkeypatch)
+    artifacts = _artifacts()
+    frame = artifacts.tables["aggregate"].query("analysis == 'primary'").copy()
+    # AUPRC is absent, but the other panels still contain real PU curves.
+    frame.loc[frame["model"].eq("PU"), "macro_auprc"] = np.nan
+    # Three isolated measured points are not a connected curve.
+    isolated = frame.loc[frame["model"].eq("Joint") & frame["loss_rate"].isin([0., .4, .8])].assign(
+        model="Isolated baseline")
+    artifacts.tables["aggregate"] = pd.concat([frame, isolated], ignore_index=True)
+    plot_benchmark_results(artifacts, tmp_path)
+    legend = figures[0].legends[0]
+    lines = dict(zip([text.get_text() for text in legend.get_texts()], legend.get_lines()))
+    assert lines["PU logistic"].get_linestyle() == "-"
+    assert lines["Isolated baseline"].get_linestyle() == "None"
+    isolated_curve = next(line for line in figures[0].axes[0].lines
+                          if line.get_label() == "Isolated baseline")
+    np.testing.assert_array_equal(np.isfinite(isolated_curve.get_ydata()), [True, False, True, False, True])
 
 
 def test_benchmark_controls_are_separate_by_rho_mechanism_fraction_and_spec(tmp_path, monkeypatch):

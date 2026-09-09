@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import inspect
 from pathlib import Path
 import textwrap
 
@@ -17,7 +18,7 @@ NOTEBOOK_NAMES = ("simulation", "SPIDER", "MERGE_seq", "Projection_TAGs", "BARse
 
 def cell(kind, source, index):
     result = {"cell_type": kind, "id": f"g2w0908-{index:03d}", "metadata": {},
-              "source": textwrap.dedent(source).strip() + "\n"}
+              "source": (inspect.cleandoc(source) if kind == "markdown" else textwrap.dedent(source).strip()) + "\n"}
     if kind == "code":
         result.update(execution_count=None, outputs=[])
     return result
@@ -35,6 +36,10 @@ N_JOBS = 32
 N_REPETITIONS = 5
 STRATEGY = 'full_joint'
 SEED = 20260908
+
+# Primary paired-reference budget. The default simulation uses this size only.
+PAIRED_FRACTION = 0.20
+CALIBRATION_FRACTIONS = (PAIRED_FRACTION,)  # Simulation size controls; e.g. (0.10, 0.20, 0.40).
 
 RUN_INFORMATION_CONTROLS = True
 RUN_RANDOM_FOREST = True
@@ -189,6 +194,7 @@ settings = Settings(
     n_outer_folds=N_OUTER_FOLDS, use_location=USE_LOCATION,
     use_target_features=USE_TARGET_FEATURES, n_jobs=N_JOBS,
     n_repetitions=N_REPETITIONS, strategy=STRATEGY, seed=SEED,
+    paired_fraction=PAIRED_FRACTION, calibration_fractions=CALIBRATION_FRACTIONS,
     run_information_controls=RUN_INFORMATION_CONTROLS,
     run_random_forest=RUN_RANDOM_FOREST,
     run_mechanism_controls=RUN_MECHANISM_CONTROLS,
@@ -200,7 +206,8 @@ if SHOW_FULL_DIAGNOSTICS:
 else:
     print({'folds': N_OUTER_FOLDS, 'repetitions': N_REPETITIONS, 'n_jobs': N_JOBS,
            'use_location': USE_LOCATION, 'use_target_features': USE_TARGET_FEATURES,
-           'strategy': STRATEGY, 'run_qiao': RUN_QIAO})
+           'strategy': STRATEGY, 'run_qiao': RUN_QIAO,
+           'paired_fraction': PAIRED_FRACTION, 'calibration_fractions': CALIBRATION_FRACTIONS})
 if RESULTS_ONLY:
     all_artifacts = load_existing_exports(
         EXISTING_EXPORT_DIRS, expected_labels=EXPECTED_EXPORT_LABELS)
@@ -279,11 +286,17 @@ print('Resumable checkpoints:', CHECKPOINT_DIR)
 def dataset_cells(name):
     if name == "simulation":
         return [
-            ("markdown", """**Simulation configuration.** The three sharing strengths are run together.
+            ("markdown", """## Simulation configuration
+
+            The three sharing strengths are run together.
             `USE_LOCATION=False` excludes location from both the fitted predictor and the generated
             projection signal. Setting it to `True` includes the declared location basis in both.
             Generated raw arrays and truths are saved for reproducibility; truth remains outside fitting.
-            Each repetition generates an independent dataset; folds are aggregated within repetitions."""),
+            Each repetition generates an independent dataset; folds are aggregated within repetitions.
+            The run configuration defaults to `PAIRED_FRACTION=0.20` and
+            `CALIBRATION_FRACTIONS=(PAIRED_FRACTION,)`. All default scenarios therefore use
+            the same 20% paired budget. To restore the size comparison, change the latter
+            variable to `(0.10, 0.20, 0.40)`; existing mechanism/misspecification controls remain available."""),
             ("code", '''
             from gene2wire.experiments.datasets.simulation import generate_simulation
             SHARING_STRENGTHS = (0.0, 0.5, 1.0)
@@ -300,7 +313,9 @@ def dataset_cells(name):
                 **SIMULATION_OPTIONS)
             preflight_folds = preflight(representative)
             '''),
-            ("markdown", """**Run the frozen experiment matrix.** This cell is the expensive step.
+            ("markdown", """## Run the frozen experiment matrix
+
+            This cell is the expensive step.
             Existing compatible checkpoints resume automatically. Mechanism and calibration controls
             follow the shared protocol; they do not multiply every dataset/rate/model combination."""),
             ("code", '''
@@ -317,7 +332,9 @@ def dataset_cells(name):
         ]
     if name == "BARseq":
         return [
-            ("markdown", """**BARseq A1 and M1.** Both panels are fitted and reported separately.
+            ("markdown", """## BARseq A1 and M1
+
+            Both panels are fitted and reported separately.
             Location uses the native measured spatial covariates. Optional target features are
             anatomy descriptors derived from target names, not postsynaptic gene expression.
             With target features disabled, Qiao uses identity one-hot vectors and is explicitly
@@ -330,6 +347,7 @@ def dataset_cells(name):
             for panel in PANELS:
                 preflight(datasets[panel])
             '''),
+            ("markdown", "## Run A1 and M1 experiments"),
             ("code", '''
             all_artifacts = {}
             for panel in PANELS:
@@ -384,10 +402,13 @@ def dataset_cells(name):
         a coarse covariate; an external location CSV may be supplied instead.
         Target features require an aligned numeric CSV independent of the projection outcomes."""
     return [
-        ("markdown", f"**Dataset inputs.** {description}"),
+        ("markdown", f"## Dataset inputs\n\n{inspect.cleandoc(description)}"),
         ("code", textwrap.dedent(options).strip()),
+        ("markdown", "## Load data and inspect inputs"),
         ("code", textwrap.dedent(load).strip() + "\npreflight_folds = preflight(dataset)"),
-        ("markdown", """**Run all configured repetitions.** Validated raw files are reused
+        ("markdown", """## Run all configured repetitions
+
+        Validated raw files are reused
         without downloading again. The shared pipeline checkpoints completed work and exports
         full fold/target/repetition metrics, selected settings, calibration diagnostics, and predictions."""),
         ("code", '''
@@ -433,14 +454,19 @@ def notebook(name, commit, source_hash):
 
         Outputs are deliberately cleared. Earlier paper numbers remain provisional until
         the harmonized reruns and their diagnostics have been reviewed."""),
+        ("markdown", "## Run configuration"),
         ("code", CONFIG.replace("__CORE_COMMIT_0908__", commit).replace("__SOURCE_HASH_0908__", source_hash)
          .replace("__EXISTING_EXPORT_DIRS_0908__", repr(dict.fromkeys(expected_labels)))
          + f"\nREQUIRED_MODULES = {modules!r}\nEXPECTED_EXPORT_LABELS = {expected_labels!r}\n"),
-        ("markdown", """**Load the pinned code.** A verified local checkout works offline.
+        ("markdown", """## Load the pinned code
+
+        A verified local checkout works offline.
         A stale package already imported in this kernel requires a kernel restart;
         the notebook never reloads or rewrites installed model source."""),
         ("code", BOOTSTRAP),
-        ("markdown", """**Shared scientific settings.** `full_joint` evaluates simultaneous
+        ("markdown", """## Shared scientific settings
+
+        `full_joint` evaluates simultaneous
         rank/penalty candidates from a deterministic bounded Cartesian grid. Exact direct and
         residual-off endpoints are included in Joint's budget. Inner validation selects models;
         final preprocessing, calibration, and fitting use the designated development data.
@@ -451,6 +477,7 @@ def notebook(name, commit, source_hash):
         `USE_TARGET_FEATURES=True` uses the same declared target descriptors as the other models.
         No target outcomes are used to construct these descriptors."""),
         ("code", SETTINGS),
+        ("markdown", "## Define input and split checks"),
         ("code", PREFLIGHT),
     ]
     # Keep the results-only branch free of any raw loader, simulation generation,
@@ -460,7 +487,9 @@ def notebook(name, commit, source_hash):
             source = "if not RESULTS_ONLY:\n" + textwrap.indent(textwrap.dedent(source).strip(), "    ")
         parts.append((kind, source))
     parts.extend([
-        ("markdown", """**Loss-rate curves and PDF figures.** Curves retain the complete configured
+        ("markdown", """## Loss-rate curves and PDF figures
+
+        Curves retain the complete configured
         loss-rate grid. Simulation includes all three sharing strengths; BARseq includes both panels.
         The natural Projection-TAGs analysis uses paired-audit and model-comparison panels.
         No PNG files are written."""),
@@ -468,7 +497,9 @@ def notebook(name, commit, source_hash):
         for label, artifacts in all_artifacts.items():
             plot_results(artifacts, output_dir=FIGURE_DIR)
         '''),
-        ("markdown", """**PU-Joint and every recorded benchmark.** These additional figures
+        ("markdown", """## PU-Joint and every recorded benchmark
+
+        These additional figures
         retain every available benchmark at its actually evaluated loss rates. Endpoint-only
         controls are shown at those endpoints; missing intermediate experiments are not invented.
         Existing primary figures above are retained. Figures display here and save as PDF."""),
@@ -478,7 +509,9 @@ def notebook(name, commit, source_hash):
             benchmark_figure_paths[label] = plot_benchmark_results(artifacts, output_dir=FIGURE_DIR, show=True)
         display(benchmark_figure_paths)
         '''),
-        ("markdown", """**Same paired-reference budget.** Independent logistic models compare
+        ("markdown", """## Same paired-reference budget
+
+        Independent logistic models compare
         Reference-only, Calibrated PU (`PU` in saved tables), and Reference + PU. All use the same
         paired cells, cell features, splits and tuning rules. The mixed arm uses each paired
         reference outcome once; those entries do not also contribute detection loss.
@@ -490,7 +523,9 @@ def notebook(name, commit, source_hash):
                 artifacts, output_dir=FIGURE_DIR, show=True)
         display(information_budget_figure_paths)
         '''),
-        ("markdown", """**Useful diagnostics and reusable exports.** The default report shows
+        ("markdown", """## Useful diagnostics and reusable exports
+
+        The default report shows
         endpoint metrics for every recorded method, selected-configuration frequencies, convergence,
         candidate coverage and failures. Per-target metrics, every tuning trial, calibration tables,
         and the saved run manifest remain in the export directory.

@@ -55,10 +55,11 @@ def test_real_data_scenarios_do_not_expand_to_control_cartesian_product():
     assert scenarios(expanded_fractions, natural=False, simulation=False) == empirical
 
 
-@pytest.mark.parametrize("rho, expected_count", [(0., 11), (.5, 7), (1., 11)])
+@pytest.mark.parametrize("rho, expected_count", [(0., 9), (.5, 7), (1., 9)])
 def test_simulation_controls_have_predeclared_endpoint_scope(rho, expected_count):
     matrix = scenarios(Settings(), natural=False, simulation=True, sharing_strength=rho)
     assert len(matrix) == expected_count
+    assert {row["calibration_fraction"] for row in matrix} == {.2}
     assert len({fingerprint(row) for row in matrix}) == len(matrix)
     for row in matrix:
         if row["analysis"] != "primary":
@@ -80,7 +81,7 @@ def test_control_switches_remove_only_the_corresponding_axis():
     assert len(scenarios(settings, natural=False, simulation=True, sharing_strength=0.)) == 5
     with_calibration = replace(settings, run_calibration_controls=True)
     matrix = scenarios(with_calibration, natural=False, simulation=True, sharing_strength=0.)
-    assert len(matrix) == 9
+    assert len(matrix) == 7
     assert not any(row["analysis"] == "mechanism" for row in matrix)
 
 
@@ -134,3 +135,15 @@ def test_manifests_are_strict_json_and_atomic_arrays_reopen(tmp_path):
     with np.load(arrays, allow_pickle=False) as restored:
         np.testing.assert_array_equal(restored["prediction"], expected)
         np.testing.assert_array_equal(restored["measured"], expected > 3)
+
+
+def test_paired_budget_can_be_changed_and_size_sweep_restored():
+    for rho in (0., .5, 1.):
+        settings = Settings(paired_fraction=.3, calibration_fractions=(.3,))
+        matrix = scenarios(settings, natural=False, simulation=True, sharing_strength=rho)
+        assert {row["calibration_fraction"] for row in matrix} == {.3}
+    expanded = Settings(calibration_fractions=(.1, .2, .4))
+    matrix = scenarios(expanded, natural=False, simulation=True, sharing_strength=0.)
+    assert len(matrix) == 11
+    sizes = [row["calibration_fraction"] for row in matrix if row["analysis"] == "calibration_size"]
+    assert sizes == [.1, .4]
