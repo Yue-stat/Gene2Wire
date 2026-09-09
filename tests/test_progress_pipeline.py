@@ -103,19 +103,20 @@ def test_summary_final_and_disabled_output(tmp_path, capsys):
     assert relay.done_units == 1 and len(relay.rows) == 1
 
 
-def test_default_real_plan_runs_identical_twelve_models_at_every_primary_rate():
+def test_default_real_plan_runs_identical_fifteen_models_at_every_primary_rate():
     from types import SimpleNamespace
     from gene2wire.experiments.pipeline import _planned_models
     settings = Settings()
     planned = _planned_models(SimpleNamespace(metadata={}, natural_observed=None), settings)
-    assert len(planned) == 60
-    assert len(planned) * settings.n_outer_folds * settings.n_repetitions == 900
+    assert len(planned) == 75
+    assert len(planned) * settings.n_outer_folds * settings.n_repetitions == 1125
     models = {row['model'] for row in planned}
-    assert len(models) == 12
-    assert models >= {'Qiao-ID-squared', 'Qiao-ID-logit', 'Reference+PU',
+    assert len(models) == 15
+    assert models >= {'Qiao-ID-squared', 'Qiao-ID-logit', 'Reference-only', 'Reference+PU',
+                      'Reference+PU-MIRT', 'Reference+PU-Joint',
                       'RF-observed', 'RF-reference', 'RF-mixed'}
-    assert not models & {'Reference-only', 'Prevalence-observed', 'Prevalence-reference'}
+    assert not models & {'Prevalence-observed', 'Prevalence-reference'}
     for rate in settings.loss_rates:
         assert {row['model'] for row in planned if row['loss_rate'] == rate} == models
     natural = _planned_models(SimpleNamespace(metadata={}, natural_observed=True), settings)
-    assert len(natural) == 12 and {row['loss_rate'] for row in natural} == {None}
+    assert len(natural) == 15 and {row['loss_rate'] for row in natural} == {None}

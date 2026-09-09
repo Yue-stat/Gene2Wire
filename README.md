@@ -104,9 +104,18 @@ data or downloading a different file silently.
 
 Completed compatible work resumes after a kernel disconnect. Scientific
 settings, actual code contents, data, splits, and seeds participate in run/fit
-identity. Changing only `N_JOBS` changes concurrency, not the scientific setting.
-Worker count is capped at available fold/repetition units; numerical libraries
-and random forests use one inner thread to avoid nested parallelism.
+identity. Changing only `N_JOBS` or `PARALLEL_UNIT` changes scheduling, not the
+scientific setting. Default `PARALLEL_UNIT='scenario'` schedules folds ×
+repetitions × loss/calibration settings, so three folds × five repetitions ×
+five rates provide 75 tasks and can use 32 workers. Natural Projection-TAGs has
+one setting, so at most 15 tasks. `PARALLEL_UNIT='fold'` groups scenarios in a
+worker. Both modes share scenario checkpoints. Numerical libraries and random
+forests use one inner thread to avoid nested parallelism.
+
+RF fit caches use the actual data/configuration identity across scenarios. For
+example, identical paired-only RF candidate fits can be reused across loss
+rates; candidate scores are always recomputed using the current validation D/e.
+POSIX per-fit locks prevent simultaneous workers from computing the same RF fit.
 
 ## Feature switches and measurement scope
 
@@ -150,13 +159,19 @@ exported as an identified p or q. The default paired fraction is 20% and remains
 configurable. RF-observed, RF-reference and RF-mixed share the candidate grid,
 seed schedule and validation-label budget.
 
-All 12 retained methods run at every primary loss rate (0%, 20%, 40%, 60%, 80%);
+All 15 retained methods run at every primary loss rate (0%, 20%, 40%, 60%, 80%);
 Projection-TAGs retains its natural paired evaluation. Both Prevalence methods
-and reference-only logistic are removed from the active experiment matrix and
-benchmark figures. Solid lines indicate PU or paired-reference information;
+are removed. Reference-only logistic is restored. Reference + PU logistic,
+Reference + PU-MIRT and Reference + PU-Joint directly use the same clean C
+outcomes and PU supervision on the remaining O, enabling comparisons of model
+structure under matched supervision. The original six models remain unchanged.
+Solid lines indicate PU or paired-reference information;
 dashed lines indicate neither. Reference + PU logistic and both RF arms using
 paired references therefore have solid curves. Historical unrun rates remain
 gaps when loading old exports; new intermediate fits require a training run.
+Horizontal model dot panels are omitted by default; Projection-TAGs retains
+its paired-label audit, with model metrics in tables. Information-budget plots
+use within-structure loss-rate curves and skip unrun/single-condition comparisons.
 
 Qiao bilinear comparisons are enabled by default on every dataset's primary
 conditions. With target features disabled, `Qiao-ID-squared` and `Qiao-ID-logit`

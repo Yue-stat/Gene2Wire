@@ -43,6 +43,7 @@ N_OUTER_FOLDS = 3
 USE_LOCATION = False
 USE_TARGET_FEATURES = False
 N_JOBS = 32
+PARALLEL_UNIT = 'scenario'
 N_REPETITIONS = 5
 STRATEGY = 'full_joint'
 PAIRED_FRACTION = 0.20
@@ -50,12 +51,16 @@ CALIBRATION_FRACTIONS = (PAIRED_FRACTION,)
 ```
 
 Choose a compute allocation that supports the requested worker count and memory.
-`N_JOBS=32` is a maximum: for a real dataset, three folds times five repetitions
-provide at most 15 concurrent fold/repetition units. BARseq processes A1 and M1
-separately. Simulation has 3 sharing strengths × 5 generated datasets × 3 folds
-= 45 tasks, so it can use all 32 workers. Loss rates and models run sequentially
-inside each worker; increasing `N_JOBS` alone cannot exceed the available tasks. Reducing `N_JOBS`
-does not redraw masks or invalidate compatible fitted checkpoints. Threads inside
+`N_JOBS=32` is a maximum. Default `PARALLEL_UNIT='scenario'` schedules three folds
+× five repetitions × five rates = 75 tasks for each thinning benchmark, allowing
+all 32 workers. BARseq processes A1 and M1 separately. Simulation additionally
+spans sharing strengths and its declared calibration/mechanism settings. Models
+and candidates remain sequential within each scenario to share fitting caches.
+Natural Projection-TAGs has only one setting, so five repetitions provide 15
+tasks (one repetition provides three). `PARALLEL_UNIT='fold'` groups a fold's
+scenarios into one task. Neither scheduling switch redraws masks nor invalidates
+compatible fitted checkpoints. The manifest records actual workers and pending
+tasks; requested workers still need matching allocated CPU/memory. Threads inside
 each worker are limited to one; avoid importing NumPy before the configuration
 cell applies those thread settings.
 
@@ -180,7 +185,7 @@ strengths remain represented. No PNG export is requested by these notebooks.
 | Raw or processed cache checksum mismatch | Preserve the changed file for diagnosis; rebuild the identified cache from its verified source |
 | No native location/target descriptors | Supply the aligned CSV or leave that feature switch off |
 | No paired reference positives | Inspect the recorded calibration failure; do not borrow validation/test references or silently resample |
-| Fewer workers than `N_JOBS` | Expected when fewer fold/repetition units are available |
+| Fewer workers than `N_JOBS` | Expected when fewer pending scenario tasks are available; natural data have one scenario |
 
 ## 7. Distinguish verification from formal results
 
@@ -213,14 +218,19 @@ The explicit run directories must exist on that machine. This mode reads their
 saved manifests and all CSVs, displays the existing plots plus new plots of all
 available benchmarks, adds the same-information-budget plot, and prints concise diagnostics. It skips raw-data loading,
 preflight and training. The loaded run's saved protocol remains authoritative.
-Every retained benchmark actually present is plotted; both Prevalence methods
-and reference-only logistic are omitted. Unexecuted methods are not invented.
+Every retained benchmark actually present in a curve setting is plotted; both
+Prevalence methods are omitted and reference-only logistic is restored.
+Default plotting skips horizontal model dots for natural or single-rate scopes.
+Projection-TAGs retains its paired audit; its model results remain in tables.
+Information-budget plots show independent, MIRT and Joint comparisons as separate
+curve rows, only when at least two compared arms were actually run.
+Unexecuted methods are not invented.
 Historical endpoint-only baselines use disconnected markers. Curve methods show their
 actual solid/dashed line and marker in the legend; endpoint-only methods retain
 marker-only legend entries. Missing intermediate fits are never interpolated. Additional
 PDFs are saved in `figures/0908/all_benchmarks/`; no PNGs are written.
 
-New primary runs evaluate all 12 retained methods at every configured loss rate
+New primary runs evaluate all 15 retained methods at every configured loss rate
 (default 0%, 20%, 40%, 60%, 80%). `RF-mixed` uses reference labels on the same
 20% paired subset and observed labels on the other cells, with each entry used
 once. It performs ordinary RF fitting, not PU correction. Three RF arms share
@@ -229,6 +239,16 @@ use neither PU nor paired references; solid curves use at least one. This
 includes solid `Reference+PU`, `RF-reference` and `RF-mixed` curves. Qiao uses
 observed labels and remains dashed, with target ID one-hot inputs by default.
 Set `USE_TARGET_FEATURES=True` to supply the declared target descriptors.
+
+Reference-only logistic and `Reference+PU-MIRT` / `Reference+PU-Joint` now join
+every primary rate. All reference arms use the same paired IDs; the three mixed
+models use reference loss on C and PU loss on O without duplicating C. These
+new controls require fitting; their outcomes cannot be inferred from old plots.
+
+RF fit predictions are cached by actual training/prediction arrays, seed,
+configuration and source, across loss rates. Identical paired-only fits are
+computed once on POSIX systems using advisory locks; each scenario still scores
+candidates on its own observed validation labels and estimated sensitivities.
 
 For training, use `RESULTS_ONLY = False`. New progress switches are:
 
@@ -243,7 +263,7 @@ Default progress prints one initial cache summary, one compact line per minute,
 and one completion summary. For example:
 
 ```text
-[running 1min] finished units 82/900, current time 2026-09-09 10:42:00 PDT
+[running 1min] finished units 82/1125, current time 2026-09-09 10:42:00 PDT
 ```
 
 One unit is one model evaluation at a specified repetition, fold and scenario:
@@ -256,9 +276,10 @@ and never counted as a completed model evaluation. Los Angeles local time uses
 `America/Los_Angeles`, including daylight-saving transitions.
 
 The initial inventory counts model evaluations contained in fully verified
-fold/repetition result checkpoints. Incomplete folds can still reuse candidate
+scenario result checkpoints. Unprocessed scenarios can still reuse candidate
 and model checkpoints; their precise hits are recorded as each identity becomes
-available, without printing a line for every hit. Completed unit summaries are
+available, without printing a line for every hit. The startup pending count means
+work still to process, not necessarily unfitted models. Completed unit summaries are
 accepted only when their exported predictions and audits pass content checks.
 Worker events remain under `progress/` and in `progress_events.csv`;
 `checkpoint_inventory.csv` retains the initial counts.

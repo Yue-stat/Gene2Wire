@@ -33,6 +33,7 @@ N_OUTER_FOLDS = 3
 USE_LOCATION = False
 USE_TARGET_FEATURES = False
 N_JOBS = 32
+PARALLEL_UNIT = 'scenario'  # Parallelize folds × repetitions × loss/calibration settings; 'fold' also supported.
 N_REPETITIONS = 5
 STRATEGY = 'full_joint'
 SEED = 20260908
@@ -69,7 +70,7 @@ CORE_COMMIT = '__CORE_COMMIT_0908__'
 EXPECTED_SOURCE_HASH = '__SOURCE_HASH_0908__'
 REPO_URL = 'https://github.com/Yue-stat/Gene2Wire.git'
 
-# Set before importing NumPy/SciPy. Parallelism is at fold/repetition level.
+# Set before importing NumPy/SciPy. Only the outer fold/repetition/scenario pool is parallel.
 for variable in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
                  'VECLIB_MAXIMUM_THREADS', 'NUMEXPR_NUM_THREADS'):
     os.environ[variable] = '1'
@@ -192,7 +193,7 @@ else:
     configure_compact_display()
 settings = Settings(
     n_outer_folds=N_OUTER_FOLDS, use_location=USE_LOCATION,
-    use_target_features=USE_TARGET_FEATURES, n_jobs=N_JOBS,
+    use_target_features=USE_TARGET_FEATURES, n_jobs=N_JOBS, parallel_unit=PARALLEL_UNIT,
     n_repetitions=N_REPETITIONS, strategy=STRATEGY, seed=SEED,
     paired_fraction=PAIRED_FRACTION, calibration_fractions=CALIBRATION_FRACTIONS,
     run_information_controls=RUN_INFORMATION_CONTROLS,
@@ -205,6 +206,7 @@ if SHOW_FULL_DIAGNOSTICS:
     display(pd.DataFrame([asdict(settings)]).T.rename(columns={0: 'setting'}))
 else:
     print({'folds': N_OUTER_FOLDS, 'repetitions': N_REPETITIONS, 'n_jobs': N_JOBS,
+           'parallel_unit': PARALLEL_UNIT,
            'use_location': USE_LOCATION, 'use_target_features': USE_TARGET_FEATURES,
            'strategy': STRATEGY, 'run_qiao': RUN_QIAO,
            'paired_fraction': PAIRED_FRACTION, 'calibration_fractions': CALIBRATION_FRACTIONS})
@@ -425,7 +427,7 @@ def dataset_cells(name):
 def notebook(name, commit, source_hash):
     expected_labels = {"BARseq": ("A1", "M1"), "Projection_TAGs": ("Projection-TAGs",),
                        "MERGE_seq": ("MERGE-seq",)}.get(name, (name,))
-    modules = ["numpy", "scipy", "pandas", "sklearn", "joblib", "matplotlib", "yaml", "IPython"]
+    modules = ["numpy", "scipy", "pandas", "sklearn", "joblib", "threadpoolctl", "matplotlib", "yaml", "IPython"]
     if name in {"SPIDER", "Projection_TAGs"}:
         modules.append("rdata")
     if name == "Projection_TAGs":
@@ -501,8 +503,10 @@ def notebook(name, commit, source_hash):
 
         New primary runs evaluate every retained method at 0%, 20%, 40%, 60%, and 80% loss.
         Dashed lines use neither PU nor paired references; solid lines use either kind of information.
-        Both Prevalence methods and reference-only logistic are excluded. Older exports retain
-        gaps where fits were not run. Projection-TAGs uses its natural paired evaluation.
+        Both Prevalence methods are excluded; reference-only logistic is included.
+        Reference + PU logistic/MIRT/Joint use the same direct paired-reference supervision.
+        Older exports retain gaps where fits were not run. Single-condition model dot plots are
+        omitted, including natural Projection-TAGs model comparisons; its paired audit remains.
         Existing primary figures above are retained. Figures display here and save as PDF."""),
         ("code", '''
         benchmark_figure_paths = {}
@@ -512,13 +516,13 @@ def notebook(name, commit, source_hash):
         '''),
         ("markdown", """## Same paired-reference budget
 
-        Compare Calibrated PU (`PU`), Reference + PU logistic, and three random forests:
-        observed labels, paired references only, and observed + paired references (`RF-mixed`).
-        Paired methods share the same authorized subset, features and splits. RF-mixed uses
-        reference labels on paired cells and observed labels elsewhere, once per entry, without
-        PU correction. Its raw mixed-label scores are evaluated directly, without p/h reinterpretation.
-        All three RF arms share the same candidate grid, seed schedule and validation-label budget.
-        Only actually recorded, matched conditions are plotted."""),
+        Curves compare Reference-only / Calibrated PU / Reference + PU logistic, and the
+        matched PU-versus-Reference + PU variants for MIRT and Joint. The original pure-PU
+        predictors use all measured entries with observed D; paired references calibrate e.
+        Mixed predictors instead use reference loss on paired C and PU loss on the remaining O,
+        with each projection outcome used once. All share the same authorized C, features and splits.
+        Three RF controls remain in the all-benchmark curves. Only actually recorded comparisons
+        are plotted; natural and single-rate settings remain in the exported metric tables."""),
         ("code", '''
         information_budget_figure_paths = {}
         for label, artifacts in all_artifacts.items():

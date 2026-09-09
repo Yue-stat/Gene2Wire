@@ -112,7 +112,7 @@ def test_pipeline_compiles_disjoint_information_views_and_reuses_fold_local_mask
     np.testing.assert_array_equal(tuning["paired"], np.intersect1d(final["paired"], fold.train_rows))
     assert not np.intersect1d(final["paired"], fold.test_rows).size
     assert set(call["unit_context"]["supervision"] for call in calls["core"]) == {
-        "calibrated_pu", "reference_plus_pu",
+        "calibrated_pu", "reference_only", "reference_plus_pu",
     }
     observed = calls["thinning"][0]["result"].observed
     for call in calls["core"]:
@@ -133,10 +133,31 @@ def test_pipeline_compiles_disjoint_information_views_and_reuses_fold_local_mask
                 expected_labels[np.isin(rows, paired)] = data.reference[paired]
             expected_labels &= bundle.W_measured
             np.testing.assert_array_equal(bundle.S_observed, expected_labels)
+            exposure = call["train_exposure" if key == "train" else "refit_exposure"]
+            detector_value = tuning["value"] if key == "train" else final["value"]
+            if role == "reference_only":
+                np.testing.assert_array_equal(exposure, 1.)
+            else:
+                expected_exposure = np.ones_like(exposure)
+                pu_entries = bundle.W_measured.copy()
+                if role == "reference_plus_pu":
+                    pu_entries &= ~paired_local
+                expected_exposure[pu_entries] = detector_value
+                np.testing.assert_array_equal(exposure, expected_exposure)
+            # Compiled views preserve one row per authorized cell, even when
+            # both reference and detection measurements are available on C.
+            assert bundle.n_cells == len(rows)
+            assert len(set(bundle.cell_ids)) == len(rows)
+            assert not set(bundle.cell_ids).intersection(np.asarray(data.cell_ids)[fold.test_rows])
+    mixed_call = next(call for call in calls["core"]
+                      if call["unit_context"]["supervision"] == "reference_plus_pu")
+    assert [(model.name, model.kind) for model in mixed_call["models"]] == [
+        ("Reference+PU", "direct"), ("Reference+PU-MIRT", "lowrank"),
+        ("Reference+PU-Joint", "joint")]
     assert not calls["baselines"]  # No automatic prevalence models when RF is disabled.
 
 
-def test_all_primary_rates_share_three_rf_views_and_reference_pu_control(tmp_path, monkeypatch):
+def test_all_primary_rates_share_three_rf_views_and_all_reference_controls(tmp_path, monkeypatch):
     data, fold, _ = _dataset()
     settings = replace(_settings(), loss_rates=(0., .2, .4, .6, .8), run_random_forest=True)
     prepared = pipeline._prepare(data, fold, settings)
@@ -144,18 +165,52 @@ def test_all_primary_rates_share_three_rf_views_and_reference_pu_control(tmp_pat
     tables = pipeline._run_fold(prepared, 0, settings, tmp_path / "checkpoints",
                                 tmp_path / "exports", "test-source")
     assert len(calls["baselines"]) == 15
-    assert len(calls["core"]) == 10  # Six-model grid and Reference+PU at each rate.
+    assert len(calls["core"]) == 15  # Main, reference-only, and mixed grid per rate.
     frame = pd.DataFrame(tables["metrics"])
     for name, rows in frame.groupby("model"):
         assert set(rows["loss_rate"]) == set(settings.loss_rates), name
     assert set(frame["model"]) == {m.name for m in settings.models()} | {
-        "Reference+PU", "RF-observed", "RF-reference", "RF-mixed"}
+        "Reference-only", "Reference+PU", "Reference+PU-MIRT", "Reference+PU-Joint",
+        "RF-observed", "RF-reference", "RF-mixed"}
     for index, rate in enumerate(settings.loss_rates):
         observed = calls["thinning"][index]["result"].observed
         # Zero loss has known e=1 and skips detector fitting; paired IDs are
         # identical across loss rates and are recorded by the next scenario.
         detector_index = 2 * max(index - 1, 0)
         tuning, final = calls["detectors"][detector_index:detector_index + 2]
+        controls = calls["core"][3 * index:3 * index + 3]
+        assert [call["unit_context"]["supervision"] for call in controls] == [
+            "calibrated_pu", "reference_only", "reference_plus_pu"]
+        assert [model.name for model in controls[1]["models"]] == ["Reference-only"]
+        assert {model.name for model in controls[2]["models"]} == {
+            "Reference+PU", "Reference+PU-MIRT", "Reference+PU-Joint"}
+        for call in controls:
+            role = call["unit_context"]["supervision"]
+            np.testing.assert_array_equal(call["validation"].S_observed, observed[fold.validation_rows])
+            for key, rows, paired, value in (
+                ("train", fold.train_rows, tuning["paired"], 1. if rate == 0 else tuning["value"]),
+                ("refit", np.arange(45), final["paired"], 1. if rate == 0 else final["value"]),
+            ):
+                bundle = call[key]
+                paired_local = np.isin(rows, paired)
+                expected_mask = data.measured[rows].copy()
+                expected_labels = observed[rows].copy()
+                if role != "calibrated_pu":
+                    expected_labels[paired_local] = data.reference[paired]
+                if role == "reference_only":
+                    expected_mask &= paired_local[:, None]
+                np.testing.assert_array_equal(bundle.W_measured, expected_mask)
+                np.testing.assert_array_equal(bundle.S_observed, expected_labels & expected_mask)
+                expected_exposure = np.ones_like(expected_labels, dtype=float)
+                pu_entries = expected_mask.copy()
+                if role == "reference_only":
+                    pu_entries[:] = False
+                elif role == "reference_plus_pu":
+                    pu_entries &= ~paired_local[:, None]
+                expected_exposure[pu_entries] = value
+                np.testing.assert_array_equal(
+                    call["train_exposure" if key == "train" else "refit_exposure"], expected_exposure)
+                assert bundle.n_cells == len(rows)
         forests = calls["baselines"][3 * index:3 * index + 3]
         assert {kw["probability_semantics"] for _, kw in forests} == {"observed", "reference", "mixed"}
         assert len({kw["seed"] for _, kw in forests}) == 1
@@ -185,19 +240,24 @@ def test_natural_validation_references_affect_refit_but_not_tuning_views(tmp_pat
     first = pipeline._prepare(data, fold, settings)
     calls = _instrument(monkeypatch)
     pipeline._run_fold(first, 0, settings, tmp_path / "checkpoints", tmp_path / "first", "test-source")
-    old = calls["core"][0]
+    old_calls = calls["core"]
     old_final_value = calls["detectors"][1]["value"]
     data.reference[fold.validation_rows] = 0  # D is fixed and remains PU-consistent.
     second = pipeline._prepare(data, fold, settings)
     calls = _instrument(monkeypatch)
     pipeline._run_fold(second, 0, settings, tmp_path / "checkpoints", tmp_path / "second", "test-source")
-    new = calls["core"][0]
+    new_calls = calls["core"]
     assert calls["detectors"][1]["value"] < old_final_value
-    np.testing.assert_array_equal(old["train"].S_observed, new["train"].S_observed)
-    np.testing.assert_array_equal(old["train_exposure"], new["train_exposure"])
-    np.testing.assert_array_equal(old["validation"].S_observed, new["validation"].S_observed)
-    np.testing.assert_array_equal(old["validation_exposure"], new["validation_exposure"])
-    assert not np.array_equal(old["refit_exposure"], new["refit_exposure"])
+    assert len(old_calls) == len(new_calls) == 3
+    for old, new in zip(old_calls, new_calls):
+        np.testing.assert_array_equal(old["train"].S_observed, new["train"].S_observed)
+        np.testing.assert_array_equal(old["train_exposure"], new["train_exposure"])
+        np.testing.assert_array_equal(old["validation"].S_observed, new["validation"].S_observed)
+        np.testing.assert_array_equal(old["validation_exposure"], new["validation_exposure"])
+        if old["unit_context"]["supervision"] == "reference_only":
+            assert not np.array_equal(old["refit"].S_observed, new["refit"].S_observed)
+        else:
+            assert not np.array_equal(old["refit_exposure"], new["refit_exposure"])
 
 
 def test_summary_simulation_ci_counts_generated_datasets_not_folds():

@@ -313,12 +313,15 @@ def _probability_dashboard(frame, destination, *, show, simulation=False, natura
 
 
 def plot_results(artifacts: Any, output_dir: str | Path, *, show: bool = True,
-                 include_all_models: bool = False) -> dict[str, Path]:
+                 include_all_models: bool = False,
+                 show_single_condition_dots: bool = False) -> dict[str, Path]:
     """Display notebook figures and export PDF files, returning their paths.
 
     ``artifacts`` provides ``tables`` and ``manifest`` attributes, as returned
     by the shared pipeline. Empty result tables produce an empty mapping. No
     artificial loss-rate axis is fabricated for naturally paired datasets.
+    Their paired-label audit is retained, but horizontal model-comparison dots
+    are omitted unless ``show_single_condition_dots=True`` is requested.
     """
     frame = _aggregate(artifacts.tables)
     if frame.empty:
@@ -353,6 +356,15 @@ def plot_results(artifacts: Any, output_dir: str | Path, *, show: bool = True,
                 main = directory / f"{stem}_results_0908.pdf"
                 if natural:
                     dataset_audit = audit.loc[audit["dataset"].eq(dataset)] if not audit.empty and "dataset" in audit else audit
+                    if not show_single_condition_dots:
+                        if dataset_audit is not None and not dataset_audit.empty:
+                            figure, axis = plt.subplots(figsize=(6.5, max(3.4, .38 * len(dataset_audit) + 1.)))
+                            _paired_audit(axis, dataset_audit)
+                            axis.set_title("Paired-label audit", loc="left", pad=9)
+                            figure.tight_layout()
+                            _save_display(figure, main, show)
+                            paths[f"{stem}_primary"] = main
+                        continue
                     _natural_main(selected, dataset_audit, main, show=show)
                 else:
                     _real_curves(selected, main, show=show)
@@ -370,13 +382,17 @@ def plot_results(artifacts: Any, output_dir: str | Path, *, show: bool = True,
 # Diagnostic figures deliberately discover models from the exported results.
 # Keep MODEL_ORDER above fixed: changing it would alter the existing paper plots.
 _BENCHMARK_ORDER = MODEL_ORDER + (
-    "Reference+PU", "Logistic-rescaled",
+    "Reference-only",
+    "Reference+PU", "Reference+PU-MIRT", "Reference+PU-Joint", "Logistic-rescaled",
     "RF-observed", "RF-reference", "RF-mixed",
     "Qiao-squared", "Qiao-logit",
 )
-_RETIRED_BENCHMARKS = {"Reference-only", "Prevalence-observed", "Prevalence-reference"}
+_RETIRED_BENCHMARKS = {"Prevalence-observed", "Prevalence-reference"}
 _BENCHMARK_LABELS = {**MODEL_LABELS,
+    "Reference-only": "Reference-only logistic",
     "Reference+PU": "Reference + PU logistic",
+    "Reference+PU-MIRT": "Reference + PU-MIRT",
+    "Reference+PU-Joint": "Reference + PU-Joint",
     "Logistic-rescaled": "Logistic + sensitivity rescaling",
     "RF-observed": "RF (observed labels)",
     "RF-reference": "RF (paired references)",
@@ -385,13 +401,16 @@ _BENCHMARK_LABELS = {**MODEL_LABELS,
     "Qiao-logit": "Qiao bilinear (logistic)",
 }
 _BENCHMARK_COLORS = {**COLORS,
-    "Reference+PU": "#332288",
+    "Reference-only": "#AA77BB", "Reference+PU": "#332288",
+    "Reference+PU-MIRT": "#00664A", "Reference+PU-Joint": "#882D00",
     "Logistic-rescaled": "#CC79A7", "RF-observed": "#AA4499",
     "RF-reference": "#882255", "RF-mixed": "#9467BD", "Qiao-squared": "#44AA99",
     "Qiao-logit": "#117733",
 }
 _BENCHMARK_MARKERS = {**MARKERS,
-    "Reference+PU": "P", "Logistic-rescaled": "*",
+    "Reference-only": "D",
+    "Reference+PU": "P", "Reference+PU-MIRT": "s", "Reference+PU-Joint": "^",
+    "Logistic-rescaled": "*",
     "RF-observed": "v", "RF-reference": "D", "RF-mixed": "h",
     "Qiao-squared": "<", "Qiao-logit": ">",
 }
@@ -428,8 +447,8 @@ def _benchmark_models(frame: pd.DataFrame) -> tuple[str, ...]:
 
 def _benchmark_linestyle(model: str) -> str:
     """Encode use of PU or paired-reference information, including direct RF labels."""
-    uses_reference = model.startswith("PU") or model in {
-        "Reference+PU", "Logistic-rescaled", "RF-reference", "RF-mixed"}
+    uses_reference = model.startswith(("PU", "Reference-only", "Reference+PU")) or model in {
+        "Logistic-rescaled", "RF-reference", "RF-mixed"}
     return "-" if uses_reference else "--"
 
 
@@ -531,7 +550,8 @@ def _benchmark_legend_handles(axes, models):
 
 def plot_benchmark_results(artifacts: Any, output_dir: str | Path, *,
                            show: bool = True,
-                           metrics: tuple[str, ...] = PRIMARY_METRICS) -> dict[str, Path]:
+                           metrics: tuple[str, ...] = PRIMARY_METRICS,
+                           show_single_condition_dots: bool = False) -> dict[str, Path]:
     """Add diagnostic PDFs comparing PU-Joint with every available model.
 
     Call this *after* :func:`plot_results` to retain existing paper figures.
@@ -540,8 +560,9 @@ def plot_benchmark_results(artifacts: Any, output_dir: str | Path, *,
     fraction and calibration specification: no controls are averaged into
     primary estimates. Three or more measured loss rates produce curves;
     endpoint-only models have disconnected markers. Natural and single-rate
-    comparisons use categorical dot panels. Exported model names are discovered
-    dynamically, excluding retired Prevalence and reference-only logistic arms.
+    comparisons are omitted by default; ``show_single_condition_dots=True``
+    enables the legacy horizontal model-comparison panels. Exported model names
+    are discovered dynamically, excluding the retired Prevalence arms.
     Solid lines use PU or paired references; other methods use dashed lines.
 
     Diagnostic means follow the same fold-then-repetition aggregation as the
@@ -579,6 +600,8 @@ def plot_benchmark_results(artifacts: Any, output_dir: str | Path, *,
                             if "loss_rate" in selected else np.array([]))
             natural = scope.get("mechanism") == "natural" or len(finite_rates) == 0
             curves = not natural and len(finite_rates) > 1
+            if not curves and not show_single_condition_dots:
+                continue
             simulation = pd.notna(scope.get("sharing_strength", np.nan))
             title_parts = []
             for label, value in scope.items():
@@ -633,35 +656,31 @@ def plot_benchmark_results(artifacts: Any, output_dir: str | Path, *,
     return paths
 
 
-_INFORMATION_ARMS = ("PU", "Reference+PU", "RF-observed", "RF-reference", "RF-mixed")
-_INFORMATION_LABELS = {"PU": "Calibrated PU logistic",
-                       "Reference+PU": "Reference + PU logistic",
-                       "RF-observed": "RF: observed labels",
-                       "RF-reference": "RF: paired references",
-                       "RF-mixed": "RF: observed + paired references"}
+_INFORMATION_GROUPS = (
+    ("Independent logistic", ("Reference-only", "PU", "Reference+PU")),
+    ("Strict low rank", ("PU-MIRT", "Reference+PU-MIRT")),
+    ("Shared + specific", ("PU-Joint", "Reference+PU-Joint")),
+)
+_INFORMATION_ARMS = tuple(model for _, models in _INFORMATION_GROUPS for model in models)
 
 
 def plot_information_budget_results(artifacts: Any, output_dir: str | Path, *,
                                     show: bool = True) -> dict[str, Path]:
-    """Compare retained logistic/RF controls using the same authorized paired C.
+    """Plot primary loss-rate curves comparing the use of the same paired C.
 
-    Additional 1-by-3 PDF figures show the primary natural evaluation or the
-    80%-loss endpoint. Each scientific setting gets its own figure, including
-    each simulation sharing strength. ``PU`` is the calibrated independent
-    predictor, not PU-MIRT or PU-Joint. Missing arms/undefined metrics are
-    explicitly annotated; they are never replaced by another model or rate.
-    Means follow the same fold-then-repetition aggregation as the main plots.
-    This function does not overwrite or replace any existing figure.
+    Rows hold predictor structure fixed: independent logistic compares
+    Reference-only, calibrated PU and Reference + PU; strict low rank and
+    shared + specific compare calibrated PU with Reference + PU. A row is
+    included only when at least two of its arms exist in the supplied results.
+    Missing model/rate combinations are never interpolated. Natural paired
+    evaluations and single-rate settings remain in the exported tables and do
+    not create horizontal model-comparison dot panels. RF controls remain in
+    :func:`plot_benchmark_results` to keep these comparisons legible.
     """
     frame = _primary(_benchmark_aggregate(artifacts.tables))
     if frame.empty:
         return {}
     frame = frame.loc[frame["model"].isin(_INFORMATION_ARMS)].copy()
-    natural = (frame["mechanism"].eq("natural") if "mechanism" in frame
-               else pd.Series(False, index=frame.index))
-    endpoint = (np.isclose(pd.to_numeric(frame["loss_rate"], errors="coerce"), .8)
-                if "loss_rate" in frame else np.zeros(len(frame), dtype=bool))
-    frame = frame.loc[natural | endpoint]
     if frame.empty:
         return {}
     scope_columns = [key for key in _BENCHMARK_SCOPES if key in frame]
@@ -672,9 +691,20 @@ def plot_information_budget_results(artifacts: Any, output_dir: str | Path, *,
         for scope_key, selected in grouping:
             key = scope_key if isinstance(scope_key, tuple) else (scope_key,)
             scope = dict(zip(scope_columns, key))
-            if selected.duplicated("model").any():
-                raise ValueError("Duplicate model estimates within an information-budget setting; "
+            identifiers = ["model"] + (["loss_rate"] if "loss_rate" in selected else [])
+            if selected.duplicated(identifiers).any():
+                raise ValueError("Duplicate model/loss estimates within an information-budget setting; "
                                  "keep distinct scientific configurations in separate artifacts")
+            rates = (pd.to_numeric(selected["loss_rate"], errors="coerce").dropna().unique()
+                     if "loss_rate" in selected else np.array([]))
+            if scope.get("mechanism") == "natural" or len(rates) < 2:
+                continue
+            available = set(selected["model"].dropna())
+            groups = [(label, tuple(model for model in models if model in available))
+                      for label, models in _INFORMATION_GROUPS]
+            groups = [(label, models) for label, models in groups if len(models) >= 2]
+            if not groups:
+                continue
             simulation = pd.notna(scope.get("sharing_strength", np.nan))
             title_parts = [str(scope.get("dataset", "Results")).replace("_", " ")]
             if simulation:
@@ -682,38 +712,32 @@ def plot_information_budget_results(artifacts: Any, output_dir: str | Path, *,
             fraction = scope.get("calibration_fraction", np.nan)
             if pd.notna(fraction):
                 title_parts.append(f"paired = {float(fraction):.0%}")
-            title_parts.append("natural paired evaluation" if scope.get("mechanism") == "natural"
-                               else "positive-label loss = 80%")
-            figure, axes = plt.subplots(1, len(PRIMARY_METRICS), figsize=(12.4, 3.7))
-            for column, (axis, metric) in enumerate(zip(axes, PRIMARY_METRICS)):
-                for position, model in enumerate(_INFORMATION_ARMS):
-                    estimates = selected.loc[selected["model"].eq(model)]
-                    value = (pd.to_numeric(estimates[metric], errors="coerce").iloc[0]
-                             if not estimates.empty and metric in estimates else np.nan)
-                    if np.isfinite(value):
-                        style = _benchmark_style(model, _INFORMATION_ARMS)
-                        style["label"] = _INFORMATION_LABELS[model]
-                        style["markersize"] = 7
-                        axis.plot(float(value), position, **style, linestyle="None",
-                                  markeredgewidth=.7)
+            title_parts.append("same paired subset, different uses of reference labels")
+            figure, axes = plt.subplots(len(groups), len(PRIMARY_METRICS), squeeze=False,
+                                        figsize=(12.4, 3.2 * len(groups) + .6))
+            for row, (structure, models) in enumerate(groups):
+                for column, metric in enumerate(PRIMARY_METRICS):
+                    axis = axes[row, column]
+                    if metric in selected:
+                        _benchmark_curve(axis, selected, metric, models)
                     else:
-                        message = "Not run" if estimates.empty else "Undefined / unavailable"
-                        axis.text(.5, position, message, transform=axis.get_yaxis_transform(),
-                                  ha="center", va="center", fontsize=8, color="#888888")
-                _style_axis(axis, loss_axis=False)
-                axis.set_yticks(np.arange(len(_INFORMATION_ARMS)),
-                    [_INFORMATION_LABELS[model] for model in _INFORMATION_ARMS]
-                    if column == 0 else [""] * len(_INFORMATION_ARMS))
-                axis.set_ylim(len(_INFORMATION_ARMS) - .5, -.5)
-                axis.grid(False, axis="y")
-                axis.grid(axis="x", color="#E6E6E6", linewidth=.6)
-                axis.xaxis.set_major_locator(MaxNLocator(nbins=4))
-                axis.set_xlabel(_metric_title(metric, simulation=simulation))
-            figure.suptitle(" · ".join(title_parts), fontsize=10, y=.98)
-            figure.text(.5, .015, "Paired methods share the same reference subset; RF observed uses detections only. "
-                        "Means over folds and repetitions.",
+                        _style_axis(axis)
+                        axis.text(.5, .5, "No defined estimates", transform=axis.transAxes,
+                                  ha="center", va="center", fontsize=9, color="#777777")
+                    axis.set_title(_metric_title(metric, simulation=simulation), loc="left", pad=9)
+                    if column == 0:
+                        axis.set_ylabel(structure)
+                    if row != len(groups) - 1:
+                        axis.set_xlabel("")
+                handles = _benchmark_legend_handles(axes[row], models)
+                axes[row, 1].legend(handles, [_BENCHMARK_LABELS[model] for model in models],
+                                    loc="lower center", bbox_to_anchor=(.5, 1.20), frameon=False,
+                                    ncol=len(models), handlelength=2.5, columnspacing=1.6, fontsize=9)
+            figure.suptitle(" · ".join(title_parts), fontsize=10, y=.995)
+            figure.text(.5, .012, "Structure is fixed within each row. Means over folds and repetitions; "
+                        "missing fits are not interpolated.",
                         ha="center", va="bottom", fontsize=8, color="#555555")
-            figure.tight_layout(rect=(0, .07, 1, .92), w_pad=2.)
+            figure.tight_layout(rect=(0, .04, 1, .945), h_pad=2.4, w_pad=2.)
             stem = "__".join(f"{label}_{_slug(value)}" for label, value in scope.items()
                               if pd.notna(value)) or "results"
             destination = directory / f"{stem}__information_budget_0908.pdf"

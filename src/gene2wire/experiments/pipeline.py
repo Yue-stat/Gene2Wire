@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed, parallel_config
 from scipy.stats import t as student_t
+from threadpoolctl import threadpool_limits
 
 from ..checkpoint import AtomicCheckpointStore, sha256_array, sha256_file
 from ..data import DatasetBundle
@@ -129,7 +130,7 @@ def _compile(prepared, features, observed, estimated, rows, paired, mode):
 
 
 def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_hash,
-              on_progress=None):
+              on_progress=None, scenario=None):
     fold = prepared.fold
     train, validation, test = fold.train_rows, fold.validation_rows, fold.test_rows
     development = np.sort(np.r_[train, validation])
@@ -149,8 +150,10 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                       "outer_fold": fold.outer_fold, "sharing_strength": rho}
     model_checkpoint = Path(checkpoint_dir) / slug(prepared.name)
 
-    for scenario in scenarios(settings, natural=prepared.natural_observed is not None,
-                              simulation=is_simulation, sharing_strength=rho):
+    selected_scenarios = (scenarios(settings, natural=prepared.natural_observed is not None,
+                                   simulation=is_simulation, sharing_strength=rho)
+                          if scenario is None else [scenario])
+    for scenario in selected_scenarios:
         context = {**source_context, **scenario}
         def emit(event):
             if on_progress is not None:
@@ -266,20 +269,33 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                                      "seed": trial.seed} for trial in model_result.tuning.trials)
         primary = scenario["analysis"] == "primary"
         if primary and settings.run_information_controls:
-            role, name = "reference_plus_pu", "Reference+PU"
-            tb, te = _compile(prepared, prepared.train_features, observed, tuning_e,
-                              train, paired_train, role)
-            rb, re = _compile(prepared, prepared.refit_features, observed, final_e,
-                              development, paired, role)
-            base = next(m for m in settings.models() if m.name == "PU").with_updates(name=name)
-            control = core_run((base,), tb, te, rb, re, role).models[name]
-            record(name, control.latent_probability, "reference")
-            tables["selected"].append({**context, **control.summary()})
-            tables["tuning"].extend({**context, "model": name, **asdict(trial.config),
-                                     "stage": trial.stage, "index": trial.index,
-                                     "validation_loss": trial.validation_loss,
-                                     "converged": trial.converged, "iterations": trial.iterations,
-                                     "seed": trial.seed} for trial in control.tuning.trials)
+            pu_models = {model.name: model for model in settings.models() if model.pu}
+            controls = (
+                ("reference_only", (pu_models["PU"].with_updates(name="Reference-only"),)),
+                ("reference_plus_pu", tuple(pu_models[base].with_updates(name=name)
+                    for base, name in (("PU", "Reference+PU"),
+                                       ("PU-MIRT", "Reference+PU-MIRT"),
+                                       ("PU-Joint", "Reference+PU-Joint")))),
+            )
+            for role, control_models in controls:
+                tb, te = _compile(prepared, prepared.train_features, observed, tuning_e,
+                                  train, paired_train, role)
+                rb, re = _compile(prepared, prepared.refit_features, observed, final_e,
+                                  development, paired, role)
+                # All mixed structures share exactly the same C/O labels and
+                # exposures, as well as candidate and warm-start caches. C's
+                # reference outcome replaces D; it is never counted twice.
+                fitted_controls = core_run(control_models, tb, te, rb, re, role)
+                for name, control in fitted_controls.models.items():
+                    record(name, control.latent_probability, "reference",
+                           {"supervision_mode": role, "uses_paired_reference": True,
+                            "uses_pu_likelihood": role == "reference_plus_pu"})
+                    tables["selected"].append({**context, **control.summary()})
+                    tables["tuning"].extend({**context, "model": name, **asdict(trial.config),
+                                             "stage": trial.stage, "index": trial.index,
+                                             "validation_loss": trial.validation_loss,
+                                             "converged": trial.converged, "iterations": trial.iterations,
+                                             "seed": trial.seed} for trial in control.tuning.trials)
         # Rescaling is only defined here for target-constant detection mechanisms.
         if scenario["mechanism"] in ("scar", "target_sar") and "Logistic" in result.models:
             q = result.models["Logistic"].latent_probability
@@ -307,7 +323,10 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                     kind=kind, probability_semantics=semantics,
                     candidate_budget=settings.candidate_budget,
                     seed=stable_seed(settings.seed, repetition, fold.outer_fold, kind),
-                    checkpoint_dir=model_checkpoint / "baselines" / fingerprint({**runner_context, "kind": kind, "semantics": semantics}),
+                    # Fit keys include actual X/labels/masks/prediction X, seed,
+                    # configuration and source. Share predictions across rates;
+                    # selection still recomputes loss using this scenario's D/e.
+                    checkpoint_dir=model_checkpoint / "baselines" / "shared_predictions",
                     refit_X=rb.X_cell, refit_labels=rb.S_observed, refit_measured=rb.W_measured,
                     on_progress=lambda event, model=name: emit({**event, "model": model}))
                 emit({"event": "model_complete", "model": name,
@@ -384,7 +403,7 @@ def _planned_models(prepared, settings):
                  if m.pu or not scenario["analysis"].startswith("calibration")]
         if scenario["analysis"] == "primary":
             if settings.run_information_controls:
-                names += ["Reference+PU"]
+                names += ["Reference-only", "Reference+PU", "Reference+PU-MIRT", "Reference+PU-Joint"]
             if settings.run_random_forest:
                 names += ["RF-observed", "RF-reference", "RF-mixed"]
             if settings.run_qiao:
@@ -417,19 +436,21 @@ def _load_unit_result(store, key, run_id, export_path):
 
 
 def _run_checkpointed_fold(prepared, repetition, settings, checkpoint_dir,
-                           export_path, fit_version, run_id, key, writer):
+                           export_path, fit_version, run_id, key, writer, scenario=None):
     started = time.monotonic()
     writer({"event": "unit_start"})
     tables = _run_fold(prepared, repetition, settings, checkpoint_dir, export_path,
-                       fit_version, on_progress=writer)
+                       fit_version, on_progress=writer, scenario=scenario)
     if not tables["failures"]:
         prefix = {"dataset": prepared.name, "repetition": repetition,
                   "outer_fold": prepared.fold.outer_fold,
                   "sharing_strength": prepared.metadata.get("sharing_strength")}
         files = []
-        for scenario in scenarios(settings, natural=prepared.natural_observed is not None,
-                                  simulation=prepared.metadata.get("independent_unit") == "generated_dataset",
-                                  sharing_strength=prepared.metadata.get("sharing_strength")):
+        selected_scenarios = (scenarios(settings, natural=prepared.natural_observed is not None,
+                                        simulation=prepared.metadata.get("independent_unit") == "generated_dataset",
+                                        sharing_strength=prepared.metadata.get("sharing_strength"))
+                              if scenario is None else [scenario])
+        for scenario in selected_scenarios:
             files.extend((export_path / "units" / fingerprint({**prefix, **scenario})).glob("*"))
         numeric = {name: list(pd.DataFrame(rows).select_dtypes(include="number").columns)
                    for name, rows in tables.items()}
@@ -441,6 +462,18 @@ def _run_checkpointed_fold(prepared, repetition, settings, checkpoint_dir,
     writer({"event": "unit_complete", "elapsed_seconds": time.monotonic()-started,
             "failed_scenarios": len(tables["failures"])})
     return tables
+
+
+def _run_scenario_group(tasks, settings, checkpoint_dir, export_path, fit_version, run_id):
+    """Run one or more independent scenarios in a single outer worker.
+
+    Grouping changes scheduling only. Each scenario retains its own completed
+    summary, model/candidate caches, event stream and deterministic seeds.
+    """
+    return [(index, _run_checkpointed_fold(prepared, repetition, settings,
+              checkpoint_dir, export_path, fit_version, run_id, key, writer,
+              scenario=scenario))
+            for index, prepared, repetition, key, writer, scenario in tasks]
 
 
 def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
@@ -491,7 +524,7 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
                 "datasets": metadata, "input_identities": input_identities,
                 "uncertainty_unit": "generated_dataset" if is_simulation else "descriptive_fold_and_mask_repeat",
                 "software": {"python": platform.python_version(), **{package: importlib.metadata.version(package)
-                             for package in ("numpy", "scipy", "pandas", "scikit-learn", "joblib")}}
+                             for package in ("numpy", "scipy", "pandas", "scikit-learn", "joblib", "threadpoolctl")}}
                 }
     run_id = fingerprint({"protocol": settings.scientific_dict(), "source_hash": code_hash,
                           "input_identities": input_identities, "software": manifest["software"]})
@@ -501,23 +534,30 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
     manifest.update(run_id=run_id, requested_n_jobs=settings.n_jobs, completed=False,
                     checkpoint_dir=str(Path(checkpoint_dir).resolve()))
     atomic_json(manifest, export_path / "manifest.json")
-    # One parallel level only: workers receive prepared dense arrays, not raw
-    # high-dimensional sequencing objects; joblib can memory-map large arrays.
-    workers = min(settings.n_jobs, len(contexts))
+    # Every completed-summary checkpoint is a fold/repetition/scenario unit,
+    # independently of how those units are grouped for scheduling. The default
+    # exposes loss rates to the outer process pool without nesting parallelism.
     store = AtomicCheckpointStore(Path(checkpoint_dir) / "experiment_units" / run_id)
-    results, pending, inventory = [None] * len(contexts), [], []
-    for index, (prepared, repetition) in enumerate(contexts):
-        unit_context = {"dataset": prepared.name, "repetition": repetition,
-                        "outer_fold": prepared.fold.outer_fold,
-                        "sharing_strength": prepared.metadata.get("sharing_strength")}
-        key = fingerprint({"run_id": run_id, **unit_context})
-        cached = _load_unit_result(store, key, run_id, export_path)
-        inventory.append({**unit_context, "work_id": key, "fully_cached": cached is not None,
-                          "planned_model_evaluations": len(_planned_models(prepared, settings))})
-        if cached is not None:
-            results[index] = cached
-        else:
-            pending.append((index, prepared, repetition, key, unit_context))
+    results, pending, inventory = [], [], []
+    for fold_group, (prepared, repetition) in enumerate(contexts):
+        planned_models = _planned_models(prepared, settings)
+        for scenario in scenarios(settings, natural=prepared.natural_observed is not None,
+                                  simulation=prepared.metadata.get("independent_unit") == "generated_dataset",
+                                  sharing_strength=prepared.metadata.get("sharing_strength")):
+            index = len(results)
+            unit_context = {"dataset": prepared.name, "repetition": repetition,
+                            "outer_fold": prepared.fold.outer_fold,
+                            "sharing_strength": prepared.metadata.get("sharing_strength"),
+                            **scenario}
+            key = fingerprint({"run_id": run_id, **unit_context})
+            cached = _load_unit_result(store, key, run_id, export_path)
+            model_count = sum(all(row[name] == value for name, value in scenario.items())
+                              for row in planned_models)
+            inventory.append({**unit_context, "work_id": key, "fully_cached": cached is not None,
+                              "planned_model_evaluations": model_count})
+            results.append(cached)
+            if cached is None:
+                pending.append((index, prepared, repetition, key, unit_context, scenario, fold_group))
     planned_model_count = sum(row["planned_model_evaluations"] for row in inventory)
     cached_model_count = sum(row["planned_model_evaluations"] for row in inventory
                              if row["fully_cached"])
@@ -526,18 +566,32 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
                           level=progress_level, total_units=planned_model_count,
                           cached_units=cached_model_count)
     with relay:
-        tasks = [(index, p, r, key, relay.writer(key, **context, work_id=key))
-                 for index, p, r, key, context in pending]
-        if workers == 1:
-            new_results = [_run_checkpointed_fold(p, r, settings, checkpoint_dir, export_path,
-                           fit_version, run_id, key, writer) for _, p, r, key, writer in tasks]
-        else:
-            with parallel_config(backend="loky", inner_max_num_threads=1):
-                new_results = Parallel(n_jobs=workers, verbose=0, max_nbytes="10M")(
-                    delayed(_run_checkpointed_fold)(p, r, settings, checkpoint_dir, export_path,
-                        fit_version, run_id, key, writer) for _, p, r, key, writer in tasks)
-        for task, result in zip(tasks, new_results):
-            results[task[0]] = result
+        groups = {}
+        for index, p, r, key, context, scenario, fold_group in pending:
+            group_key = index if settings.parallel_unit == "scenario" else fold_group
+            groups.setdefault(group_key, []).append(
+                (index, p, r, key, relay.writer(key, **context, work_id=key), scenario))
+        task_groups = list(groups.values())
+        workers = min(settings.n_jobs, len(task_groups))
+        manifest.update(parallel_unit=settings.parallel_unit, effective_n_jobs=workers,
+                        scheduled_tasks=len(task_groups), planned_scenario_units=len(inventory),
+                        pending_scenario_units=len(pending))
+        atomic_json(manifest, export_path / "manifest.json")
+        # Prepared dense arrays are shared through joblib memmaps when large.
+        # Serial and process execution both use one BLAS thread, and RF/Qiao/core
+        # remain serial inside a scenario; N_JOBS is the only process budget.
+        with threadpool_limits(limits=1):
+            if workers <= 1:
+                new_results = [_run_scenario_group(group, settings, checkpoint_dir, export_path,
+                               fit_version, run_id) for group in task_groups]
+            else:
+                with parallel_config(backend="loky", inner_max_num_threads=1):
+                    new_results = Parallel(n_jobs=workers, verbose=0, max_nbytes="10M")(
+                        delayed(_run_scenario_group)(group, settings, checkpoint_dir, export_path,
+                            fit_version, run_id) for group in task_groups)
+        for group_results in new_results:
+            for index, result in group_results:
+                results[index] = result
     names = results[0].keys()
     tables = {name: pd.DataFrame([row for result in results for row in result[name]]) for name in names}
     tables["checkpoint_inventory"] = pd.DataFrame(inventory)

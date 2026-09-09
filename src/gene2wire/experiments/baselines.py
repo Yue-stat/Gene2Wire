@@ -8,6 +8,7 @@ selected across all targets by mean measured-entry observed log loss.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -155,6 +156,27 @@ def _checkpoint_available(x: np.ndarray, y: np.ndarray, mask: np.ndarray, x_pred
                                 (len(x_predict), y.shape[1])) is not None
 
 
+@contextmanager
+def _exclusive_fit(path: Path | None):
+    """Deduplicate identical fits across OnDemand processes sharing a cache.
+
+    POSIX advisory locks are released on process exit, including interruption.
+    Other platforms retain atomic, validated checkpoints but may compute an
+    identical fit concurrently. No labels or fitted model objects are pickled.
+    """
+    if path is None or os.name != "posix":
+        yield
+        return
+    import fcntl
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_suffix(path.suffix + ".lock").open("a+b") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
 def _cached_fit_predict(x: np.ndarray, y: np.ndarray, mask: np.ndarray, x_predict: np.ndarray,
                         *, kind: str, config: Mapping[str, Any], seed: int,
                         checkpoint_dir: Path | None) -> tuple[np.ndarray, dict[str, Any], bool]:
@@ -163,22 +185,27 @@ def _cached_fit_predict(x: np.ndarray, y: np.ndarray, mask: np.ndarray, x_predic
     cached = _read_fit_checkpoint(path, identity, (len(x_predict), y.shape[1]))
     if cached is not None:
         return cached[0], cached[1], True
-    prediction, diagnostics = _fit_predict(x, y, mask, x_predict, kind=kind, config=config, seed=seed)
-    if path is not None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        metadata = canonical_json({"identity": identity, "prediction_hash": sha256_array(prediction),
-                                   "diagnostics": diagnostics})
-        descriptor, temporary = tempfile.mkstemp(prefix=path.stem + ".", suffix=".npz", dir=path.parent)
-        try:
-            with os.fdopen(descriptor, "wb") as stream:
-                np.savez_compressed(stream, prediction=prediction, metadata=np.array(metadata))
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, path)
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
-    return prediction, diagnostics, False
+    with _exclusive_fit(path):
+        # Another scenario may have finished this exact fit while we waited.
+        cached = _read_fit_checkpoint(path, identity, (len(x_predict), y.shape[1]))
+        if cached is not None:
+            return cached[0], cached[1], True
+        prediction, diagnostics = _fit_predict(x, y, mask, x_predict, kind=kind, config=config, seed=seed)
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            metadata = canonical_json({"identity": identity, "prediction_hash": sha256_array(prediction),
+                                       "diagnostics": diagnostics})
+            descriptor, temporary = tempfile.mkstemp(prefix=path.stem + ".", suffix=".npz", dir=path.parent)
+            try:
+                with os.fdopen(descriptor, "wb") as stream:
+                    np.savez_compressed(stream, prediction=prediction, metadata=np.array(metadata))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+        return prediction, diagnostics, False
 
 
 def fit_baseline(

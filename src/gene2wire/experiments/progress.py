@@ -38,7 +38,7 @@ class ProgressRelay:
     for one dataset/rho, repetition, fold and observation/calibration scenario.
     Candidate fits are retained in the event log but are not separate units:
     their count can vary with strategy, warm-start reuse and optimizer retries.
-    Whole-fold ``unit_complete`` events never increment the model-unit count.
+    Scenario ``unit_complete`` events never increment the model-unit count.
     """
 
     _SCENARIO_KEYS = ("work_id", "dataset", "sharing_strength", "repetition",
@@ -169,8 +169,9 @@ class ProgressRelay:
     def __enter__(self):
         if self.enabled:
             print(f"[cache] {self.cached_units}/{self.total_units} model evaluations reusable "
-                  f"from complete checkpoints; {self.total_units-self.cached_units} remaining. "
-                  "Partial candidate/refit caches are also retained.", flush=True)
+                  f"from verified complete scenario summaries; "
+                  f"{self.total_units-self.cached_units} still to process "
+                  "(may reuse model/candidate/refit caches).", flush=True)
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
         return self

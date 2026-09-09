@@ -20,6 +20,7 @@ class Settings:
     use_location: bool = False
     use_target_features: bool = False
     n_jobs: int = 32
+    parallel_unit: str = "scenario"
     n_repetitions: int = 5
     strategy: str = "full_joint"
     seed: int = 20260908
@@ -49,6 +50,8 @@ class Settings:
             raise ValueError("At least two outer folds are required")
         if self.strategy not in {"full_joint", "staged_rank_l2"}:
             raise ValueError("Unknown tuning strategy")
+        if self.parallel_unit not in {"scenario", "fold"}:
+            raise ValueError("parallel_unit must be 'scenario' or 'fold'")
         if not 0 < self.paired_fraction < 1:
             raise ValueError("paired_fraction must lie strictly between zero and one")
         if (not self.loss_rates or len(set(self.loss_rates)) != len(self.loss_rates)
@@ -62,6 +65,7 @@ class Settings:
     def scientific_dict(self):
         result = asdict(self)
         result.pop("n_jobs")  # Hardware changes must not invalidate learned models.
+        result.pop("parallel_unit")  # Scheduling cannot change the scientific identity.
         return result
 
     def fit_config(self):

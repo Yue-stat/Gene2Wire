@@ -165,8 +165,9 @@ and the same authorized paired C; observed-only RF does not use C's references:
 
 | Arm | Projection training objective |
 |---|---|
-| Calibrated PU | Observed PU likelihood on C and O; C estimates detection |
-| Reference + PU | Reference loss on C plus observed PU likelihood on O |
+| Reference-only logistic | Reference loss on C only, including negatives |
+| Calibrated PU logistic / MIRT / Joint | Observed PU likelihood on C and O; C estimates detection |
+| Reference + PU logistic / MIRT / Joint | Reference loss on C plus observed PU likelihood on O |
 | RF-observed | Ordinary RF using detections on C and O |
 | RF-reference | Ordinary RF using reference positives and negatives on C only |
 | RF-mixed | Ordinary RF using reference labels on C and detections on O |
@@ -175,6 +176,27 @@ The Reference + PU arm compiles `C` to reference labels with effective sensitivi
 `O` to observed labels with estimated sensitivity. It reuses the exact core
 likelihood, averaged over the included entries. It does not additionally count
 the marginal observed-label loss on `C` as an independent projection outcome.
+The three mixed structures run together with shared candidate/warm-start caches.
+Their names are `Reference+PU`, `Reference+PU-MIRT`, and `Reference+PU-Joint`.
+The original PU-Joint remains a pure calibrated-PU arm; it is not silently
+replaced by a different supervision method.
+
+Reference+PU logistic versus Reference-only logistic tests the increment from
+the remaining detection-only entries under fixed structure and authorized C.
+Calibrated PU versus Reference-only changes how those references are used, so
+it does not isolate that increment by itself. Reference+PU-Joint versus
+Reference+PU logistic compares structure with matched direct reference loss.
+Pure PU uses all measured entries, not just detected positives. At paired
+fraction a and positive retention s, direct replacement on C makes approximately
+a+(1-a)s of underlying positives explicitly labelled positive, versus s under
+detections alone. This is a label-information count, not the training sample
+fraction; actual SAR rates depend on the sampled cells and target composition.
+
+Within an outer fold C is sampled from development cells (inner train plus
+validation) and never overlaps test. Inner selection uses C intersect inner
+train and original validation detections; validation references cannot enter
+selection. The development refit uses all authorized C. Test references remain
+evaluation-only, even though a cell can legitimately train other outer folds.
 
 RF-mixed counts every assayed training entry once. It uses no PU likelihood or
 sensitivity rescaling. Its output is a mixed-label score, not an identified
@@ -182,9 +204,9 @@ reference probability p or detection probability q. Reference proper scores and
 hidden recovery use that raw score; p/q/h arrays are absent in its score export.
 RF-mixed versus RF-reference changes the training label view and the use of the
 remaining detections; it is not an independent-logistic information ablation.
-Both Prevalence methods and reference-only logistic are retired from new runs
-and diagnostic plots. Their historical exports and the low-level reference-only
-supervision compiler (still used by RF-reference) remain readable.
+Both Prevalence methods remain retired from new runs and diagnostic plots.
+Reference-only logistic is restored at all primary rates. Historical exports
+remain readable without mixing them into a new source/configuration identity.
 
 Common validation scoring uses the original validation
 detections: a reference-probability predictor is mapped to observed probability
@@ -207,7 +229,7 @@ restricted to the following scopes, rather than crossed with every dataset:
 | Mechanism controls | Simulation only: SCAR and Target-SAR at 80%, all three sharing strengths |
 | Calibration-size controls | Simulation only: sharing 0 and 1, Technical-SAR 80%, correctly specified detector; optional sizes from `CALIBRATION_FRACTIONS`, default `(0.20,)` reuses primary |
 | Calibration misspecification | Simulation only: sharing 0 and 1, Technical-SAR 80%, 20% budget; omit technical score or pool targets |
-| Reference + PU logistic | All five primary loss rates; natural paired evaluation for Projection-TAGs |
+| Reference-only logistic; Reference + PU logistic/MIRT/Joint | All five primary loss rates; natural paired evaluation for Projection-TAGs |
 | RF-observed / RF-reference / RF-mixed | All five primary loss rates; natural paired evaluation for Projection-TAGs |
 | Post-hoc sensitivity rescaling | Reuse observed-model predictions in target-constant SCAR/Target-SAR settings |
 | Fixed-predictor p/h ranking | Reuse saved primary predictions, without retraining |
@@ -221,10 +243,19 @@ zero/full-sharing simulation. All default scenarios use the 20% paired budget.
 size comparison and eleven zero/full-sharing scenarios; the primary fraction
 is reused instead of adding a duplicate scenario. Information and RF controls
 are model-level additions at every primary rate, not extra missingness axes.
-With all default switches enabled, each primary rate has 12 methods. A real-data
-thinning panel therefore has 60 model evaluations per fold/repetition, or 900
+With all default switches enabled, each primary rate has 15 methods. A real-data
+thinning panel therefore has 75 model evaluations per fold/repetition, or 1,125
 across three folds and five repetitions. Optional simulation mechanism and
 calibration diagnostics retain their stated endpoint scopes.
+
+Runtime scheduling defaults to fold × repetition × scenario. It changes neither
+the experiment matrix nor the aggregation units. With three folds, five
+repetitions and five primary rates there are 75 scheduling tasks, each executing
+15 methods. A single natural setting has only 15 tasks. Completed summaries
+are checkpointed per scenario in both `scenario` and `fold` scheduling modes.
+RF prediction caches share identical fit identities across scenarios and use
+POSIX advisory locks for concurrent deduplication; current validation D/e still
+select the winning configuration separately in each scenario.
 
 Qiao's squared-error and logit variants use only observed training outcomes and
 the common observed-validation log-loss rule. When `USE_TARGET_FEATURES=False`,

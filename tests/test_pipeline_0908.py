@@ -149,7 +149,7 @@ def test_mixed_rf_real_fit_exports_score_semantics_and_resumes(tmp_path, monkeyp
     first = run_experiment(data, config, **kwargs)
     assert first.manifest["status"] == "complete"
     metrics = first.tables["metrics"]
-    assert len(metrics) == 30  # Three folds; six core + Reference+PU + three RF.
+    assert len(metrics) == 39  # Three folds; six core + four reference controls + three RF.
     mixed = metrics.loc[metrics["model"].eq("RF-mixed")]
     assert len(mixed) == 3 and mixed["probability_semantics"].eq("mixed").all()
     assert mixed["uses_paired_reference"].all()
