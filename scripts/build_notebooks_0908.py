@@ -36,6 +36,7 @@ N_JOBS = 32
 PARALLEL_UNIT = 'scenario'  # Parallelize folds × repetitions × loss/calibration settings; 'fold' also supported.
 N_REPETITIONS = 5
 STRATEGY = 'full_joint'
+CANDIDATE_BUDGET = 32  # Per-model upper bound; keep the same setting across datasets.
 SEED = 20260908
 
 # Primary paired-reference budget. The default simulation uses this size only.
@@ -195,6 +196,7 @@ settings = Settings(
     n_outer_folds=N_OUTER_FOLDS, use_location=USE_LOCATION,
     use_target_features=USE_TARGET_FEATURES, n_jobs=N_JOBS, parallel_unit=PARALLEL_UNIT,
     n_repetitions=N_REPETITIONS, strategy=STRATEGY, seed=SEED,
+    candidate_budget=CANDIDATE_BUDGET,
     paired_fraction=PAIRED_FRACTION, calibration_fractions=CALIBRATION_FRACTIONS,
     run_information_controls=RUN_INFORMATION_CONTROLS,
     run_random_forest=RUN_RANDOM_FOREST,
@@ -209,12 +211,24 @@ else:
            'parallel_unit': PARALLEL_UNIT,
            'use_location': USE_LOCATION, 'use_target_features': USE_TARGET_FEATURES,
            'strategy': STRATEGY, 'run_qiao': RUN_QIAO,
+           'candidate_budget': CANDIDATE_BUDGET,
            'paired_fraction': PAIRED_FRACTION, 'calibration_fractions': CALIBRATION_FRACTIONS})
 if RESULTS_ONLY:
     all_artifacts = load_existing_exports(
         EXISTING_EXPORT_DIRS, expected_labels=EXPECTED_EXPORT_LABELS)
     print('RESULTS_ONLY: loaded completed exports; raw loading, preflight and fitting are skipped.')
     print('Plots and diagnostics use the SAVED manifest, not the current settings printed above.')
+'''
+
+
+WORKER_STATUS = '''
+from gene2wire.experiments.workers import NotebookWorkerStatus
+
+worker_status = None
+if RESULTS_ONLY:
+    print('RESULTS_ONLY: no training workers are launched.')
+else:
+    worker_status = NotebookWorkerStatus(requested_workers=N_JOBS)
 '''
 
 
@@ -328,6 +342,7 @@ def dataset_cells(name):
                 simulation_options=SIMULATION_OPTIONS,
                 progress=SHOW_PROGRESS, progress_level=PROGRESS_LEVEL,
                 progress_interval=PROGRESS_INTERVAL_SECONDS,
+                worker_status=worker_status,
             )
             all_artifacts = {'simulation': artifacts}
             '''),
@@ -357,7 +372,8 @@ def dataset_cells(name):
                     dataset=datasets[panel], settings=settings,
                     checkpoint_dir=CHECKPOINT_DIR, export_dir=EXPORT_DIR,
                     progress=SHOW_PROGRESS, progress_level=PROGRESS_LEVEL,
-                    progress_interval=PROGRESS_INTERVAL_SECONDS)
+                    progress_interval=PROGRESS_INTERVAL_SECONDS,
+                    worker_status=worker_status)
             '''),
         ]
     if name == "SPIDER":
@@ -418,7 +434,8 @@ def dataset_cells(name):
             dataset=dataset, settings=settings,
             checkpoint_dir=CHECKPOINT_DIR, export_dir=EXPORT_DIR,
             progress=SHOW_PROGRESS, progress_level=PROGRESS_LEVEL,
-            progress_interval=PROGRESS_INTERVAL_SECONDS)
+            progress_interval=PROGRESS_INTERVAL_SECONDS,
+            worker_status=worker_status)
         all_artifacts = {dataset.name: artifacts}
         '''),
     ]
@@ -479,6 +496,15 @@ def notebook(name, commit, source_hash):
         `USE_TARGET_FEATURES=True` uses the same declared target descriptors as the other models.
         No target outcomes are used to construct these descriptors."""),
         ("code", SETTINGS),
+        ("markdown", """## Worker usage and available slots
+
+        This cell creates a single live output, refreshed once per progress interval while
+        the experiment runs. It reports occupied and available slots in this experiment's
+        scheduled worker pool, alongside requested workers and the detectable CPU allowance.
+        Occupied workers may be fitting, reading caches or writing outputs; this is not CPU
+        utilization or a count of free CPUs across other jobs. Cached work and the number of
+        pending tasks can reduce the scheduled pool below `N_JOBS`."""),
+        ("code", WORKER_STATUS),
         ("markdown", "## Define input and split checks"),
         ("code", PREFLIGHT),
     ]
@@ -516,13 +542,13 @@ def notebook(name, commit, source_hash):
         '''),
         ("markdown", """## Same paired-reference budget
 
-        Curves compare Reference-only / Calibrated PU / Reference + PU logistic, and the
-        matched PU-versus-Reference + PU variants for MIRT and Joint. The original pure-PU
-        predictors use all measured entries with observed D; paired references calibrate e.
-        Mixed predictors instead use reference loss on paired C and PU loss on the remaining O,
-        with each projection outcome used once. All share the same authorized C, features and splits.
-        Three RF controls remain in the all-benchmark curves. Only actually recorded comparisons
-        are plotted; natural and single-rate settings remain in the exported metric tables."""),
+        Curves compare exactly Reference + PU logistic, RF (observed + paired references),
+        and Reference + PU-Joint. The two PU methods use reference loss on paired C and PU
+        loss on the remaining O. RF uses reference labels on C and raw observed labels on O,
+        with ordinary supervised training. Each method uses each projection outcome once;
+        all share the same authorized paired cells, features and splits. Other methods remain
+        in the all-benchmark curves above. Only recorded multi-rate comparisons are plotted;
+        natural and single-rate settings remain in the exported metric tables."""),
         ("code", '''
         information_budget_figure_paths = {}
         for label, artifacts in all_artifacts.items():
@@ -539,6 +565,9 @@ def notebook(name, commit, source_hash):
         lists every unit in the progress denominator; `model_cache_accounting.csv` distinguishes
         restored results, reused fits, and new/mixed fitting. An unchecked cache is not counted
         as a cache miss. Progress still prints one line per minute.
+        `joint_selection_diagnostics.csv` reports the candidate-family counts, converged
+        validation minima and the selected model's margin over its own direct endpoint.
+        Full diagnostics can also compute this table from older exports without fitting.
         Set `SHOW_FULL_DIAGNOSTICS=True` to display these full tables."""),
         ("code", FINAL),
     ])

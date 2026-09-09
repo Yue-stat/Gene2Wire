@@ -656,26 +656,24 @@ def plot_benchmark_results(artifacts: Any, output_dir: str | Path, *,
     return paths
 
 
-_INFORMATION_GROUPS = (
-    ("Independent logistic", ("Reference-only", "PU", "Reference+PU")),
-    ("Strict low rank", ("PU-MIRT", "Reference+PU-MIRT")),
-    ("Shared + specific", ("PU-Joint", "Reference+PU-Joint")),
-)
-_INFORMATION_ARMS = tuple(model for _, models in _INFORMATION_GROUPS for model in models)
+_INFORMATION_ARMS = ("Reference+PU", "RF-mixed", "Reference+PU-Joint")
 
 
 def plot_information_budget_results(artifacts: Any, output_dir: str | Path, *,
                                     show: bool = True) -> dict[str, Path]:
-    """Plot primary loss-rate curves comparing the use of the same paired C.
+    """Compare logistic, RF and Joint using the same paired-reference budget.
 
-    Rows hold predictor structure fixed: independent logistic compares
-    Reference-only, calibrated PU and Reference + PU; strict low rank and
-    shared + specific compare calibrated PU with Reference + PU. A row is
-    included only when at least two of its arms exist in the supplied results.
+    The three curves are Reference + PU logistic, RF with observed and paired
+    reference labels, and Reference + PU-Joint. All three methods must be
+    present in a setting; other information controls remain in the benchmark
+    plots and exported tables. This compares both structure and training loss,
+    rather than isolating either contribution. RF fits reference labels on C
+    and observed labels outside C without detection correction; its outputs
+    therefore target the mixed-label probability. Recovery uses PU posterior
+    scores for the PU methods and raw RF scores for RF.
     Missing model/rate combinations are never interpolated. Natural paired
     evaluations and single-rate settings remain in the exported tables and do
-    not create horizontal model-comparison dot panels. RF controls remain in
-    :func:`plot_benchmark_results` to keep these comparisons legible.
+    not create horizontal model-comparison dot panels.
     """
     frame = _primary(_benchmark_aggregate(artifacts.tables))
     if frame.empty:
@@ -700,11 +698,9 @@ def plot_information_budget_results(artifacts: Any, output_dir: str | Path, *,
             if scope.get("mechanism") == "natural" or len(rates) < 2:
                 continue
             available = set(selected["model"].dropna())
-            groups = [(label, tuple(model for model in models if model in available))
-                      for label, models in _INFORMATION_GROUPS]
-            groups = [(label, models) for label, models in groups if len(models) >= 2]
-            if not groups:
+            if not set(_INFORMATION_ARMS).issubset(available):
                 continue
+            models = _INFORMATION_ARMS
             simulation = pd.notna(scope.get("sharing_strength", np.nan))
             title_parts = [str(scope.get("dataset", "Results")).replace("_", " ")]
             if simulation:
@@ -712,32 +708,27 @@ def plot_information_budget_results(artifacts: Any, output_dir: str | Path, *,
             fraction = scope.get("calibration_fraction", np.nan)
             if pd.notna(fraction):
                 title_parts.append(f"paired = {float(fraction):.0%}")
-            title_parts.append("same paired subset, different uses of reference labels")
-            figure, axes = plt.subplots(len(groups), len(PRIMARY_METRICS), squeeze=False,
-                                        figsize=(12.4, 3.2 * len(groups) + .6))
-            for row, (structure, models) in enumerate(groups):
-                for column, metric in enumerate(PRIMARY_METRICS):
-                    axis = axes[row, column]
-                    if metric in selected:
-                        _benchmark_curve(axis, selected, metric, models)
-                    else:
-                        _style_axis(axis)
-                        axis.text(.5, .5, "No defined estimates", transform=axis.transAxes,
-                                  ha="center", va="center", fontsize=9, color="#777777")
-                    axis.set_title(_metric_title(metric, simulation=simulation), loc="left", pad=9)
-                    if column == 0:
-                        axis.set_ylabel(structure)
-                    if row != len(groups) - 1:
-                        axis.set_xlabel("")
-                handles = _benchmark_legend_handles(axes[row], models)
-                axes[row, 1].legend(handles, [_BENCHMARK_LABELS[model] for model in models],
-                                    loc="lower center", bbox_to_anchor=(.5, 1.20), frameon=False,
-                                    ncol=len(models), handlelength=2.5, columnspacing=1.6, fontsize=9)
+            title_parts.append("Same paired-reference budget")
+            figure, axes = plt.subplots(1, len(PRIMARY_METRICS), squeeze=False,
+                                        figsize=(12.4, 4.1))
+            for axis, metric in zip(axes[0], PRIMARY_METRICS):
+                if metric in selected:
+                    _benchmark_curve(axis, selected, metric, models)
+                else:
+                    _style_axis(axis)
+                    axis.text(.5, .5, "No defined estimates", transform=axis.transAxes,
+                              ha="center", va="center", fontsize=9, color="#777777")
+                axis.set_title(_metric_title(metric, simulation=simulation), loc="left", pad=9)
+            handles = _benchmark_legend_handles(axes[0], models)
+            figure.legend(handles, [_BENCHMARK_LABELS[model] for model in models],
+                          loc="upper center", bbox_to_anchor=(.5, .94), frameon=False,
+                          ncol=len(models), handlelength=2.5, columnspacing=1.6, fontsize=9)
             figure.suptitle(" · ".join(title_parts), fontsize=10, y=.995)
-            figure.text(.5, .012, "Structure is fixed within each row. Means over folds and repetitions; "
-                        "missing fits are not interpolated.",
+            figure.text(.5, .012, "Same paired cells, features and splits. Means over folds and repetitions; "
+                        "missing fits are not interpolated.\n"
+                        "Recovery uses PU posterior scores for PU models and RF scores for RF.",
                         ha="center", va="bottom", fontsize=8, color="#555555")
-            figure.tight_layout(rect=(0, .04, 1, .945), h_pad=2.4, w_pad=2.)
+            figure.tight_layout(rect=(0, .075, 1, .85), w_pad=2.)
             stem = "__".join(f"{label}_{_slug(value)}" for label, value in scope.items()
                               if pd.notna(value)) or "results"
             destination = directory / f"{stem}__information_budget_0908.pdf"

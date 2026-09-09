@@ -297,7 +297,7 @@ def _information_artifacts(*, simulation=False, natural=False):
     return artifacts
 
 
-def test_information_budget_curves_compare_uses_of_reference_within_each_structure(tmp_path, monkeypatch):
+def test_information_budget_curves_compare_logistic_rf_and_joint(tmp_path, monkeypatch):
     from gene2wire.experiments.plotting import plot_information_budget_results
     figures = _capture_show(monkeypatch)
     artifacts = _information_artifacts()
@@ -305,24 +305,19 @@ def test_information_budget_curves_compare_uses_of_reference_within_each_structu
     assert len(paths) == len(figures) == 1
     assert all(path.parent.name == "information_budget" and path.suffix == ".pdf"
                and path.read_bytes().startswith(b"%PDF") for path in paths.values())
-    assert len(figures[0].axes) == 9
-    expected = [
-        ["Reference-only logistic", "PU logistic", "Reference + PU logistic"],
-        ["PU-MIRT", "Reference + PU-MIRT"],
-        ["PU-Joint", "Reference + PU-Joint"],
-    ]
-    for row, models in enumerate(expected):
-        axes = figures[0].axes[row * 3:(row + 1) * 3]
-        assert [line.get_label() for line in axes[0].lines] == models
-        legend = axes[1].get_legend()
-        assert [label.get_text() for label in legend.get_texts()] == models
-        assert all(line.get_linestyle() == "-" for line in legend.get_lines())
-        for column, axis in enumerate(axes):
-            for line in axis.lines:
-                np.testing.assert_allclose(line.get_xdata(), [.2, .4, .6, .8] if column == 2
-                                           else [0., .2, .4, .6, .8])
-                assert line.get_linestyle() == "-"
-    assert "same paired subset" in figures[0]._suptitle.get_text()
+    assert len(figures[0].axes) == 3
+    expected = ["Reference + PU logistic", "RF (observed + paired references)",
+                "Reference + PU-Joint"]
+    legend = figures[0].legends[0]
+    assert [label.get_text() for label in legend.get_texts()] == expected
+    assert all(line.get_linestyle() == "-" for line in legend.get_lines())
+    for column, axis in enumerate(figures[0].axes):
+        assert [line.get_label() for line in axis.lines] == expected
+        for line in axis.lines:
+            np.testing.assert_allclose(line.get_xdata(), [.2, .4, .6, .8] if column == 2
+                                       else [0., .2, .4, .6, .8])
+            assert line.get_linestyle() == "-"
+    assert "Same paired-reference budget" in figures[0]._suptitle.get_text()
     assert not list(tmp_path.rglob("*.png"))
 
 
@@ -341,7 +336,7 @@ def test_information_budget_separates_simulation_rhos_and_paired_fractions(tmp_p
             assert all(np.all(line.get_ydata() == .7) for line in figure.axes[0].lines)
 
 
-def test_information_budget_omits_natural_single_rate_and_unmatched_rows(tmp_path, monkeypatch):
+def test_information_budget_omits_natural_single_rate_and_incomplete_comparisons(tmp_path, monkeypatch):
     from gene2wire.experiments.plotting import plot_information_budget_results
     figures = _capture_show(monkeypatch)
     assert plot_information_budget_results(_information_artifacts(natural=True), tmp_path) == {}
@@ -350,12 +345,15 @@ def test_information_budget_omits_natural_single_rate_and_unmatched_rows(tmp_pat
     artifacts.tables["aggregate"] = frame.loc[frame["loss_rate"].eq(.8)]
     assert plot_information_budget_results(artifacts, tmp_path) == {}
     assert figures == []
-    artifacts.tables["aggregate"] = frame.loc[~frame["model"].isin(["Reference+PU-MIRT", "Reference+PU-Joint"])]
+    artifacts.tables["aggregate"] = frame.loc[~frame["model"].eq("RF-mixed")]
+    assert plot_information_budget_results(artifacts, tmp_path) == {}
+    assert figures == []
+    artifacts.tables["aggregate"] = frame.loc[~frame["model"].isin(["Reference-only", "PU", "Reference+PU-MIRT"])]
     paths = plot_information_budget_results(artifacts, tmp_path)
     assert len(paths) == 1
     assert len(figures[0].axes) == 3
     assert {line.get_label() for line in figures[0].axes[0].lines} == {
-        "Reference-only logistic", "PU logistic", "Reference + PU logistic"}
+        "Reference + PU logistic", "RF (observed + paired references)", "Reference + PU-Joint"}
 
 
 def test_information_budget_legacy_endpoints_preserve_missing_rates(tmp_path, monkeypatch):
@@ -369,19 +367,18 @@ def test_information_budget_legacy_endpoints_preserve_missing_rates(tmp_path, mo
     artifacts.tables["aggregate"] = frame.loc[keep].copy()
     artifacts.tables["aggregate"]["hidden_recall_at_h"] = np.nan
     plot_information_budget_results(artifacts, tmp_path)
-    reference = next(line for line in figures[0].axes[0].lines if line.get_label() == "Reference-only logistic")
+    reference = next(line for line in figures[0].axes[0].lines if line.get_label() == "Reference + PU logistic")
     np.testing.assert_array_equal(np.isfinite(reference.get_ydata()), [False, False, False, False, True])
     assert reference.get_linestyle() == "None"
-    assert all(not figures[0].axes[index].lines for index in (2, 5, 8))
-    assert all(any(text.get_text() == "No defined estimates" for text in figures[0].axes[index].texts)
-               for index in (2, 5, 8))
+    assert not figures[0].axes[2].lines
+    assert any(text.get_text() == "No defined estimates" for text in figures[0].axes[2].texts)
 
 
 def test_information_budget_never_mixes_probability_semantics(tmp_path):
     from gene2wire.experiments.plotting import plot_information_budget_results
     artifacts = _information_artifacts()
     frame = artifacts.tables["aggregate"]
-    duplicate = frame.loc[frame["analysis"].eq("primary") & frame["model"].eq("PU")
+    duplicate = frame.loc[frame["analysis"].eq("primary") & frame["model"].eq("Reference+PU")
                           & frame["loss_rate"].eq(.8)].assign(probability_semantics="other")
     artifacts.tables["aggregate"] = pd.concat([frame, duplicate], ignore_index=True)
     with pytest.raises(ValueError, match="Duplicate model/loss estimates"):

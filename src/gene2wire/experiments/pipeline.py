@@ -470,14 +470,21 @@ def _run_scenario_group(tasks, settings, checkpoint_dir, export_path, fit_versio
     Grouping changes scheduling only. Each scenario retains its own completed
     summary, model/candidate caches, event stream and deterministic seeds.
     """
-    return [(index, _run_checkpointed_fold(prepared, repetition, settings,
-              checkpoint_dir, export_path, fit_version, run_id, key, writer,
-              scenario=scenario))
-            for index, prepared, repetition, key, writer, scenario in tasks]
+    if not tasks:
+        return []
+    group_writer = tasks[0][4]
+    group_writer({"event": "task_group_start"})
+    try:
+        return [(index, _run_checkpointed_fold(prepared, repetition, settings,
+                  checkpoint_dir, export_path, fit_version, run_id, key, writer,
+                  scenario=scenario))
+                for index, prepared, repetition, key, writer, scenario in tasks]
+    finally:
+        group_writer({"event": "task_group_complete"})
 
 
 def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
-             progress_interval=60., progress_level="summary"):
+             progress_interval=60., progress_level="summary", worker_status=None):
     code_hash = source_hash()
     contexts = []
     metadata = []
@@ -569,22 +576,24 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
     _atomic_csv(pd.DataFrame(evaluation_plan), export_path / "model_evaluation_plan.csv")
     cached_model_count = sum(row["planned_model_evaluations"] for row in inventory
                              if row["fully_cached"])
+    groups = {}
+    for index, p, r, key, context, scenario, fold_group in pending:
+        group_key = index if settings.parallel_unit == "scenario" else fold_group
+        groups.setdefault(group_key, []).append((index, p, r, key, context, scenario))
+    workers = min(settings.n_jobs, len(groups))
     event_dir = export_path / "progress" / uuid.uuid4().hex
     relay = ProgressRelay(event_dir, enabled=progress, interval=progress_interval,
                           level=progress_level, total_units=planned_model_count,
-                          cached_units=cached_model_count)
+                          cached_units=cached_model_count, worker_status=worker_status,
+                          worker_slots=workers, requested_workers=settings.n_jobs)
+    task_groups = [[(index, p, r, key, relay.writer(key, **context, work_id=key), scenario)
+                    for index, p, r, key, context, scenario in group]
+                   for group in groups.values()]
+    manifest.update(parallel_unit=settings.parallel_unit, effective_n_jobs=workers,
+                    scheduled_tasks=len(task_groups), planned_scenario_units=len(inventory),
+                    pending_scenario_units=len(pending), worker_capacity=relay.capacity)
+    atomic_json(manifest, export_path / "manifest.json")
     with relay:
-        groups = {}
-        for index, p, r, key, context, scenario, fold_group in pending:
-            group_key = index if settings.parallel_unit == "scenario" else fold_group
-            groups.setdefault(group_key, []).append(
-                (index, p, r, key, relay.writer(key, **context, work_id=key), scenario))
-        task_groups = list(groups.values())
-        workers = min(settings.n_jobs, len(task_groups))
-        manifest.update(parallel_unit=settings.parallel_unit, effective_n_jobs=workers,
-                        scheduled_tasks=len(task_groups), planned_scenario_units=len(inventory),
-                        pending_scenario_units=len(pending))
-        atomic_json(manifest, export_path / "manifest.json")
         # Prepared dense arrays are shared through joblib memmaps when large.
         # Serial and process execution both use one BLAS thread, and RF/Qiao/core
         # remain serial inside a scenario; N_JOBS is the only process budget.
@@ -624,6 +633,8 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
             "relative_detection": np.divide(standard, reference,
                 out=np.full(len(reference), np.nan), where=reference > 0)})
     _summarize(tables, simulation=is_simulation)
+    from .reporting import joint_selection_diagnostics
+    tables["joint_selection_diagnostics"] = joint_selection_diagnostics(tables)
     for name, table in tables.items():
         _atomic_csv(table, export_path / f"{name}.csv")
     manifest.update(completed=True, status="complete_with_failures" if len(tables["failures"]) else "complete",
@@ -643,14 +654,16 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
 
 
 def run_experiment(dataset: ExperimentDataset, settings: Settings, *, checkpoint_dir, export_dir,
-                   progress=True, progress_interval=60., progress_level="summary"):
+                   progress=True, progress_interval=60., progress_level="summary", worker_status=None):
     return _execute([dataset], settings, checkpoint_dir, export_dir, progress=progress,
-                    progress_interval=progress_interval, progress_level=progress_level)
+                    progress_interval=progress_interval, progress_level=progress_level,
+                    worker_status=worker_status)
 
 
 def run_simulation_experiments(settings: Settings, *, raw_cache_dir, checkpoint_dir, export_dir,
                                sharing_strengths=(0., .5, 1.), simulation_options=None,
-                               progress=True, progress_interval=60., progress_level="summary"):
+                               progress=True, progress_interval=60., progress_level="summary",
+                               worker_status=None):
     from .datasets.simulation import generate_simulation
     options = {"truth_uses_location": settings.use_location, **(simulation_options or {})}
     datasets = []
@@ -672,7 +685,8 @@ def run_simulation_experiments(settings: Settings, *, raw_cache_dir, checkpoint_
                               if isinstance(v, np.ndarray) and k != "target_descriptors"})
             datasets.append(dataset)
     return _execute(datasets, settings, checkpoint_dir, export_dir, progress=progress,
-                    progress_interval=progress_interval, progress_level=progress_level)
+                    progress_interval=progress_interval, progress_level=progress_level,
+                    worker_status=worker_status)
 
 
 def _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,

@@ -46,6 +46,7 @@ def test_clean_valid_python_and_shared_defaults(name):
     for key, expected in {
         "N_OUTER_FOLDS": 3, "USE_LOCATION": False, "USE_TARGET_FEATURES": False,
         "N_JOBS": 32, "N_REPETITIONS": 5, "STRATEGY": "full_joint",
+        "CANDIDATE_BUDGET": 32,
         "RUN_INFORMATION_CONTROLS": True, "RUN_RANDOM_FOREST": True,
         "RUN_MECHANISM_CONTROLS": True, "RUN_CALIBRATION_CONTROLS": True,
         "RUN_QIAO": True, "PAIRED_FRACTION": .2,
@@ -106,6 +107,7 @@ def test_generated_results_only_skips_all_raw_and_fit_cells(name):
     assert "SHOW_PROGRESS = True" in all_code
     assert "PROGRESS_LEVEL = 'summary'" in all_code
     assert "PROGRESS_INTERVAL_SECONDS = 60.0" in all_code
+    assert "NotebookWorkerStatus(requested_workers=N_JOBS)" in all_code
     run_calls = [node for node in ast.walk(ast.parse(all_code))
                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                  and node.func.id in {"run_experiment", "run_simulation_experiments"}]
@@ -116,6 +118,7 @@ def test_generated_results_only_skips_all_raw_and_fit_cells(name):
         assert values["progress"] == "SHOW_PROGRESS"
         assert values["progress_level"] == "PROGRESS_LEVEL"
         assert values["progress_interval"] == "PROGRESS_INTERVAL_SECONDS"
+        assert values["worker_status"] == "worker_status"
     if name == "BARseq":
         assert "EXISTING_EXPORT_DIRS = {'A1': None, 'M1': None}" in all_code
 

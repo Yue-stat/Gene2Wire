@@ -17,7 +17,9 @@ def test_whole_unit_inventory_and_missing_export_recovery(tmp_path, capsys):
                         loss_rates=(0.,), run_random_forest=False,
                         run_information_controls=False, run_calibration_controls=False,
                         run_mechanism_controls=False, run_qiao=False)
-    kwargs = dict(checkpoint_dir=tmp_path / 'checkpoints', export_dir=tmp_path / 'exports')
+    worker_snapshots = []
+    kwargs = dict(checkpoint_dir=tmp_path / 'checkpoints', export_dir=tmp_path / 'exports',
+                  worker_status=worker_snapshots.append)
     first = run_experiment(data, settings, **kwargs)
     output = capsys.readouterr().out
     assert 'verified result summaries 0/18' in output
@@ -27,11 +29,18 @@ def test_whole_unit_inventory_and_missing_export_recovery(tmp_path, capsys):
     assert not first.tables['checkpoint_inventory']['fully_cached'].any()
     events = first.tables['progress_events']
     assert (events['event'] == 'unit_complete').sum() == 3
+    assert (events['event'] == 'task_group_start').sum() == 3
+    assert (events['event'] == 'task_group_complete').sum() == 3
+    assert worker_snapshots[-1]['phase'] == 'finished'
+    assert worker_snapshots[-1]['occupied_workers'] == 0
+    assert worker_snapshots[-1]['available_workers'] == 1
     assert set(events.loc[events['event'] == 'model_complete', 'model']) >= {'PU-Joint', 'PU'}
     with patch.object(UnifiedPUModel, 'fit', side_effect=AssertionError('Unexpected fit')):
         second = run_experiment(data, settings, **kwargs)
         assert second.tables['checkpoint_inventory']['fully_cached'].all()
         assert second.tables['selected']['resumed'].all()
+        assert worker_snapshots[-1]['worker_slots'] == 0
+        assert worker_snapshots[-1]['occupied_workers'] == 0
         assert 'verified result summaries 18/18' in capsys.readouterr().out
         prediction = next(first.export_dir.rglob('PU-Joint_predictions.npz'))
         with np.load(prediction) as archive:

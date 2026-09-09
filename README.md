@@ -171,7 +171,11 @@ paired references therefore have solid curves. Historical unrun rates remain
 gaps when loading old exports; new intermediate fits require a training run.
 Horizontal model dot panels are omitted by default; Projection-TAGs retains
 its paired-label audit, with model metrics in tables. Information-budget plots
-use within-structure loss-rate curves and skip unrun/single-condition comparisons.
+compare Reference + PU logistic, RF (observed + paired references), and
+Reference + PU-Joint in three metric panels. All use the same paired cells;
+RF learns mixed labels without detection correction. Recovery uses PU posterior
+scores for the PU models and RF scores for RF. Unrun/single-condition
+comparisons are skipped.
 
 Qiao bilinear comparisons are enabled by default on every dataset's primary
 conditions. With target features disabled, `Qiao-ID-squared` and `Qiao-ID-logit`
@@ -191,9 +195,18 @@ refit cache hit alone cannot classify the entire model as reused. Incomplete
 telemetry is explicitly unknown. `model_evaluation_plan.csv` lists the exact
 denominator and `model_cache_accounting.csv` records the completed-unit breakdown.
 Duplicate calibration fractions are rejected before scheduling.
+A separate notebook cell displays occupied/available worker slots in one live
+output, refreshed once per progress interval. Requested workers, scheduled pool
+size and detectable CPU allowance are distinct. Occupancy includes fitting,
+cache access and output writing; it is not machine-wide CPU utilization.
 Notebook reports show compact endpoint, information-budget and convergence
 summaries. Complete CSV/NPZ exports remain available, and
 `SHOW_FULL_DIAGNOSTICS=True` restores the full table display.
+New exports include `joint_selection_diagnostics.csv`: per-unit candidate counts
+and best converged validation scores for direct, lowrank and joint candidates,
+plus the recorded selected family and its validation margin versus direct.
+This audits the recorded Joint search, not an inferred full MIRT grid. Full
+diagnostics derive the same table from older saved trials without refitting.
 
 ## Tests and development
 

@@ -9,12 +9,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import threading
 import time
+import warnings
 from zoneinfo import ZoneInfo
 
 from .io import jsonable
+from .workers import worker_capacity
 
 
 @dataclass(frozen=True)
@@ -26,7 +29,7 @@ class EventWriter:
         return EventWriter(self.path, {**self.context, **context})
 
     def __call__(self, event):
-        row = jsonable({**self.context, **event, "timestamp": time.time()})
+        row = jsonable({**self.context, **event, "timestamp": time.time(), "pid": os.getpid()})
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, allow_nan=False) + "\n")
 
@@ -46,13 +49,16 @@ class ProgressRelay:
                       "calibration_fraction", "calibration_spec")
 
     def __init__(self, directory, *, enabled=True, level="summary", interval=60.,
-                 total_units=0, cached_units=0):
+                 total_units=0, cached_units=0, worker_status=None,
+                 worker_slots=0, requested_workers=0):
         if level not in ("summary", "model", "trial"):
             raise ValueError("progress_level must be 'summary', 'model' or 'trial'")
         if not 0 < interval <= 3600:
             raise ValueError("progress_interval must be positive and at most 3600 seconds")
         if total_units < 0 or cached_units < 0 or cached_units > total_units:
             raise ValueError("Progress counts must satisfy 0 <= cached_units <= total_units")
+        if worker_slots < 0 or worker_slots > requested_workers:
+            raise ValueError("Worker slots must satisfy 0 <= worker_slots <= requested_workers")
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.enabled, self.level, self.interval = enabled, level, float(interval)
@@ -66,6 +72,11 @@ class ProgressRelay:
         self.stop = threading.Event()
         self.started = self.last_heartbeat = time.monotonic()
         self.thread = None
+        self.worker_status = worker_status
+        self.worker_slots = int(worker_slots)
+        self.capacity = worker_capacity(requested_workers)
+        self.worker_activity = {}
+        self.worker_status_failed = False
 
     def writer(self, key, **context):
         return EventWriter(self.directory / f"{key}.jsonl", context)
@@ -86,6 +97,13 @@ class ProgressRelay:
     def _accept(self, row):
         self.rows.append(row)
         event, unit = row.get("event"), row.get("work_id")
+        if event in ("task_group_start", "task_group_complete") and row.get("pid") is not None:
+            # A process can execute successive groups in different JSONL files.
+            # File-name drain order must not resurrect a previously ended task.
+            stamp = (float(row["timestamp"]), event == "task_group_complete")
+            previous = self.worker_activity.get(row["pid"])
+            if previous is None or stamp > previous[0]:
+                self.worker_activity[row["pid"]] = (stamp, event == "task_group_start")
         label = self.label(row)
         if event in ("model_start", "candidate_start", "refit_start", "scenario_start"):
             self.active[unit] = label
@@ -175,11 +193,35 @@ class ProgressRelay:
         """Print at most one line per interval; return whether a line was printed."""
         now = time.monotonic() if now is None else now
         with self.lock:
-            if not self.enabled or now - self.last_heartbeat < self.interval:
+            if now - self.last_heartbeat < self.interval:
                 return False
-            self._status(now)
+            if self.enabled:
+                self._status(now)
+            self._worker_status("running")
             self.last_heartbeat = now
-            return True
+            return self.enabled
+
+    def _worker_status(self, phase):
+        """Report occupied scheduling slots, never infer utilization from CPUs."""
+        if self.worker_status is None or self.worker_status_failed:
+            return
+        occupied = (0 if phase in ("finished", "interrupted") else
+                    sum(active for _, active in self.worker_activity.values()))
+        # A late drain can briefly contain a finished PID and its replacement.
+        # Occupancy is bounded by this experiment's explicitly scheduled pool.
+        occupied = min(self.worker_slots, occupied)
+        local_time = datetime.fromtimestamp(time.time(), ZoneInfo("America/Los_Angeles"))
+        snapshot = {**self.capacity, "phase": phase, "worker_slots": self.worker_slots,
+                    "occupied_workers": occupied,
+                    "available_workers": self.worker_slots - occupied,
+                    "finished_units": self.done_units, "total_units": self.total_units,
+                    "local_time": f"{local_time:%Y-%m-%d %H:%M:%S %Z}"}
+        try:
+            self.worker_status(snapshot)
+        except Exception as exc:
+            # Rendering is optional diagnostics, not a training dependency.
+            self.worker_status_failed = True
+            warnings.warn(f"Worker status callback disabled: {exc}", RuntimeWarning, stacklevel=2)
 
     def drain(self):
         with self.lock:
@@ -206,6 +248,7 @@ class ProgressRelay:
                   f"remaining {self.total_units-self.cached_units} require cache checks or processing. "
                   "Model/candidate/refit reuse is counted during execution; unchecked does not mean uncached.",
                   flush=True)
+        self._worker_status("running")
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
         return self
@@ -216,3 +259,4 @@ class ProgressRelay:
         self.drain()
         if self.enabled:
             self._status(time.monotonic(), final=True, interrupted=bool(exc and exc[0]))
+        self._worker_status("interrupted" if exc and exc[0] else "finished")

@@ -124,6 +124,96 @@ def _boolean_status(values: pd.Series) -> pd.Series:
                       else "not_converged" if str(value).lower() == "false" else "not_recorded")
 
 
+def joint_selection_diagnostics(tables: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
+    """Audit the candidates *inside each recorded Joint search*, without fitting.
+
+    Compare converged finite validation scores, as the tuner does. No separate
+    independent/MIRT search is merged into the candidate set, and no test metric
+    is read. Positive ``direct_minus_selected_validation_loss`` favors the
+    recorded selection over its own direct endpoint. It is not a test-set gain
+    or a confidence interval. Missing convergence is unknown, never success.
+
+    Old exports remain usable: missing fields produce explicit evidence status
+    and NaNs. If repetition/fold metadata is absent, ``unit_scope`` makes the
+    coarser recorded grouping explicit. Original tables/exports are not changed.
+    """
+    tuning = tables.get("tuning", pd.DataFrame())
+    if tuning.empty or "model" not in tuning:
+        return pd.DataFrame()
+    tuning = tuning.loc[tuning["model"].isin(("Joint", "PU-Joint", "Reference+PU-Joint"))]
+    if tuning.empty:
+        return pd.DataFrame()
+    groups = [column for column in (*_CONTEXT, "repetition", "outer_fold",
+                                   "supervision", "supervision_mode") if column in tuning]
+    selected = tables.get("selected", pd.DataFrame())
+    selection_aligned = not selected.empty and all(column in selected for column in groups)
+
+    def stable_key(key):
+        values = key if isinstance(key, tuple) else (key,)
+        return tuple(None if pd.isna(value) else value for value in values)
+
+    selection_groups = ({stable_key(key): frame for key, frame in
+                         selected.groupby(groups, dropna=False, observed=True)}
+                        if selection_aligned else {})
+    rows = []
+    for key, frame in tuning.groupby(groups, dropna=False, observed=True):
+        row = dict(zip(groups, key if isinstance(key, tuple) else (key,)))
+        row["unit_scope"] = ("fold_repetition" if {"repetition", "outer_fold"}.issubset(groups)
+                             else "recorded_context_only")
+        score = pd.to_numeric(frame.get("validation_loss",
+            pd.Series(index=frame.index, dtype=float)), errors="coerce")
+        status = _boolean_status(frame.get("converged", pd.Series(index=frame.index, dtype=object)))
+        eligible = status.eq("converged") & np.isfinite(score)
+        kind = frame.get("kind", pd.Series(index=frame.index, dtype=object))
+        row["recorded_candidates"] = len(frame)
+        row["eligible_candidates"] = int(eligible.sum())
+        row["convergence_unknown_candidates"] = int(status.eq("not_recorded").sum())
+        row["unknown_family_candidates"] = int((~kind.isin(("direct", "lowrank", "joint"))).sum())
+        missing = [label for field, label in (("converged", "convergence not recorded"),
+                   ("kind", "structure not recorded"), ("validation_loss", "validation loss not recorded"))
+                   if field not in frame]
+        row["candidate_evidence_status"] = ("; ".join(missing) if missing else
+            "no converged finite candidates" if not eligible.any() else "recorded")
+        for family in ("direct", "lowrank", "joint"):
+            in_family = kind.eq(family)
+            available = eligible & in_family
+            row[f"{family}_recorded_candidates"] = int(in_family.sum())
+            row[f"{family}_eligible_candidates"] = int(available.sum())
+            row[f"{family}_minimum_validation_loss"] = score[available].min()
+        row["best_recorded_validation_loss"] = score[eligible].min()
+        row["selected_family"] = None
+        row["selected_validation_loss"] = np.nan
+        matched = selection_groups.get(stable_key(key), pd.DataFrame())
+        if selected.empty:
+            selection_status = "selection not recorded"
+        elif not selection_aligned:
+            selection_status = "selection unit metadata missing"
+        elif matched.empty:
+            selection_status = "matching selection not recorded"
+        elif len(matched) != 1:
+            selection_status = "multiple selection rows for recorded unit"
+        else:
+            choice = matched.iloc[0]
+            family = choice.get("selected_structure")
+            if pd.isna(family):
+                family = choice.get("kind")
+            row["selected_family"] = (family if isinstance(family, str)
+                                      and family in ("direct", "lowrank", "joint") else None)
+            recorded_score = pd.to_numeric(pd.Series([choice.get("validation_observed_log_loss")]),
+                                           errors="coerce").iloc[0]
+            if np.isfinite(recorded_score):
+                row["selected_validation_loss"] = float(recorded_score)
+            selection_status = ("recorded" if row["selected_family"] is not None
+                and np.isfinite(row["selected_validation_loss"]) else "selection fields missing")
+        row["selection_evidence_status"] = selection_status
+        row["direct_minus_selected_validation_loss"] = (
+            row["direct_minimum_validation_loss"] - row["selected_validation_loss"])
+        row["selected_minus_best_recorded_validation_loss"] = (
+            row["selected_validation_loss"] - row["best_recorded_validation_loss"])
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def diagnostic_summaries(tables: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
     """Summaries of recorded evidence only; detailed original tables are unchanged."""
     output = {}
@@ -150,6 +240,9 @@ def diagnostic_summaries(tables: Mapping[str, pd.DataFrame]) -> dict[str, pd.Dat
             # Counts represent actual recorded trials, including repeat/fold
             # occurrences. They are not inferred Cartesian search budgets.
             output["recorded_candidate_coverage"] = _counts(tuning, groups + config, "trial_occurrences")
+    joint = joint_selection_diagnostics(tables)
+    if not joint.empty:
+        output["joint_selection_diagnostics"] = joint
     return output
 
 

@@ -46,6 +46,7 @@ N_JOBS = 32
 PARALLEL_UNIT = 'scenario'
 N_REPETITIONS = 5
 STRATEGY = 'full_joint'
+CANDIDATE_BUDGET = 32
 PAIRED_FRACTION = 0.20
 CALIBRATION_FRACTIONS = (PAIRED_FRACTION,)
 ```
@@ -64,11 +65,27 @@ tasks; requested workers still need matching allocated CPU/memory. Threads insid
 each worker are limited to one; avoid importing NumPy before the configuration
 cell applies those thread settings.
 
+The **Worker usage and available slots** cell creates one live output before
+training. It reports occupied and available slots out of the actual scheduled
+pool, the requested `N_JOBS`, and the detectable CPU allowance. The latter uses
+joblib's affinity/cgroup-aware count and a valid `SLURM_CPUS_PER_TASK` when set;
+it does not claim CPUs are idle across other jobs. Occupancy covers a task's
+fitting, cache access and output writing. The display refreshes once per
+progress interval, plus startup/completion, without adding repeated output
+lines. A fully cached run has zero scheduled training workers. The display does
+not silently change `N_JOBS` or alter model settings.
+
 The shared profile exposes the declared information-budget, RF, mechanism,
 calibration, and Qiao controls. Default mechanism/calibration stress
 tests are simulation-only; their switches do not add arbitrary new missingness
 axes to every real dataset. The complete matrix and search budgets are documented
 in [PROTOCOL_0908.md](PROTOCOL_0908.md).
+
+`CANDIDATE_BUDGET` exposes the existing default upper bound of 32; smaller finite
+grids still evaluate fewer candidates. Changing it is a new scientific
+configuration requiring new fitting, not a plotting option. A search-budget
+sensitivity should use a declared common setting across datasets; the default
+grid and model selection rule are unchanged.
 
 Every code cell has a Markdown section heading visible in the notebook table of
 contents. The first configuration section exposes the paired-reference variables.
@@ -222,8 +239,12 @@ Every retained benchmark actually present in a curve setting is plotted; both
 Prevalence methods are omitted and reference-only logistic is restored.
 Default plotting skips horizontal model dots for natural or single-rate scopes.
 Projection-TAGs retains its paired audit; its model results remain in tables.
-Information-budget plots show independent, MIRT and Joint comparisons as separate
-curve rows, only when at least two compared arms were actually run.
+Information-budget plots compare exactly `Reference+PU`, `RF-mixed`, and
+`Reference+PU-Joint` in AUPRC, log-loss and Hidden Recall panels. All three
+methods must be recorded in the setting; missing intermediate fits stay gaps.
+This controls the available paired labels but compares both model structure
+and training loss. RF's mixed-label score receives no PU correction. Hidden
+Recall uses PU posterior scores for the PU models and RF scores for RF.
 Unexecuted methods are not invented.
 Historical endpoint-only baselines use disconnected markers. Curve methods show their
 actual solid/dashed line and marker in the legend; endpoint-only methods retain
@@ -283,6 +304,14 @@ work still to process, not necessarily unfitted models. Completed unit summaries
 accepted only when their exported predictions and audits pass content checks.
 Worker events remain under `progress/` and in `progress_events.csv`;
 `checkpoint_inventory.csv` retains the initial counts.
+
+`joint_selection_diagnostics.csv` audits each recorded Joint/PU-Joint/
+Reference+PU-Joint search: counts and converged validation minima by candidate
+family, selected family, and validation-loss margin relative to its own direct
+endpoint. No test scores enter this diagnostic. It does not assume the Joint
+budget contains all standalone MIRT candidates. In results-only mode, full
+diagnostics compute the same table from saved tuning/selection records without
+refitting or rewriting the old exports. Missing legacy fields stay explicit.
 
 The three heartbeat counts sum to `finished units`: `restored results` came
 from complete verified summaries; `reused fits` processed a model using only
