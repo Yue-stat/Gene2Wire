@@ -461,7 +461,10 @@ def _benchmark_curve(axis, frame, metric, models):
         # Reindexing inserts NaNs at missing rates and breaks any interpolated
         # segment. In particular, 0%/80%-only RF fits are disconnected points.
         values = selected.set_index("loss_rate")[metric].reindex(rates).to_numpy(float)
-        values[~np.isfinite(values)] = np.nan
+        # Pandas copy-on-write can expose a read-only NumPy view. A functional
+        # replacement handles both writable arrays and immutable views without
+        # modifying the caller's table or relying on pandas' copy policy.
+        values = np.where(np.isfinite(values), values, np.nan)
         count = int(np.isfinite(values).sum())
         if not count:
             continue
@@ -599,6 +602,93 @@ def plot_benchmark_results(artifacts: Any, output_dir: str | Path, *,
                 figure.text(.5, .01, "Means over folds and repetitions; no diagnostic confidence intervals.",
                             ha="center", va="bottom", fontsize=8, color="#555555")
                 figure.tight_layout(rect=(0, .04, 1, .94), w_pad=2.)
+            _save_display(figure, destination, show)
+            paths[stem] = destination
+    return paths
+
+
+_INFORMATION_ARMS = ("Reference-only", "PU", "Reference+PU")
+_INFORMATION_LABELS = {"Reference-only": "Reference-only",
+                       "PU": "Calibrated PU",
+                       "Reference+PU": "Reference + PU"}
+
+
+def plot_information_budget_results(artifacts: Any, output_dir: str | Path, *,
+                                    show: bool = True) -> dict[str, Path]:
+    """Compare three independent-logistic arms at the same paired budget.
+
+    Additional 1-by-3 PDF figures show the primary natural evaluation or the
+    80%-loss endpoint. Each scientific setting gets its own figure, including
+    each simulation sharing strength. ``PU`` is the calibrated independent
+    predictor, not PU-MIRT or PU-Joint. Missing arms/undefined metrics are
+    explicitly annotated; they are never replaced by another model or rate.
+    Means follow the same fold-then-repetition aggregation as the main plots.
+    This function does not overwrite or replace any existing figure.
+    """
+    frame = _primary(_benchmark_aggregate(artifacts.tables))
+    if frame.empty:
+        return {}
+    frame = frame.loc[frame["model"].isin(_INFORMATION_ARMS)].copy()
+    natural = (frame["mechanism"].eq("natural") if "mechanism" in frame
+               else pd.Series(False, index=frame.index))
+    endpoint = (np.isclose(pd.to_numeric(frame["loss_rate"], errors="coerce"), .8)
+                if "loss_rate" in frame else np.zeros(len(frame), dtype=bool))
+    frame = frame.loc[natural | endpoint]
+    if frame.empty:
+        return {}
+    scope_columns = [key for key in _BENCHMARK_SCOPES if key in frame]
+    grouping = (frame.groupby(scope_columns, observed=True, dropna=False, sort=True)
+                if scope_columns else [((), frame)])
+    directory, paths = Path(output_dir) / "information_budget", {}
+    with plt.rc_context(_STYLE):
+        for scope_key, selected in grouping:
+            key = scope_key if isinstance(scope_key, tuple) else (scope_key,)
+            scope = dict(zip(scope_columns, key))
+            if selected.duplicated("model").any():
+                raise ValueError("Duplicate model estimates within an information-budget setting; "
+                                 "keep distinct scientific configurations in separate artifacts")
+            simulation = pd.notna(scope.get("sharing_strength", np.nan))
+            title_parts = [str(scope.get("dataset", "Results")).replace("_", " ")]
+            if simulation:
+                title_parts.append(rf"$\rho={float(scope['sharing_strength']):g}$")
+            fraction = scope.get("calibration_fraction", np.nan)
+            if pd.notna(fraction):
+                title_parts.append(f"paired = {float(fraction):.0%}")
+            title_parts.append("natural paired evaluation" if scope.get("mechanism") == "natural"
+                               else "positive-label loss = 80%")
+            figure, axes = plt.subplots(1, len(PRIMARY_METRICS), figsize=(11.6, 3.05))
+            for column, (axis, metric) in enumerate(zip(axes, PRIMARY_METRICS)):
+                for position, model in enumerate(_INFORMATION_ARMS):
+                    estimates = selected.loc[selected["model"].eq(model)]
+                    value = (pd.to_numeric(estimates[metric], errors="coerce").iloc[0]
+                             if not estimates.empty and metric in estimates else np.nan)
+                    if np.isfinite(value):
+                        style = _benchmark_style(model, _INFORMATION_ARMS)
+                        style["label"] = _INFORMATION_LABELS[model]
+                        style["markersize"] = 7
+                        axis.plot(float(value), position, **style, linestyle="None",
+                                  markeredgewidth=.7)
+                    else:
+                        message = "Not run" if estimates.empty else "Undefined / unavailable"
+                        axis.text(.5, position, message, transform=axis.get_yaxis_transform(),
+                                  ha="center", va="center", fontsize=8, color="#888888")
+                _style_axis(axis, loss_axis=False)
+                axis.set_yticks(np.arange(len(_INFORMATION_ARMS)),
+                    [_INFORMATION_LABELS[model] for model in _INFORMATION_ARMS]
+                    if column == 0 else [""] * len(_INFORMATION_ARMS))
+                axis.set_ylim(len(_INFORMATION_ARMS) - .5, -.5)
+                axis.grid(False, axis="y")
+                axis.grid(axis="x", color="#E6E6E6", linewidth=.6)
+                axis.xaxis.set_major_locator(MaxNLocator(nbins=4))
+                axis.set_xlabel(_metric_title(metric, simulation=simulation))
+            figure.suptitle(" · ".join(title_parts), fontsize=10, y=.98)
+            figure.text(.5, .015, "Independent logistic predictors; same paired-reference budget. "
+                        "Means over folds and repetitions; no diagnostic confidence intervals.",
+                        ha="center", va="bottom", fontsize=8, color="#555555")
+            figure.tight_layout(rect=(0, .07, 1, .92), w_pad=2.)
+            stem = "__".join(f"{label}_{_slug(value)}" for label, value in scope.items()
+                              if pd.notna(value)) or "results"
+            destination = directory / f"{stem}__information_budget_0908.pdf"
             _save_display(figure, destination, show)
             paths[stem] = destination
     return paths

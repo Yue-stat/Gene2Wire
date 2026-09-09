@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 from gene2wire.experiments.reporting import (
-    diagnostic_summaries, display_diagnostics, load_existing_exports,
+    compact_summaries, diagnostic_summaries, display_diagnostics, load_existing_exports,
     load_export_artifacts,
 )
 
@@ -93,7 +93,7 @@ def test_all_original_tables_displayed_untruncated_and_empty_explicit(tmp_path, 
     with pd.option_context("display.max_rows", 2, "display.max_columns", 2,
                            "display.max_colwidth", 10, "display.max_seq_items", 2,
                            "display.width", 80, "display.expand_frame_repr", True):
-        display_diagnostics(result, display_fn=shown.append)
+        display_diagnostics(result, display_fn=shown.append, full=True)
         for option in ("display.max_rows", "display.max_columns", "display.max_colwidth", "display.max_seq_items"):
             assert pd.get_option(option) is None
         for original in result.tables.values():
@@ -103,3 +103,71 @@ def test_all_original_tables_displayed_untruncated_and_empty_explicit(tmp_path, 
     assert "failures: 0 rows" in output
     assert "This exported table has zero rows" in output
     assert "extra_table: 100 rows" in output
+
+
+def test_compact_default_keeps_useful_endpoints_without_dumping_raw_tables(tmp_path, capsys):
+    result = load_export_artifacts(write_export(tmp_path / "compact"))
+    result.tables["aggregate"] = pd.DataFrame({
+        "dataset": ["BARseq A1"] * 5, "analysis": ["primary"] * 4 + ["calibration_size"],
+        "model": ["PU", "PU", "Reference-only", "Reference+PU", "PU"],
+        "loss_rate": [0., .8, .8, .8, .8], "macro_auprc": [.2, .3, .4, .5, .9],
+        "macro_log_loss": [.5, .4, .3, .2, .1], "macro_hidden_recall_at_h": [None, .2, .3, .4, .9]})
+    result.tables["tuning"] = pd.DataFrame({"model": ["PU"] * 1000, "rank": [0] * 1000,
+                                            "residual_l2": [.001] * 1000, "converged": [True] * 1000})
+    result.tables["extra_table"] = pd.DataFrame({"long": ["x" * 500] * 100})
+    before = {name: frame.copy(deep=True) for name, frame in result.tables.items()}
+    shown = []
+    display_diagnostics(result, display_fn=shown.append)
+    summary = shown[0]
+    assert summary.model.tolist() == ["PU", "Reference-only", "Reference+PU"]
+    assert summary.macro_auprc.tolist() == [.3, .4, .5]
+    assert "macro_hidden_recall_at_h" in summary
+    assert all(value is not result.tables["tuning"] and value is not result.tables["extra_table"] for value in shown)
+    assert not any(len(value) > 10 for value in shown)
+    for name in before:
+        pd.testing.assert_frame_equal(before[name], result.tables[name])
+    output = capsys.readouterr().out
+    assert "complete diagnostics" not in output and "older-core" not in output
+    assert "Recorded failed units: 0" in output
+    assert "SHOW_FULL_DIAGNOSTICS=True" in output
+
+
+def test_compact_natural_endpoint_and_failure_status_are_preserved():
+    frames = {"aggregate": pd.DataFrame({"dataset": ["Projection-TAGs"] * 2,
+        "model": ["PU", "Reference-only"], "loss_rate": [None, None],
+        "macro_auprc": [.2, .3]}),
+        "selected": pd.DataFrame({"model": ["PU"] * 3, "rank": [0] * 3,
+            "residual_l2": [.001, .001, .1], "final_converged": [True, False, None]}),
+        "failures": pd.DataFrame({"outer_fold": [1], "reason": ["calibration failed"]})}
+    summaries = compact_summaries(frames)
+    assert len(summaries["primary_endpoint_metrics"]) == 2
+    row = summaries["selection_and_convergence_all_primary_rates"].iloc[0]
+    assert (row["converged"], row["not_converged"], row["not_recorded"]) == (1, 1, 1)
+    assert row["unique_selected_configs"] == 2
+    assert row["mode_count"] == 2
+    assert len(summaries["nonconverged_final_fits_first_10_see_selected_csv"]) == 1
+    assert summaries["failed_units_first_10_see_failures_csv"].reason.tolist() == ["calibration failed"]
+
+
+def test_compact_baseline_parameters_and_nonprimary_convergence():
+    selected = pd.DataFrame([
+        dict(model='RF-reference', analysis='primary', n_estimators=300,
+             min_samples_leaf=1, max_features='sqrt', max_depth=None),
+        dict(model='RF-reference', analysis='primary', n_estimators=300,
+             min_samples_leaf=5, max_features='sqrt', max_depth=12),
+        dict(model='Qiao-ID-logit', analysis='primary', rank=2, l2=.001, objective='logit', converged=True),
+        dict(model='Qiao-ID-logit', analysis='primary', rank=2, l2=.1, objective='logit', converged=True),
+        dict(model='PU', analysis='calibration_misspecification', rank=0, final_converged=False)])
+    result = compact_summaries({'selected': selected, 'tuning': selected})
+    modes = result['selection_and_convergence_all_primary_rates'].set_index('model')
+    assert modes.loc['RF-reference', 'unique_selected_configs'] == 2
+    assert 'depth=unlimited' in modes.loc['RF-reference', 'most_selected_config']
+    assert modes.loc['Qiao-ID-logit', 'unique_selected_configs'] == 2
+    assert modes.loc['Qiao-ID-logit', 'converged'] == 2
+    status = result['convergence_all_scenarios'].set_index('records')
+    assert status.loc['final fits', 'not_converged'] == 1
+    assert result['nonconverged_final_fits_first_10_see_selected_csv'].model.tolist() == ['PU']
+    assert result['candidate_coverage_all_primary_rates'].set_index('model').loc[
+        'Qiao-ID-logit', 'unique_bilinear_penalties'] == 2
+    only_control = compact_summaries({'selected': selected.iloc[[-1]]})
+    assert only_control['convergence_all_scenarios'].iloc[0]['not_converged'] == 1

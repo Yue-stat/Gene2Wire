@@ -331,7 +331,7 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                     tables["selected"].append({**context, "model": name, **baseline.selected_config,
                                                 "tuning_trials": len(baseline.candidate_records)})
                     tables["tuning"].extend({**context, "model": name, **row} for row in baseline.candidate_records)
-        if settings.run_qiao and is_simulation and scenario["analysis"] == "primary":
+        if settings.run_qiao and scenario["analysis"] == "primary":
             _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
                                record, tables, model_checkpoint, on_progress=emit)
     return tables
@@ -399,8 +399,9 @@ def _planned_models(prepared, settings):
                 names += ["Prevalence-observed", "Prevalence-reference"]
                 if settings.run_random_forest:
                     names += ["RF-observed", "RF-reference"]
-            if simulation and settings.run_qiao:
-                names += ["Qiao-squared", "Qiao-logit"]
+            if settings.run_qiao:
+                from .qiao import qiao_model_names
+                names += list(qiao_model_names(settings.use_target_features))
         rows.extend({**scenario, "model": name} for name in names)
     return rows
 
@@ -455,7 +456,7 @@ def _run_checkpointed_fold(prepared, repetition, settings, checkpoint_dir,
 
 
 def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
-             progress_interval=30., progress_level="model"):
+             progress_interval=60., progress_level="summary"):
     code_hash = source_hash()
     contexts = []
     metadata = []
@@ -529,18 +530,13 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
             results[index] = cached
         else:
             pending.append((index, prepared, repetition, key, unit_context))
-    cached_count = len(contexts)-len(pending)
-    if progress:
-        print(f"[checkpoint inventory] {cached_count}/{len(contexts)} complete fold/repetition units "
-              f"reusable; {len(pending)} units remaining; up to {workers} workers.", flush=True)
-        print(f"[work plan] {sum(r['planned_model_evaluations'] for r in inventory)} model evaluations; "
-              f"{sum(r['planned_model_evaluations'] for r in inventory if r['fully_cached'])} in fully cached units. "
-              "Partial candidate/refit caches are verified against exact fingerprints per model below; "
-              "remaining units need not require all-new fits.", flush=True)
-        print(f"Checkpoints: {checkpoint_dir}", flush=True)
+    planned_model_count = sum(row["planned_model_evaluations"] for row in inventory)
+    cached_model_count = sum(row["planned_model_evaluations"] for row in inventory
+                             if row["fully_cached"])
     event_dir = export_path / "progress" / uuid.uuid4().hex
     relay = ProgressRelay(event_dir, enabled=progress, interval=progress_interval,
-                          level=progress_level, total_units=len(contexts), cached_units=cached_count)
+                          level=progress_level, total_units=planned_model_count,
+                          cached_units=cached_model_count)
     with relay:
         tasks = [(index, p, r, key, relay.writer(key, **context, work_id=key))
                  for index, p, r, key, context in pending]
@@ -572,6 +568,9 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
         _atomic_csv(table, export_path / f"{name}.csv")
     manifest.update(completed=True, status="complete_with_failures" if len(tables["failures"]) else "complete",
                     failed_calibration_units=len(tables["failures"]),
+                    planned_model_evaluations=planned_model_count,
+                    completed_model_evaluations=relay.done_units,
+                    cached_model_evaluations=cached_model_count,
                     metric_rows=len(tables["metrics"]), table_files=[f"{name}.csv" for name in tables])
     atomic_json(manifest, export_path / "manifest.json")
     print(f"All results exported to: {export_path}")
@@ -581,14 +580,14 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
 
 
 def run_experiment(dataset: ExperimentDataset, settings: Settings, *, checkpoint_dir, export_dir,
-                   progress=True, progress_interval=30., progress_level="model"):
+                   progress=True, progress_interval=60., progress_level="summary"):
     return _execute([dataset], settings, checkpoint_dir, export_dir, progress=progress,
                     progress_interval=progress_interval, progress_level=progress_level)
 
 
 def run_simulation_experiments(settings: Settings, *, raw_cache_dir, checkpoint_dir, export_dir,
                                sharing_strengths=(0., .5, 1.), simulation_options=None,
-                               progress=True, progress_interval=30., progress_level="model"):
+                               progress=True, progress_interval=60., progress_level="summary"):
     from .datasets.simulation import generate_simulation
     options = {"truth_uses_location": settings.use_location, **(simulation_options or {})}
     datasets = []
@@ -622,26 +621,25 @@ def _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
     Checkpoints identify inputs and fitting settings, not unrelated model lists,
     worker counts, calibration settings, or evaluation reference labels.
     """
-    from .qiao import QiaoFit, fit_qiao
+    from dataclasses import replace
+    from .qiao import (QiaoFit, fit_qiao, qiao_candidate_grid,
+                       qiao_model_names, qiao_target_inputs)
     from ..checkpoint import AtomicArrayCheckpointStore, unit_key
     # Sensitivities are intentionally not inputs to these observed-label fits.
     del tuning_e, final_e
     train, validation, test = prepared.fold.train_rows, prepared.fold.validation_rows, prepared.fold.test_rows
     dev = np.sort(np.r_[train, validation])
-    y, yr = prepared.train_features.Y_target, prepared.refit_features.Y_target
-    if not settings.use_target_features or y is None or yr is None:
-        raise ValueError("Qiao requires explicit target features for every compared model")
+    y, yr, target_input_kind = qiao_target_inputs(
+        prepared.train_features.Y_target, prepared.refit_features.Y_target,
+        len(prepared.target_ids), use_target_features=settings.use_target_features)
+    train_features = replace(prepared.train_features, Y_target=y)
+    refit_features = replace(prepared.refit_features, Y_target=yr)
     if not prepared.measured[validation].any():
         raise ValueError("Qiao validation requires measured entries")
-    maximum = min(prepared.train_features.X.shape[1] + 1,
-                  prepared.refit_features.X.shape[1] + 1, y.shape[1] + 1, yr.shape[1] + 1)
-    ranks = sorted({maximum, *(r for r in (1, 2, 4, 8, 16) if r <= maximum)})
-    candidates = [{"rank": rank, "l2": float(penalty)}
-                  for rank in ranks for penalty in sorted(set(settings.penalties))]
+    candidates = qiao_candidate_grid(train_features.X.shape[1], refit_features.X.shape[1],
+                                     y, yr, penalties=settings.penalties,
+                                     candidate_budget=settings.candidate_budget)
     budget = min(settings.candidate_budget, 32)
-    if len(candidates) > budget:
-        indices = np.unique(np.linspace(0, len(candidates) - 1, budget).round().astype(int))
-        candidates = [candidates[int(i)] for i in indices]
     store = AtomicArrayCheckpointStore(Path(checkpoint_dir) / "qiao")
     versions = {package: importlib.metadata.version(package) for package in ("numpy", "scipy")}
     code_hash = source_hash()
@@ -665,6 +663,7 @@ def _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
             ("X_prediction", prediction_x), ("training_ids", cell_ids[rows]),
             ("prediction_ids", cell_ids[prediction_rows]), ("target_ids", target_ids))}
         base = {"phase": phase, "config": config, "inputs": inputs, "source": code_hash,
+                "target_input_kind": target_input_kind,
                 "versions": versions, "seed": seed, "tolerance": settings.tolerance,
                 "init_direct_maxiter": settings.init_direct_maxiter}
 
@@ -718,7 +717,8 @@ def _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
                        "n_measured": fitted.n_measured}
         return prediction, ranking_score, diagnostics
 
-    for objective, name in (("squared_error", "Qiao-squared"), ("logit", "Qiao-logit")):
+    for objective, name in zip(("squared_error", "logit"),
+                               qiao_model_names(settings.use_target_features)):
         model_started = time.monotonic()
         if on_progress is not None:
             on_progress({"event": "model_start", "model": name})
@@ -726,11 +726,12 @@ def _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
         for index, candidate in enumerate(candidates):
             candidate_started = time.monotonic()
             config = {**candidate, "objective": objective}
-            probability, _, diagnostics = cached_fit("candidate", prepared.train_features,
+            probability, _, diagnostics = cached_fit("candidate", train_features,
                                                      train, validation, config)
             q = np.clip(probability[validation_mask], 1e-7, 1 - 1e-7)
             loss = float(np.mean(-validation_d * np.log(q) - (1 - validation_d) * np.log1p(-q)))
             trial = {**config, **diagnostics, "index": index,
+                     "target_input_kind": target_input_kind,
                      "validation_loss": loss, "selection_metric": "observed_log_loss",
                      "stage": "qiao_candidate"}
             trials.append(trial)
@@ -744,16 +745,23 @@ def _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
                 best = (key, config)
         if best is None:
             raise ValueError("Qiao has no valid candidates under the current feature dimensions")
-        prediction, ranking_score, diagnostics = cached_fit("final", prepared.refit_features,
+        prediction, ranking_score, diagnostics = cached_fit("final", refit_features,
                                                            dev, test, best[1])
-        extra = {"use_target_features": True,
+        extra = {"use_target_features": settings.use_target_features,
+                 "target_input_kind": target_input_kind,
                  "probability_transform": "sigmoid" if objective == "logit" else "clip_linear_score",
                  "probability_clip_fraction": float(np.mean((ranking_score < 1e-7) |
                                                               (ranking_score > 1 - 1e-7)))
                     if objective == "squared_error" else 0.0}
         record(name, prediction, "observed", extra, ranking_score=ranking_score)
         tables["selected"].append({**context, "model": name, **best[1], **diagnostics,
-                                    "selected_structure": "target_covariate_bilinear",
+                                    "final_converged": diagnostics["converged"],
+                                    "final_iterations": diagnostics["iterations"],
+                                    "final_fit_retried": diagnostics["fit_retried"],
+                                    "selected_structure": ("target_covariate_bilinear"
+                                        if settings.use_target_features else "target_identity_bilinear"),
+                                    "use_target_features": settings.use_target_features,
+                                    "target_input_kind": target_input_kind,
                                     "selection_metric": "observed_log_loss",
                                     "validation_loss": best[0][1],
                                     "tuning_trials": len(trials), "candidate_budget": budget})

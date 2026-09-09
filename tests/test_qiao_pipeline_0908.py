@@ -121,3 +121,53 @@ def test_validation_outcomes_rescore_without_retraining_candidates_and_source_ch
     version[0] = "source-v2"
     _run(prepared, settings, context, tmp_path, d)
     assert counts["candidate"] > before
+
+
+def test_target_id_design_ignores_outcomes_and_grid_is_bounded_and_balanced():
+    y, yr, kind = qiao.qiao_target_inputs(None, None, 7, use_target_features=False)
+    np.testing.assert_array_equal(y, np.eye(7))
+    np.testing.assert_array_equal(yr, y)
+    assert kind == 'known_target_identity'
+    with pytest.raises(ValueError, match='Disabled target features'):
+        qiao.qiao_target_inputs(y, yr, 7, use_target_features=False)
+    with pytest.raises(ValueError, match='requires aligned'):
+        qiao.qiao_target_inputs(None, None, 7, use_target_features=True)
+    penalties = (1e-4, 1e-3, 1e-2, .1, 1., 10.)
+    grid = qiao.qiao_candidate_grid(23, 23, y, yr, penalties=penalties, candidate_budget=12)
+    assert len(grid) == 12
+    assert {row['l2'] for row in grid} == set(penalties)
+    assert max(row['rank'] for row in grid) <= 7
+    assert grid == qiao.qiao_candidate_grid(23, 23, y, yr,
+                                           penalties=penalties, candidate_budget=12)
+
+
+def test_real_data_path_runs_id_comparators_and_resumes(tmp_path, monkeypatch):
+    prepared, settings, context = _inputs()
+    settings = replace(settings, use_target_features=False, candidate_budget=3, loss_rates=(0.,),
+        run_information_controls=False, run_random_forest=False,
+        run_mechanism_controls=False, run_calibration_controls=False)
+    prepared = replace(prepared, name='empirical-fixture', metadata={},
+        train_features=replace(prepared.train_features, Y_target=None),
+        refit_features=replace(prepared.refit_features, Y_target=None))
+    # Exercise the actual real-data branch, not merely the comparator helper.
+    events = []
+    output = pipeline._run_fold(prepared, 0, settings, tmp_path / 'cache', tmp_path / 'export',
+                                'source-fixture', on_progress=events.append)
+    names = {'Qiao-ID-squared', 'Qiao-ID-logit'}
+    assert {row['model'] for row in output['metrics']} >= names
+    chosen = [row for row in output['selected'] if row['model'] in names]
+    assert len(chosen) == 2
+    assert all(row['target_input_kind'] == 'known_target_identity' for row in chosen)
+    assert all(row['final_converged'] == row['converged'] for row in chosen)
+    assert {row['model'] for row in events if row['event'] == 'model_complete'} >= names
+    context = {**context, 'dataset': 'empirical-fixture'}
+    # With only the feature switch changed, helper fits must use the ID mode and
+    # reuse complete candidate/refit checkpoints on their second invocation.
+    first, _ = _run(prepared, settings, context, tmp_path / 'helper')
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Qiao resumed fit unexpectedly retrained')
+    monkeypatch.setattr(qiao, 'fit_qiao', forbidden)
+    second, tables = _run(prepared, settings, context, tmp_path / 'helper')
+    assert all(row['resumed'] for row in tables['selected'])
+    for name in names:
+        np.testing.assert_array_equal(first[name]['prediction'], second[name]['prediction'])

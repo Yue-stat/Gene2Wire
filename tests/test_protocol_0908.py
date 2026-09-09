@@ -37,8 +37,8 @@ def test_dimension_driven_ranks_and_uniform_target_feature_switch():
         assert all(model.use_target_features is enabled for model in chosen.models())
         assert sum(model.pu for model in chosen.models()) == 3
         assert chosen.tuning_config(16, 36).include_endpoints
-    with pytest.raises(ValueError, match="require USE_TARGET_FEATURES"):
-        replace(settings, run_qiao=True)
+    assert settings.run_qiao is True
+    assert replace(settings, run_qiao=True).use_target_features is False
 
 
 def test_real_data_scenarios_do_not_expand_to_control_cartesian_product():

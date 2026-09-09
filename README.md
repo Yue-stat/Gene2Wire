@@ -143,11 +143,20 @@ projection probability `p`, with observed probability `q = e_hat * p`. An ordina
 random forest is not a PU random forest. A higher-sensitivity assay reference is
 not complete anatomical truth.
 
-The optional Qiao comparison is disabled by default and restricted to simulation
-with declared target descriptors and a matched target-feature information budget.
-It distinguishes the original squared-error bilinear objective from a logistic
-adaptation. Native real-data target anatomy labels are not equivalent to the
-postsynaptic expression inputs of the original model.
+Qiao bilinear comparisons are enabled by default on every dataset's primary
+conditions. With target features disabled, `Qiao-ID-squared` and `Qiao-ID-logit`
+use one-hot known target IDs; they are explicitly named adaptations. With target
+features enabled, `Qiao-squared` and `Qiao-logit` use the same declared descriptors
+as the primary models. Squared-error and Bernoulli objectives remain distinct;
+neither comparator is a PU learner. Native real-data target anatomy labels are
+not equivalent to the original model's postsynaptic expression inputs.
+
+Default progress is one summary line per minute in `America/Los_Angeles` time.
+Its unit is one model at one repetition/fold/scenario, including selection and
+refit; optimizer candidates are recorded in detailed events rather than printed.
+Notebook reports show compact endpoint, information-budget and convergence
+summaries. Complete CSV/NPZ exports remain available, and
+`SHOW_FULL_DIAGNOSTICS=True` restores the full table display.
 
 ## Tests and development
 

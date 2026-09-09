@@ -48,7 +48,7 @@ def test_clean_valid_python_and_shared_defaults(name):
         "N_JOBS": 32, "N_REPETITIONS": 5, "STRATEGY": "full_joint",
         "RUN_INFORMATION_CONTROLS": True, "RUN_RANDOM_FOREST": True,
         "RUN_MECHANISM_CONTROLS": True, "RUN_CALIBRATION_CONTROLS": True,
-        "RUN_QIAO": False,
+        "RUN_QIAO": True,
     }.items():
         assert assignments[key] == expected
     joined = "\n".join(all_code)
@@ -96,12 +96,16 @@ def test_generated_results_only_skips_all_raw_and_fit_cells(name):
     assert "RESULTS_ONLY = False" in all_code
     assert "load_existing_exports(" in all_code
     assert "configure_full_display()" in all_code
-    assert "display_diagnostics(artifacts, label=label)" in all_code
+    assert "display_diagnostics(artifacts, label=label, full=SHOW_FULL_DIAGNOSTICS)" in all_code
+    assert "SHOW_FULL_DIAGNOSTICS = False" in all_code
+    assert "plot_information_budget_results(" in all_code
+    assert "RUN_QIAO = True" in all_code
+    assert "enabled in simulation only" not in all_code
     assert "plot_results(artifacts, output_dir=FIGURE_DIR)" in all_code
     assert "plot_benchmark_results(artifacts, output_dir=FIGURE_DIR, show=True)" in all_code
     assert "SHOW_PROGRESS = True" in all_code
-    assert "PROGRESS_LEVEL = 'model'" in all_code
-    assert "PROGRESS_INTERVAL_SECONDS = 30.0" in all_code
+    assert "PROGRESS_LEVEL = 'summary'" in all_code
+    assert "PROGRESS_INTERVAL_SECONDS = 60.0" in all_code
     run_calls = [node for node in ast.walk(ast.parse(all_code))
                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                  and node.func.id in {"run_experiment", "run_simulation_experiments"}]

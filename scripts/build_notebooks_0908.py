@@ -40,12 +40,13 @@ RUN_INFORMATION_CONTROLS = True
 RUN_RANDOM_FOREST = True
 RUN_MECHANISM_CONTROLS = True
 RUN_CALIBRATION_CONTROLS = True
-RUN_QIAO = False
+RUN_QIAO = True  # Target-ID adaptation when USE_TARGET_FEATURES=False; declared descriptors when True.
 
 # Display settings do not change scientific settings or invalidate fit checkpoints.
 SHOW_PROGRESS = True
-PROGRESS_LEVEL = 'model'  # Use 'trial' to also print individual tuning trials.
-PROGRESS_INTERVAL_SECONDS = 30.0
+PROGRESS_LEVEL = 'summary'  # One elapsed/finished/total/Los-Angeles-time line per minute.
+PROGRESS_INTERVAL_SECONDS = 60.0
+SHOW_FULL_DIAGNOSTICS = False  # True displays every saved trial, target table and manifest.
 
 BASE_DIR = Path('/home/yueyue/gene2wire').expanduser()
 RAW_DATA_DIR = BASE_DIR / 'raw_data'
@@ -172,13 +173,18 @@ import numpy as np
 import pandas as pd
 from IPython.display import display
 from gene2wire.experiments.pipeline import run_experiment, run_simulation_experiments
-from gene2wire.experiments.plotting import plot_results, plot_benchmark_results
+from gene2wire.experiments.plotting import (
+    plot_results, plot_benchmark_results, plot_information_budget_results,
+)
 from gene2wire.experiments.reporting import (
-    configure_full_display, display_diagnostics, load_existing_exports,
+    configure_compact_display, configure_full_display, display_diagnostics, load_existing_exports,
 )
 from gene2wire.tuning import full_joint_candidates
 
-configure_full_display()
+if SHOW_FULL_DIAGNOSTICS:
+    configure_full_display()
+else:
+    configure_compact_display()
 settings = Settings(
     n_outer_folds=N_OUTER_FOLDS, use_location=USE_LOCATION,
     use_target_features=USE_TARGET_FEATURES, n_jobs=N_JOBS,
@@ -189,7 +195,12 @@ settings = Settings(
     run_calibration_controls=RUN_CALIBRATION_CONTROLS,
     run_qiao=RUN_QIAO,
 )
-display(pd.DataFrame([asdict(settings)]).T.rename(columns={0: 'setting'}))
+if SHOW_FULL_DIAGNOSTICS:
+    display(pd.DataFrame([asdict(settings)]).T.rename(columns={0: 'setting'}))
+else:
+    print({'folds': N_OUTER_FOLDS, 'repetitions': N_REPETITIONS, 'n_jobs': N_JOBS,
+           'use_location': USE_LOCATION, 'use_target_features': USE_TARGET_FEATURES,
+           'strategy': STRATEGY, 'run_qiao': RUN_QIAO})
 if RESULTS_ONLY:
     all_artifacts = load_existing_exports(
         EXISTING_EXPORT_DIRS, expected_labels=EXPECTED_EXPORT_LABELS)
@@ -223,8 +234,9 @@ def preflight(dataset):
                            'feature_blocks': dict(features.feature_blocks),
                            'target_feature_columns': 0 if features.Y_target is None else features.Y_target.shape[1],
                            'natural_paired_assay': dataset.natural_observed is not None}]))
-    display(pd.DataFrame(roles))
-    display(pd.DataFrame([scalar_metadata]).T.rename(columns={0: 'dataset metadata'}))
+    if SHOW_FULL_DIAGNOSTICS:
+        display(pd.DataFrame(roles))
+        display(pd.DataFrame([scalar_metadata]).T.rename(columns={0: 'dataset metadata'}))
     tuning = settings.tuning_config(features.X.shape[1], len(dataset.target_ids))
     display(pd.DataFrame([
         {'model': model.name, 'strategy': settings.strategy,
@@ -241,11 +253,12 @@ def preflight(dataset):
                 'model': model.name, 'candidate_index': candidate_index,
                 **asdict(candidate),
             })
-    print('Exact bounded full-joint candidates for the first inner-training fold:')
-    print('For staged_rank_l2, this is grid support; realized adaptive trials are in tuning below.')
-    display(pd.DataFrame(actual_candidates))
-    print('Shared optimizer configuration:')
-    display(pd.DataFrame([asdict(settings.fit_config())]))
+    if SHOW_FULL_DIAGNOSTICS:
+        print('Exact bounded full-joint candidates for the first inner-training fold:')
+        print('For staged_rank_l2, this is grid support; realized adaptive trials are in tuning below.')
+        display(pd.DataFrame(actual_candidates))
+        print('Shared optimizer configuration:')
+        display(pd.DataFrame([asdict(settings.fit_config())]))
     print('Features above are fitted on inner-training cells only. Final refit uses the development cells.')
     print('Repeated masks share a biological dataset; they are not additional independent animals.')
     return folds
@@ -253,10 +266,10 @@ def preflight(dataset):
 
 
 FINAL = '''
-# Every selected configuration, tuning trial and exported metric is displayed.
-# Empty tables are explicit; rows, columns and cell widths are never truncated.
+# Endpoint metrics and compact selection/convergence diagnostics are the default.
+# All trial/per-target/prediction exports remain available on disk.
 for label, artifacts in all_artifacts.items():
-    display_diagnostics(artifacts, label=label)
+    display_diagnostics(artifacts, label=label, full=SHOW_FULL_DIAGNOSTICS)
 print('Figure PDFs:', FIGURE_DIR)
 print('Reusable raw cache:', RAW_DATA_DIR)
 print('Resumable checkpoints:', CHECKPOINT_DIR)
@@ -307,11 +320,11 @@ def dataset_cells(name):
             ("markdown", """**BARseq A1 and M1.** Both panels are fitted and reported separately.
             Location uses the native measured spatial covariates. Optional target features are
             anatomy descriptors derived from target names, not postsynaptic gene expression.
-            Qiao comparisons are reserved for the simulation's declared target descriptors."""),
+            With target features disabled, Qiao uses identity one-hot vectors and is explicitly
+            labelled `Qiao-ID-squared` / `Qiao-ID-logit`; it is an adaptation of the bilinear model.
+            With target features enabled, the Qiao comparison uses the same declared descriptors."""),
             ("code", '''
             from gene2wire.experiments.datasets.barseq import load_barseq
-            if RUN_QIAO:
-                raise ValueError('The Qiao comparison is enabled in simulation only; use RUN_QIAO=False here.')
             datasets = load_barseq(RAW_DATA_DIR / 'BARseq')
             PANELS = ('A1', 'M1')
             for panel in PANELS:
@@ -373,8 +386,7 @@ def dataset_cells(name):
     return [
         ("markdown", f"**Dataset inputs.** {description}"),
         ("code", textwrap.dedent(options).strip()),
-        ("code", "if RUN_QIAO:\n    raise ValueError('The Qiao comparison is enabled in simulation only; use RUN_QIAO=False here.')\n"
-         + textwrap.dedent(load).strip() + "\npreflight_folds = preflight(dataset)"),
+        ("code", textwrap.dedent(load).strip() + "\npreflight_folds = preflight(dataset)"),
         ("markdown", """**Run all configured repetitions.** Validated raw files are reused
         without downloading again. The shared pipeline checkpoints completed work and exports
         full fold/target/repetition metrics, selected settings, calibration diagnostics, and predictions."""),
@@ -411,7 +423,13 @@ def notebook(name, commit, source_hash):
 
         For completed results, set `RESULTS_ONLY=True` and fill `EXISTING_EXPORT_DIRS`
         with exact run directories. This skips raw-data loading and fitting, preserves the
-        saved scientific settings, and adds all figures and full diagnostic tables.
+        saved scientific settings, and adds all figures and concise diagnostics.
+        Set `SHOW_FULL_DIAGNOSTICS=True` only when you need every exported table.
+
+        Progress prints one summary per minute in Los Angeles local time. One unit is a
+        model at one repetition, fold and scenario, including selection and final refit.
+        All enabled baselines and controls enter the total. Detailed candidate events
+        remain in the exports; initial cache and final completion summaries appear once.
 
         Outputs are deliberately cleared. Earlier paper numbers remain provisional until
         the harmonized reruns and their diagnostics have been reviewed."""),
@@ -427,7 +445,11 @@ def notebook(name, commit, source_hash):
         residual-off endpoints are included in Joint's budget. Inner validation selects models;
         final preprocessing, calibration, and fitting use the designated development data.
         Mechanism/calibration stress tests are simulation controls. Every model shares each
-        scenario's observation mask and paired-reference subset."""),
+        scenario's observation mask and paired-reference subset.
+        Qiao runs on every dataset: `USE_TARGET_FEATURES=False` uses target identity one-hot
+        vectors, labelled `Qiao-ID-squared` / `Qiao-ID-logit` to distinguish this adaptation.
+        `USE_TARGET_FEATURES=True` uses the same declared target descriptors as the other models.
+        No target outcomes are used to construct these descriptors."""),
         ("code", SETTINGS),
         ("code", PREFLIGHT),
     ]
@@ -456,10 +478,23 @@ def notebook(name, commit, source_hash):
             benchmark_figure_paths[label] = plot_benchmark_results(artifacts, output_dir=FIGURE_DIR, show=True)
         display(benchmark_figure_paths)
         '''),
-        ("markdown", """**Complete diagnostics and reusable exports.** All result rows and columns
-        are displayed, including chosen parameters, each recorded trial, convergence, probability
-        calibration, per-target metrics, thinning and failures. Empty exports remain visible.
-        The saved manifest records the exact settings that produced these results."""),
+        ("markdown", """**Same paired-reference budget.** Independent logistic models compare
+        Reference-only, Calibrated PU (`PU` in saved tables), and Reference + PU. All use the same
+        paired cells, cell features, splits and tuning rules. The mixed arm uses each paired
+        reference outcome once; those entries do not also contribute detection loss.
+        Only actually recorded, matched conditions are plotted."""),
+        ("code", '''
+        information_budget_figure_paths = {}
+        for label, artifacts in all_artifacts.items():
+            information_budget_figure_paths[label] = plot_information_budget_results(
+                artifacts, output_dir=FIGURE_DIR, show=True)
+        display(information_budget_figure_paths)
+        '''),
+        ("markdown", """**Useful diagnostics and reusable exports.** The default report shows
+        endpoint metrics for every recorded method, selected-configuration frequencies, convergence,
+        candidate coverage and failures. Per-target metrics, every tuning trial, calibration tables,
+        and the saved run manifest remain in the export directory.
+        Set `SHOW_FULL_DIAGNOSTICS=True` to display these full tables."""),
         ("code", FINAL),
     ])
     return {"cells": [cell(kind, source, i) for i, (kind, source) in enumerate(parts)],

@@ -39,8 +39,8 @@ support and 32-candidate cap are unchanged. With target features disabled, Joint
 still has 6 direct, 13 low-rank and 13 shared-plus-residual candidates. Its 13
 low-rank endpoints do not contain every standalone MIRT candidate; exact
 endpoints therefore do not guarantee inclusion of MIRT's validation winner or
-superior held-out performance. Actual candidate tuples are printed before fits
-and recorded in tuning exports. Revised search results require fresh runs and
+superior held-out performance. Actual candidate tuples are recorded in tuning exports and are displayed
+before fits when `SHOW_FULL_DIAGNOSTICS=True`. Revised search results require fresh runs and
 must not be relabeled as outputs of the earlier flattened-grid protocol.
 
 `N_JOBS` controls hardware concurrency and is excluded from scientific identity.
@@ -199,13 +199,25 @@ restricted to the following scopes, rather than crossed with every dataset:
 | Observed-only/reference-only random forests | Natural endpoint or primary 0/80% endpoints |
 | Post-hoc sensitivity rescaling | Reuse observed-model predictions in target-constant SCAR/Target-SAR settings |
 | Fixed-predictor p/h ranking | Reuse saved primary predictions, without retraining |
-| Qiao comparisons | Optional, disabled by default; require target features for compared methods |
+| Qiao comparisons | Enabled by default on every primary rate/natural endpoint; target-ID adaptation when descriptors are disabled |
 
 Default scenario counts are one for natural paired data, five for each real-data
 thinning benchmark, seven for intermediate-sharing simulation, and eleven for
 zero/full-sharing simulation. The middle calibration fraction reuses the primary
 20% condition instead of adding a duplicate scenario. Information and RF controls
 are model-level additions at the stated endpoints, not extra missingness axes.
+
+Qiao's squared-error and logit variants use only observed training outcomes and
+the common observed-validation log-loss rule. When `USE_TARGET_FEATURES=False`,
+both use one-hot known target IDs and are explicitly exported as
+`Qiao-ID-squared` and `Qiao-ID-logit`. This does not enable external target
+features or supply additional outcome information. When target features are
+enabled, both use the same declared target descriptors as the other models and
+are named `Qiao-squared` and `Qiao-logit`. These are bilinear model-family
+comparisons, not a claim to reproduce the published paper's entire pipeline.
+Their rank/penalty candidates use the same outcome-independent balanced design,
+with at most 32 candidates per objective; the rank is bounded by available
+cell/target dimensions and target count. They remain non-PU comparators.
 
 New gene-panel masking, unseen-target prediction, complex neural multitask
 models, and additional shared/specific penalties are outside this freeze matrix.

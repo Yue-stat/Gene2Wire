@@ -1,4 +1,4 @@
-"""Complete notebook diagnostics and read-only reload of existing result exports.
+"""Compact notebook diagnostics and read-only reload of existing result exports.
 
 Reloading a result is deliberately separate from resuming fitting: an old export
 retains its own scientific settings and code identity. No dataset is downloaded,
@@ -32,6 +32,16 @@ def configure_full_display() -> None:
     pd.set_option("display.max_colwidth", None)
     pd.set_option("display.max_seq_items", None)
     pd.set_option("display.width", None)
+    pd.set_option("display.expand_frame_repr", False)
+
+
+def configure_compact_display() -> None:
+    """Display complete small summary tables; detailed exports stay on disk."""
+    pd.set_option("display.max_rows", 60)
+    pd.set_option("display.max_columns", 20)
+    pd.set_option("display.max_colwidth", 80)
+    pd.set_option("display.max_seq_items", 20)
+    pd.set_option("display.width", 140)
     pd.set_option("display.expand_frame_repr", False)
 
 
@@ -143,7 +153,156 @@ def diagnostic_summaries(tables: Mapping[str, pd.DataFrame]) -> dict[str, pd.Dat
     return output
 
 
+def _primary(frame: pd.DataFrame) -> pd.DataFrame:
+    return frame.loc[frame["analysis"].eq("primary")] if "analysis" in frame else frame
+
+
+def _endpoint(frame: pd.DataFrame) -> pd.DataFrame:
+    """Natural or largest recorded loss within each scenario/model, without averaging."""
+    frame = _primary(frame)
+    if frame.empty or "loss_rate" not in frame:
+        return frame
+    groups = [name for name in _CONTEXT if name in frame and name != "loss_rate"]
+    rates = pd.to_numeric(frame["loss_rate"], errors="coerce")
+    if not groups:
+        return frame.loc[rates.eq(rates.max()) | rates.isna()]
+    # Rates are selected separately per model so an endpoint-only baseline
+    # remains visible; the recorded rate is printed rather than assumed 80%.
+    maximum = frame.assign(_rate=rates).groupby(groups, dropna=False, observed=True)["_rate"].transform("max")
+    return frame.loc[rates.eq(maximum) | rates.isna()]
+
+
+def _final_status(frame: pd.DataFrame) -> pd.Series:
+    flags = frame.get("final_converged", pd.Series(index=frame.index, dtype=object))
+    # Older Qiao exports used the shorter key. Unknown RF status stays unknown.
+    if "converged" in frame:
+        flags = flags.combine_first(frame["converged"])
+    return _boolean_status(flags)
+
+
+def _configuration_signature(row: pd.Series) -> str:
+    fields = ("selected_structure", "kind", "rank", "shared_l2", "residual_l2",
+              "target_l2", "l2", "objective", "n_estimators", "min_samples_leaf",
+              "max_features", "max_depth")
+    short = {"selected_structure": "kind", "rank": "K", "shared_l2": "sh",
+             "residual_l2": "res", "target_l2": "tgt", "n_estimators": "trees",
+             "min_samples_leaf": "leaf", "max_features": "features", "max_depth": "depth"}
+    bits = []
+    for field in fields:
+        if field not in row:
+            continue
+        if field == "kind" and pd.notna(row.get("selected_structure")):
+            continue
+        value = row[field]
+        if pd.isna(value):
+            if field == "max_depth" and str(row.get("model", "")).startswith("RF"):
+                value = "unlimited"
+            else:
+                continue
+        bits.append(f"{short.get(field, field)}={value}")
+    return ", ".join(bits) or "not recorded"
+
+
+def compact_summaries(tables: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    """Small, explicitly scoped summaries; no raw trial/per-target/event tables."""
+    output = {}
+    aggregate = tables.get("aggregate", pd.DataFrame())
+    if not aggregate.empty:
+        endpoint = _endpoint(aggregate)
+        columns = [name for name in ("dataset", "sharing_strength", "mechanism", "loss_rate", "model",
+            "macro_auprc", "macro_log_loss", "macro_hidden_recall_at_h", "macro_brier",
+            "macro_predicted_prevalence", "macro_reference_prevalence") if name in endpoint]
+        for name in ("calibration_fraction", "calibration_spec"):
+            if name in endpoint and endpoint[name].nunique(dropna=False) > 1:
+                columns.insert(columns.index("model") if "model" in columns else 0, name)
+        output["primary_endpoint_metrics"] = endpoint.loc[:, columns].reset_index(drop=True)
+    selected = _primary(tables.get("selected", pd.DataFrame()))
+    tuning = _primary(tables.get("tuning", pd.DataFrame()))
+    groups = [name for name in ("dataset", "sharing_strength", "model") if name in selected]
+    if not selected.empty and groups:
+        rows = []
+        for key, frame in selected.groupby(groups, dropna=False, observed=True):
+            row = dict(zip(groups, key if isinstance(key, tuple) else (key,)))
+            row["final_fits"] = len(frame)
+            status = _final_status(frame)
+            row.update({name: int(status.eq(name).sum()) for name in ("converged", "not_converged", "not_recorded")})
+            frequency = frame.apply(_configuration_signature, axis=1).value_counts(sort=True)
+            row["unique_selected_configs"] = len(frequency)
+            row["most_selected_config"] = frequency.index[0]
+            row["mode_count"] = int(frequency.iloc[0])
+            rows.append(row)
+        output["selection_and_convergence_all_primary_rates"] = pd.DataFrame(rows)
+    all_selected = tables.get("selected", pd.DataFrame())
+    all_tuning = tables.get("tuning", pd.DataFrame())
+    status_rows = []
+    for label, frame, statuses in (
+        ("final fits", all_selected, _final_status(all_selected)),
+        ("candidate trials", all_tuning, _boolean_status(all_tuning.get("converged",
+            pd.Series(index=all_tuning.index, dtype=object))))):
+        if not frame.empty:
+            status_rows.append({"scope": "all scenarios", "records": label, "count": len(frame),
+                **{name: int(statuses.eq(name).sum()) for name in
+                   ("converged", "not_converged", "not_recorded")}})
+    if status_rows:
+        output["convergence_all_scenarios"] = pd.DataFrame(status_rows)
+    incomplete = all_selected.loc[_final_status(all_selected).eq("not_converged")]
+    if not incomplete.empty:
+        columns = [name for name in (*_CONTEXT, "repetition", "outer_fold", "rank",
+            "final_iterations", "validation_observed_log_loss") if name in incomplete]
+        output["nonconverged_final_fits_first_10_see_selected_csv"] = incomplete.loc[:, columns].head(10)
+    if not tuning.empty:
+        group_cols = [name for name in ("dataset", "sharing_strength", "model") if name in tuning]
+        if group_cols:
+            rows = []
+            for key, frame in tuning.groupby(group_cols, dropna=False, observed=True):
+                row = dict(zip(group_cols, key if isinstance(key, tuple) else (key,)))
+                row["recorded_trials"] = len(frame)
+                for column, target in (("rank", "unique_ranks"), ("shared_l2", "unique_shared_penalties"),
+                                       ("residual_l2", "unique_residual_penalties"), ("l2", "unique_bilinear_penalties")):
+                    if column in frame:
+                        row[target] = frame[column].nunique(dropna=True)
+                status = _boolean_status(frame["converged"]) if "converged" in frame else pd.Series("not_recorded", index=frame.index)
+                row["nonconverged_trials"] = int(status.eq("not_converged").sum())
+                rows.append(row)
+            output["candidate_coverage_all_primary_rates"] = pd.DataFrame(rows)
+    # Failure details must remain visible even when outside the primary analysis.
+    failures = tables.get("failures", pd.DataFrame())
+    if not failures.empty:
+        output["failed_units_first_10_see_failures_csv"] = failures.head(10).copy()
+    return output
+
+
 def display_diagnostics(artifacts, *, label: str | None = None,
+                        display_fn: Callable[[Any], Any] | None = None,
+                        full: bool = False) -> None:
+    """Show useful endpoint/selection diagnostics; opt in to every raw export."""
+    if display_fn is None:
+        from IPython.display import display
+        display_fn = display
+    if full:
+        return _display_full_diagnostics(artifacts, label=label, display_fn=display_fn)
+    configure_compact_display()
+    print(f"\n{label or 'Experiment'} — concise diagnostics", flush=True)
+    print(f"All result tables, predictions and settings: {artifacts.export_dir}", flush=True)
+    print("Metrics: largest recorded primary loss rate for each model (or natural paired labels). "
+          "Selection and convergence: all primary rates, folds and repetitions.", flush=True)
+    summaries = compact_summaries(artifacts.tables)
+    for name, frame in summaries.items():
+        print(f"\n{name}", flush=True)
+        display_fn(frame)
+    if "primary_endpoint_metrics" not in summaries:
+        print("No aggregate endpoint table was recorded; inspect metrics.csv for the original per-unit results.", flush=True)
+    failures = artifacts.tables.get("failures")
+    if failures is None:
+        print("Failure status was not recorded in this export.", flush=True)
+    elif failures.empty:
+        print("Recorded failed units: 0.", flush=True)
+    else:
+        print(f"Recorded failed units: {len(failures)}; see failures.csv for complete details.", flush=True)
+    print("Set SHOW_FULL_DIAGNOSTICS=True to display every saved table and the full manifest.", flush=True)
+
+
+def _display_full_diagnostics(artifacts, *, label: str | None = None,
                         display_fn: Callable[[Any], Any] | None = None) -> None:
     """Show all exports plus diagnostic summaries, without pandas truncation."""
     configure_full_display()

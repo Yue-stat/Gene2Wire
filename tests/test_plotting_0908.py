@@ -192,3 +192,107 @@ def test_benchmark_aggregation_respects_repeat_units_and_refuses_mixed_semantics
     with pytest.raises(ValueError, match="Duplicate model/loss estimates"):
         plot_benchmark_results(SimpleNamespace(tables={"aggregate": mixed}), tmp_path,
                                show=False, metrics=("macro_auprc",))
+
+
+def test_benchmark_curves_accept_readonly_numpy_views_without_mutating_results(tmp_path, monkeypatch):
+    """Emulate the immutable arrays returned by pandas copy-on-write modes."""
+    from gene2wire.experiments.plotting import plot_benchmark_results
+    figures = _capture_show(monkeypatch)
+    artifacts = _artifacts()
+    frame = artifacts.tables["aggregate"].query("analysis == 'primary'").copy()
+    frame.loc[frame["model"].eq("PU") & frame["loss_rate"].eq(.4), "macro_auprc"] = np.inf
+    artifacts.tables["aggregate"] = frame
+    original = frame.copy(deep=True)
+    to_numpy = pd.Series.to_numpy
+
+    def readonly(series, *args, **kwargs):
+        result = to_numpy(series, *args, **kwargs).copy()
+        result.setflags(write=False)
+        return result
+
+    monkeypatch.setattr(pd.Series, "to_numpy", readonly)
+    paths = plot_benchmark_results(artifacts, tmp_path)
+    assert len(paths) == 1
+    pu = next(line for line in figures[0].axes[0].lines if line.get_label() == "PU logistic")
+    assert np.isnan(pu.get_ydata()[2])
+    assert np.isfinite(pu.get_ydata()).sum() == 4
+    pd.testing.assert_frame_equal(frame, original)
+
+
+def _information_artifacts(*, simulation=False, natural=False):
+    artifacts = _artifacts(simulation=simulation, natural=natural,
+                           datasets=("simulation" if simulation else "Projection_TAGs" if natural else "BARseq_M1",))
+    base = artifacts.tables["aggregate"].query("analysis == 'primary' and model == 'PU'")
+    endpoint = base.loc[base["loss_rate"].isna() | base["loss_rate"].eq(.8)]
+    extras = [endpoint.assign(model="Reference-only", macro_auprc=.31),
+              endpoint.assign(model="Reference+PU", macro_auprc=.32)]
+    artifacts.tables["aggregate"] = pd.concat([artifacts.tables["aggregate"], *extras], ignore_index=True)
+    return artifacts
+
+
+def test_information_budget_compares_three_independent_arms_at_80_percent(tmp_path, monkeypatch):
+    from gene2wire.experiments.plotting import plot_information_budget_results
+    figures = _capture_show(monkeypatch)
+    artifacts = _information_artifacts()
+    # A low-loss PU score or another structure must never enter this contrast.
+    frame = artifacts.tables["aggregate"]
+    frame.loc[frame["loss_rate"].eq(.6), "macro_auprc"] = .99
+    paths = plot_information_budget_results(artifacts, tmp_path)
+    assert len(paths) == len(figures) == 1
+    assert all(path.parent.name == "information_budget" and path.suffix == ".pdf"
+               and path.read_bytes().startswith(b"%PDF") for path in paths.values())
+    assert len(figures[0].axes) == 3
+    axis = figures[0].axes[0]
+    assert [tick.get_text() for tick in axis.get_yticklabels()] == [
+        "Reference-only", "Calibrated PU", "Reference + PU"]
+    assert [line.get_label() for line in axis.lines] == [
+        "Reference-only", "Calibrated PU", "Reference + PU"]
+    assert [float(line.get_xdata()[0]) for line in axis.lines] == pytest.approx([.31, .23, .32])
+    assert "80%" in figures[0]._suptitle.get_text()
+    assert not list(tmp_path.rglob("*.png"))
+
+
+def test_information_budget_separates_simulation_rhos_and_paired_fractions(tmp_path, monkeypatch):
+    from gene2wire.experiments.plotting import plot_information_budget_results
+    figures = _capture_show(monkeypatch)
+    artifacts = _information_artifacts(simulation=True)
+    frame = artifacts.tables["aggregate"]
+    extra = frame.loc[frame["analysis"].eq("primary") & frame["loss_rate"].eq(.8)].assign(
+        calibration_fraction=.4, macro_auprc=.7)
+    artifacts.tables["aggregate"] = pd.concat([frame, extra], ignore_index=True)
+    paths = plot_information_budget_results(artifacts, tmp_path)
+    assert len(paths) == len(figures) == 6
+    assert sum("paired = 40%" in figure._suptitle.get_text() for figure in figures) == 3
+    for figure in figures:
+        if "paired = 40%" in figure._suptitle.get_text():
+            assert all(float(line.get_xdata()[0]) == .7 for line in figure.axes[0].lines)
+
+
+def test_information_budget_natural_missing_arms_and_undefined_metrics_are_explicit(tmp_path, monkeypatch):
+    from gene2wire.experiments.plotting import plot_information_budget_results
+    figures = _capture_show(monkeypatch)
+    artifacts = _information_artifacts(natural=True)
+    frame = artifacts.tables["aggregate"]
+    artifacts.tables["aggregate"] = frame.loc[frame["model"].ne("Reference+PU")].assign(
+        hidden_recall_at_h=np.nan)
+    paths = plot_information_budget_results(artifacts, tmp_path)
+    assert len(paths) == 1
+    assert "natural paired evaluation" in figures[0]._suptitle.get_text()
+    assert "80%" not in figures[0]._suptitle.get_text()
+    assert any(text.get_text() == "Not run" for text in figures[0].axes[0].texts)
+    assert len(figures[0].axes[0].lines) == 2
+    assert len(figures[0].axes[2].lines) == 0
+    assert sum(text.get_text() == "Undefined / unavailable" for text in figures[0].axes[2].texts) == 2
+
+
+def test_information_budget_never_substitutes_a_different_loss_or_mixes_semantics(tmp_path):
+    from gene2wire.experiments.plotting import plot_information_budget_results
+    artifacts = _information_artifacts()
+    frame = artifacts.tables["aggregate"]
+    artifacts.tables["aggregate"] = frame.loc[frame["loss_rate"].lt(.8)]
+    assert plot_information_budget_results(artifacts, tmp_path, show=False) == {}
+    duplicate = frame.loc[frame["analysis"].eq("primary") & frame["model"].eq("PU")
+                          & frame["loss_rate"].eq(.8)].assign(probability_semantics="other")
+    artifacts.tables["aggregate"] = pd.concat([frame, duplicate], ignore_index=True)
+    with pytest.raises(ValueError, match="Duplicate model estimates"):
+        plot_information_budget_results(artifacts, tmp_path, show=False)

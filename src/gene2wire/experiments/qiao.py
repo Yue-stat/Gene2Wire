@@ -2,7 +2,11 @@
 
 ``squared_error`` retains the notebook's linear bilinear response model;
 ``logit`` is its Bernoulli adaptation, with free, unpenalized target intercepts.
-Both require explicit cell and target covariates. Neither is a PU learner.
+Both use explicit cell inputs and an aligned target design. When measured target
+features are disabled, the experiment adapter supplies known-target one-hot
+indicators and labels the adaptation ``Qiao-ID``. This adds no external target
+information and does not support generalization to unseen targets. Neither is a
+PU learner.
 
 All empirical losses are MEANS over measured entries. The legacy squared-error
 notebook used SUM squared error: its penalty ``lambda_old`` corresponds to
@@ -25,6 +29,50 @@ from ..seeds import stable_seed
 
 _EPS = 1e-7
 _OBJECTIVES = ("logit", "squared_error")
+
+
+def qiao_model_names(use_target_features: bool) -> tuple[str, str]:
+    """Distinguish descriptor-based comparators from the known-target ID control."""
+    prefix = "Qiao" if use_target_features else "Qiao-ID"
+    return f"{prefix}-squared", f"{prefix}-logit"
+
+
+def qiao_target_inputs(train_features, refit_features, n_targets, *, use_target_features):
+    """Return authorized target designs without consulting any outcome matrix."""
+    if not isinstance(n_targets, int) or isinstance(n_targets, bool) or n_targets < 1:
+        raise ValueError("n_targets must be a positive integer")
+    if use_target_features:
+        if train_features is None or refit_features is None:
+            raise ValueError("Qiao target-feature mode requires aligned target covariates")
+        y = _array2d(train_features, "train target features")
+        yr = _array2d(refit_features, "refit target features")
+        if y.shape[0] != n_targets or yr.shape[0] != n_targets or not y.shape[1] or not yr.shape[1]:
+            raise ValueError("Qiao target features must align with the known target panel")
+        return y, yr, "target_features"
+    if train_features is not None or refit_features is not None:
+        raise ValueError("Disabled target features must not enter the Qiao-ID learner")
+    identity = np.eye(n_targets, dtype=float)
+    return identity, identity, "known_target_identity"
+
+
+def qiao_candidate_grid(n_train_features, n_refit_features, train_targets, refit_targets,
+                        *, penalties, candidate_budget):
+    """Bound rank by actual targets and choose an outcome-independent balanced grid."""
+    from ..candidate_design import select_balanced_candidates
+    from ..config import ModelConfig
+
+    y = _array2d(train_targets, "train target features")
+    yr = _array2d(refit_targets, "refit target features")
+    if not len(y) or len(y) != len(yr):
+        raise ValueError("Qiao train and refit target panels must have the same positive size")
+    maximum = min(n_train_features + 1, n_refit_features + 1,
+                  y.shape[1] + 1, yr.shape[1] + 1, len(y))
+    ranks = sorted({maximum, *(r for r in (1, 2, 4, 8, 16) if r <= maximum)})
+    candidates = [ModelConfig(name="Qiao", kind="lowrank", rank=rank,
+                              shared_l2=float(penalty), residual_l2=0., target_l2=0.)
+                  for rank in ranks for penalty in sorted(set(penalties))]
+    chosen = select_balanced_candidates(candidates, min(candidate_budget, 32))
+    return tuple({"rank": config.rank, "l2": config.shared_l2} for config in chosen)
 
 
 def _array2d(value: np.ndarray, name: str) -> np.ndarray:
@@ -175,8 +223,8 @@ def fit_qiao(
     d, w = _outcomes(D, W, (len(x), len(y)))
     if objective not in _OBJECTIVES:
         raise ValueError(f"objective must be one of {_OBJECTIVES}")
-    if isinstance(rank, bool) or int(rank) != rank or not 1 <= rank <= min(x.shape[1] + 1, y.shape[1] + 1):
-        raise ValueError("rank exceeds augmented cell or target feature dimensions")
+    if isinstance(rank, bool) or int(rank) != rank or not 1 <= rank <= min(x.shape[1] + 1, y.shape[1] + 1, len(y)):
+        raise ValueError("rank exceeds augmented feature dimensions or the known target count")
     if not np.isfinite(l2) or l2 < 0 or not np.isfinite(tolerance) or tolerance <= 0:
         raise ValueError("l2 must be nonnegative and tolerance positive")
     if maxiter <= 0 or init_direct_maxiter <= 0:
@@ -265,7 +313,7 @@ def tune_qiao(
     val_x, y = _array2d(validation_X, "validation_X"), _array2d(Y_target, "Y_target")
     val_d, val_w = _outcomes(validation_D, validation_mask, (len(val_x), len(y)))
     if candidates is None:
-        limit = min(np.asarray(train_X).shape[1] + 1, y.shape[1] + 1)
+        limit = min(np.asarray(train_X).shape[1] + 1, y.shape[1] + 1, len(y))
         ranks = sorted({r for r in (1, 2, 4, limit) if r <= limit})
         candidates = ({"rank": r, "l2": l2} for r in ranks for l2 in (3e-4, 3e-3, 3e-2))
     trials: list[QiaoTrial] = []

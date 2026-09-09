@@ -26,7 +26,7 @@ def settings(**changes):
                     maxiter=25, retry_maxiter=30, tolerance=1e-5,
                     init_direct_maxiter=20, loss_rates=(0.,),
                     run_random_forest=False, run_information_controls=False,
-                    run_mechanism_controls=False, run_calibration_controls=False)
+                    run_mechanism_controls=False, run_calibration_controls=False, run_qiao=False)
     return replace(base, **changes)
 
 

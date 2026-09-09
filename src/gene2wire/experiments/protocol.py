@@ -35,7 +35,7 @@ class Settings:
     run_random_forest: bool = True
     run_mechanism_controls: bool = True
     run_calibration_controls: bool = True
-    run_qiao: bool = False
+    run_qiao: bool = True
     calibration_fractions: tuple[float, ...] = (.1, .2, .4)
     protocol_version: str = PROTOCOL_VERSION
 
@@ -58,8 +58,6 @@ class Settings:
             raise ValueError("Penalties must be positive and finite")
         if any(not 0 < f < 1 for f in self.calibration_fractions):
             raise ValueError("Calibration fractions must lie between zero and one")
-        if self.run_qiao and not self.use_target_features:
-            raise ValueError("Qiao comparisons require USE_TARGET_FEATURES=True for all compared models")
 
     def scientific_dict(self):
         result = asdict(self)

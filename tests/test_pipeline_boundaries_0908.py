@@ -93,7 +93,7 @@ def _instrument(monkeypatch):
 def _settings():
     return Settings(n_jobs=1, n_repetitions=1, loss_rates=(.8,),
                     run_random_forest=False, run_mechanism_controls=False,
-                    run_calibration_controls=False)
+                    run_calibration_controls=False, run_qiao=False)
 
 
 def test_pipeline_compiles_disjoint_information_views_and_reuses_fold_local_masks(tmp_path, monkeypatch):

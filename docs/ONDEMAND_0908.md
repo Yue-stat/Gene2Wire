@@ -56,7 +56,7 @@ each worker are limited to one; avoid importing NumPy before the configuration
 cell applies those thread settings.
 
 The shared profile exposes the declared information-budget, RF, mechanism,
-calibration, and optional Qiao controls. Default mechanism/calibration stress
+calibration, and Qiao controls. Default mechanism/calibration stress
 tests are simulation-only; their switches do not add arbitrary new missingness
 axes to every real dataset. The complete matrix and search budgets are documented
 in [PROTOCOL_0908.md](PROTOCOL_0908.md).
@@ -89,8 +89,11 @@ held-out labels or target-positive rates.
 
 SPIDER, MERGE, and Projection-TAGs require external target descriptors to enable
 `USE_TARGET_FEATURES`. BARseq has optional label-derived anatomical descriptors;
-these are not postsynaptic gene expression. The optional Qiao comparison runs in
-simulation only, with `RUN_QIAO=True` and `USE_TARGET_FEATURES=True` together.
+these are not postsynaptic gene expression. `RUN_QIAO=True` is the default for
+all datasets. With target features off, it runs explicitly labelled
+`Qiao-ID-squared` / `Qiao-ID-logit` adapters using known target IDs. With the switch
+on, `Qiao-squared` / `Qiao-logit` receive the same declared target descriptors as
+the other models.
 
 The preflight cell reports input dimensions, feature blocks, split group IDs, and
 candidate counts before the expensive run cell. Inspect it after changing inputs
@@ -191,14 +194,14 @@ variables in the first configuration cell, restart the kernel, and Run All:
 ```python
 RESULTS_ONLY = True
 EXISTING_EXPORT_DIRS = {
-    'A1': BASE_DIR / 'paper_figure_exports/BARseq_A1_0908/9c6de5000d4e8a99e3b8',
-    'M1': BASE_DIR / 'paper_figure_exports/BARseq_M1_0908/8e3062511995d96ef8d7',
+    'A1': BASE_DIR / 'paper_figure_exports/BARseq_A1_0908/2186ba71a14924d025ce',
+    'M1': BASE_DIR / 'paper_figure_exports/BARseq_M1_0908/7c01c270e1dd788c8c0d',
 }
 ```
 
 The explicit run directories must exist on that machine. This mode reads their
 saved manifests and all CSVs, displays the existing plots plus new plots of all
-available benchmarks, and prints full diagnostics. It skips raw-data loading,
+available benchmarks, adds the same-information-budget plot, and prints concise diagnostics. It skips raw-data loading,
 preflight and training. The loaded run's saved protocol remains authoritative.
 Every benchmark actually present is plotted; disabled or unexecuted methods are
 not invented. Endpoint-only baselines use disconnected markers. Additional
@@ -208,23 +211,40 @@ For training, use `RESULTS_ONLY = False`. New progress switches are:
 
 ```python
 SHOW_PROGRESS = True
-PROGRESS_LEVEL = 'model'       # 'trial' also prints individual candidate finishes
-PROGRESS_INTERVAL_SECONDS = 30.0
+PROGRESS_LEVEL = 'summary'     # 'model' / 'trial' opt in to verbose event output
+PROGRESS_INTERVAL_SECONDS = 60.0
+SHOW_FULL_DIAGNOSTICS = False
 ```
 
-The initial inventory reports complete, compatible fold/repetition result
-checkpoints and remaining units. Completed unit summaries are accepted only
-when their exported predictions and audits still pass content checks. Remaining
-units can contain partial model/candidate caches; exact candidate hits, memory
-reuse and pending fits are reported when each model's identity is available.
-Final refit identities depend on model selection, so a global count of all final
-fits cannot be known before tuning. Worker events are relayed through the parent
-process and saved under the run's `progress/` directory and `progress_events.csv`.
-`checkpoint_inventory.csv` records the startup inventory. A heartbeat lists
-active model/scenario contexts even while one optimization is lengthy.
+Default progress prints one initial cache summary, one compact line per minute,
+and one completion summary. For example:
 
-The final notebook cells now display every row and column of all exported tables,
-including selected parameters, tuning trials, convergence, per-target metrics,
-calibration, failures and checkpoint diagnostics. These outputs can be large;
-they deliberately retain the user's requested complete display. Old clipped
-notebook displays can be regenerated from the full CSV exports without fitting.
+```text
+[running 1min] finished units 82/750, current time 2026-09-09 10:42:00 PDT
+```
+
+One unit is one model evaluation at a specified repetition, fold and scenario:
+its candidate search and final refit together. The denominator includes all
+planned primary, information-budget, RF, prevalence and Qiao models, including
+simulation control scenarios. Optimizer iterations and individual candidates
+are not separate units in this counter. A changed loss rate or calibration
+condition is a different scenario. Failed calibration is reported separately
+and never counted as a completed model evaluation. Los Angeles local time uses
+`America/Los_Angeles`, including daylight-saving transitions.
+
+The initial inventory counts model evaluations contained in fully verified
+fold/repetition result checkpoints. Incomplete folds can still reuse candidate
+and model checkpoints; their precise hits are recorded as each identity becomes
+available, without printing a line for every hit. Completed unit summaries are
+accepted only when their exported predictions and audits pass content checks.
+Worker events remain under `progress/` and in `progress_events.csv`;
+`checkpoint_inventory.csv` retains the initial counts.
+
+The final notebook report shows primary endpoint metrics for every recorded
+method, a direct comparison of the three independent information-budget arms,
+selected-configuration frequencies, convergence and candidate coverage. It shows
+only a small sample of failure details with complete failure counts. Full tuning,
+per-target, calibration and reliability tables remain in the CSV exports; set
+`SHOW_FULL_DIAGNOSTICS=True` to display them all. Existing exports can be replotted
+without fitting. New Qiao results require a new training run; loading older
+exports does not fabricate methods that were not run.
