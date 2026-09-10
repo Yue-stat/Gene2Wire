@@ -27,7 +27,7 @@ checkpoints, full metric tables, and predictions persist on disk.
 | [BARseq_0909.ipynb](BARseq_0909.ipynb) | A1 and M1 fitted and reported separately; within-animal depth holdout |
 
 The 0909 notebooks add a benchmark plot excluding direct reference-label training
-and default to full diagnostics. Earlier dated notebooks, including 0908, remain
+and default to bounded essential diagnostics. Earlier dated notebooks, including 0908, remain
 available with their original code pins. See [the 0909 update](docs/ONDEMAND_0909.md)
 for replotting existing exports without training. The scientific protocol and
 model selection rules are unchanged by this display update.
@@ -46,6 +46,7 @@ on held-out cells within represented groups:
 | [BARseq_M1_block_masking_0909.ipynb](BARseq_M1_block_masking_0909.ipynb) | Two artificial groups within M1's single animal |
 | [Projection_TAGs_block_masking_0909.ipynb](Projection_TAGs_block_masking_0909.ipynb) | Recorded animals, preserving native assay coverage |
 | [simulation_block_masking_0909.ipynb](simulation_block_masking_0909.ipynb) | Two artificial groups, sharing strengths 0/0.5/1 |
+| [SPIDER_block_masking_0909.ipynb](SPIDER_block_masking_0909.ipynb) | Two artificial groups; the current adapter has no verified animal IDs |
 
 These notebooks include a matched full-training-panel control and use separate
 checkpoints and result families. Default additional positive loss is zero;
@@ -61,7 +62,7 @@ USE_TARGET_FEATURES = False
 N_JOBS = 32
 N_REPETITIONS = 5
 STRATEGY = 'full_joint'
-SHOW_FULL_DIAGNOSTICS = True
+SHOW_FULL_DIAGNOSTICS = False
 ```
 
 `full_joint` searches simultaneous rank/penalty combinations from a deterministic
@@ -193,12 +194,12 @@ dashed lines indicate neither. Reference + PU logistic and both RF arms using
 paired references therefore have solid curves. Historical unrun rates remain
 gaps when loading old exports; new intermediate fits require a training run.
 Horizontal model dot panels are omitted by default; Projection-TAGs retains
-its paired-label audit, with model metrics in tables. Information-budget plots
+its paired-label audit and natural-condition horizontal model bars. Information-budget plots
 compare Reference + PU logistic, RF (observed + paired references), and
 Reference + PU-Joint in three metric panels. All use the same paired cells;
 RF learns mixed labels without detection correction. Recovery uses PU posterior
-scores for the PU models and RF scores for RF. Unrun/single-condition
-comparisons are skipped.
+scores for the PU models and RF scores for RF. Synthetic unrun/single-condition
+comparisons are skipped; natural paired comparisons do not invent a loss axis.
 
 Qiao bilinear comparisons are enabled by default on every dataset's primary
 conditions. With target features disabled, `Qiao-ID-squared` and `Qiao-ID-logit`
@@ -218,13 +219,15 @@ refit cache hit alone cannot classify the entire model as reused. Incomplete
 telemetry is explicitly unknown. `model_evaluation_plan.csv` lists the exact
 denominator and `model_cache_accounting.csv` records the completed-unit breakdown.
 Duplicate calibration fractions are rejected before scheduling.
-A separate notebook cell displays occupied/available worker slots in one live
-output, refreshed once per progress interval. Requested workers, scheduled pool
-size and detectable CPU allowance are distinct. Occupancy includes fitting,
-cache access and output writing; it is not machine-wide CPU utilization.
-Notebook reports display full diagnostics by default, including tuning and target
-tables. Set `SHOW_FULL_DIAGNOSTICS=False` for compact endpoint, information-budget
-and convergence summaries. Complete CSV/NPZ exports remain available in either mode.
+A separate notebook cell reports CPU capacity from the machine, process affinity,
+cgroup quotas and scheduler allocation metadata, refreshed once per progress
+interval. It reports this experiment's active workers separately. Allocation is
+not globally idle capacity; the notebook cannot count other jobs' unused CPUs.
+Notebook reports default to `SHOW_FULL_DIAGNOSTICS=False`: bounded aggregate
+metrics, important-model settings by repetition, convergence, calibration and
+matched block/control diagnostics. Omitted rows are explicitly counted. Set the
+switch to `True` only to display every raw table; that output can be large.
+Complete CSV/NPZ exports remain available in either mode.
 New exports include `joint_selection_diagnostics.csv`: per-unit candidate counts
 and best converged validation scores for direct, lowrank and joint candidates,
 plus the recorded selected family and its validation margin versus direct.

@@ -56,7 +56,7 @@ RUN_QIAO = True  # Target-ID adaptation when USE_TARGET_FEATURES=False; declared
 SHOW_PROGRESS = True
 PROGRESS_LEVEL = 'summary'  # One elapsed/finished/total/Los-Angeles-time line per minute.
 PROGRESS_INTERVAL_SECONDS = 60.0
-SHOW_FULL_DIAGNOSTICS = True  # False switches to compact summaries.
+SHOW_FULL_DIAGNOSTICS = False  # True opts into every raw table; output can be large.
 
 BASE_DIR = Path('/home/yueyue/gene2wire').expanduser()
 RAW_DATA_DIR = BASE_DIR / 'raw_data'
@@ -293,7 +293,7 @@ def preflight(dataset):
 
 
 FINAL = '''
-# Full saved diagnostics display by default; set SHOW_FULL_DIAGNOSTICS=False for summaries.
+# Compact essential diagnostics display by default; raw tables remain exported.
 # Trial/per-target/prediction exports also remain available on disk.
 for label, artifacts in all_artifacts.items():
     display_diagnostics(artifacts, label=label, full=SHOW_FULL_DIAGNOSTICS)
@@ -478,8 +478,10 @@ def notebook(name, commit, source_hash, date_suffix=None):
 
         For completed results, set `RESULTS_ONLY=True` and fill `EXISTING_EXPORT_DIRS`
         with exact run directories. This skips raw-data loading and fitting, preserves the
-        saved scientific settings, and adds all figures and full diagnostics.
-        `SHOW_FULL_DIAGNOSTICS=True` is the default; set it to `False` for compact summaries.
+        saved scientific settings, and adds figures and essential diagnostics.
+        `SHOW_FULL_DIAGNOSTICS=False` is the default. The compact report bounds output while
+        retaining key metrics, selected settings and failure/convergence evidence. Set it to
+        `True` only when every raw table is needed; the resulting output can be large.
 
         Progress prints one summary per minute in Los Angeles local time. One unit is a
         model at one repetition, fold and scenario, including selection and final refit.
@@ -512,14 +514,14 @@ def notebook(name, commit, source_hash, date_suffix=None):
         `USE_TARGET_FEATURES=True` uses the same declared target descriptors as the other models.
         No target outcomes are used to construct these descriptors."""),
         ("code", SETTINGS),
-        ("markdown", """## Worker usage and available slots
+        ("markdown", """## CPU allocation and live experiment workers
 
         This cell creates a single live output, refreshed once per progress interval while
-        the experiment runs. It reports occupied and available slots in this experiment's
-        scheduled worker pool, alongside requested workers and the detectable CPU allowance.
-        Occupied workers may be fitting, reading caches or writing outputs; this is not CPU
-        utilization or a count of free CPUs across other jobs. Cached work and the number of
-        pending tasks can reduce the scheduled pool below `N_JOBS`."""),
+        the experiment runs. It reports the kernel CPU allowance and detectable machine,
+        affinity, scheduler and cgroup allocation limits. This experiment's active workers
+        are shown separately from hardware capacity. Other users' idle CPUs on the node
+        cannot be inferred from this notebook. Requested `N_JOBS` and active workers do not
+        establish the number of CPUs allocated by OnDemand."""),
         ("code", WORKER_STATUS),
         ("markdown", "## Define input and split checks"),
         ("code", PREFLIGHT),
@@ -535,7 +537,8 @@ def notebook(name, commit, source_hash, date_suffix=None):
 
         Curves retain the complete configured
         loss-rate grid. Simulation includes all three sharing strengths; BARseq includes both panels.
-        The natural Projection-TAGs analysis retains its paired-label audit; no model dot panels are drawn.
+        Natural Projection-TAGs shows its paired-label audit and categorical model comparisons;
+        no artificial positive-loss axis or model dot panels are drawn.
         No PNG files are written."""),
         ("code", '''
         for label, artifacts in all_artifacts.items():
@@ -548,7 +551,7 @@ def notebook(name, commit, source_hash, date_suffix=None):
         Both Prevalence methods are excluded; reference-only logistic is included.
         Reference + PU logistic/MIRT/Joint use the same direct paired-reference supervision.
         Older exports retain gaps where fits were not run. Single-condition model dot plots are
-        omitted, including natural Projection-TAGs model comparisons; its paired audit remains.
+        omitted. Natural Projection-TAGs model comparisons use horizontal bars.
         Existing primary figures above are retained. Figures display here and save as PDF."""),
         ("code", '''
         benchmark_figure_paths = {}
@@ -564,7 +567,8 @@ def notebook(name, commit, source_hash, date_suffix=None):
         Reference-only, all Reference + PU variants, RF (paired references), and RF (observed
         + paired references) are excluded from this figure. They remain in the plots above.
         Solid lines use PU or sensitivity calibration; other methods use dashed lines.
-        Figures display here and save as PDF. Natural and single-rate model dot panels remain off."""),
+        Figures display here and save as PDF. Natural paired comparisons use bars;
+        synthetic single-rate model dot panels remain off."""),
         ("code", '''
         detection_only_figure_paths = {}
         for label, artifacts in all_artifacts.items():
@@ -579,8 +583,8 @@ def notebook(name, commit, source_hash, date_suffix=None):
         loss on the remaining O. RF uses reference labels on C and raw observed labels on O,
         with ordinary supervised training. Each method uses each projection outcome once;
         all share the same authorized paired cells, features and splits. Other methods remain
-        in the all-benchmark curves above. Only recorded multi-rate comparisons are plotted;
-        natural and single-rate settings remain in the exported metric tables."""),
+        in the all-benchmark curves above. Recorded multi-rate comparisons use curves, and natural
+        paired comparisons use bars. Synthetic single-rate results remain in the tables."""),
         ("code", '''
         information_budget_figure_paths = {}
         for label, artifacts in all_artifacts.items():
@@ -588,19 +592,20 @@ def notebook(name, commit, source_hash, date_suffix=None):
                 artifacts, output_dir=FIGURE_DIR, show=True)
         display(information_budget_figure_paths)
         '''),
-        ("markdown", """## Full diagnostics and reusable exports
+        ("markdown", """## Essential diagnostics and reusable exports
 
         The report shows
-        endpoint metrics for every recorded method, selected-configuration frequencies, convergence,
-        candidate coverage and failures. Per-target metrics, every tuning trial, calibration tables,
-        and the saved run manifest display by default and remain in the export directory. `model_evaluation_plan.csv`
+        aggregate endpoint metrics, important model curves and selected configurations by repetition,
+        convergence, calibration and failures with bounded output. Per-target metrics, every tuning
+        trial and the saved run manifest remain in the export directory. `model_evaluation_plan.csv`
         lists every unit in the progress denominator; `model_cache_accounting.csv` distinguishes
         restored results, reused fits, and new/mixed fitting. An unchecked cache is not counted
         as a cache miss. Progress still prints one line per minute.
         `joint_selection_diagnostics.csv` reports the candidate-family counts, converged
         validation minima and the selected model's margin over its own direct endpoint.
         Full diagnostics can also compute this table from older exports without fitting.
-        Set `SHOW_FULL_DIAGNOSTICS=False` to show only the compact diagnostic summaries."""),
+        `SHOW_FULL_DIAGNOSTICS=False` is the default. Set it to `True` only to display every raw
+        table; that option can produce very large notebook output."""),
         ("code", FINAL),
     ])
     return {"cells": [cell(kind, source, i, date_suffix) for i, (kind, source) in enumerate(parts)],

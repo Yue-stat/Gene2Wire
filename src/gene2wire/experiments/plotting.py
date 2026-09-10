@@ -253,28 +253,30 @@ def _paired_audit(axis, audit):
     axis.set_axisbelow(True)
 
 
-def _natural_main(frame, audit, destination, *, show):
+def _natural_main(frame, audit, destination, *, show, dots=False):
+    comparison_panel = _dot_panel if dots else _benchmark_bars
     if audit is not None and not audit.empty:
         figure, axes = plt.subplots(2, 2, figsize=(10.5, 7.5))
         _paired_audit(axes[0, 0], audit)
         axes[0, 0].set_title("A   Paired-label audit", loc="left", pad=9)
         for axis, metric, letter in zip((axes[0, 1], axes[1, 0], axes[1, 1]),
                                        ("macro_log_loss", "macro_auprc", "hidden_recall_at_h"), "BCD"):
-            _dot_panel(axis, frame, metric)
+            comparison_panel(axis, frame, metric, models=MODEL_ORDER)
             axis.set_xlabel(_metric_title(metric))
             axis.set_title(f"{letter}   Natural paired evaluation", loc="left", pad=9)
         figure.tight_layout(h_pad=2.2, w_pad=2.8)
     else:
         figure, axes = plt.subplots(1, 3, figsize=(11.6, 3.8))
         for axis, metric, letter in zip(axes, PRIMARY_METRICS, "ABC"):
-            _dot_panel(axis, frame, metric)
+            comparison_panel(axis, frame, metric, models=MODEL_ORDER)
             axis.set_xlabel(_metric_title(metric))
             axis.set_title(f"{letter}   Natural paired evaluation", loc="left", pad=9)
         figure.tight_layout(w_pad=2.5)
     _save_display(figure, destination, show)
 
 
-def _probability_dashboard(frame, destination, *, show, simulation=False, natural=False):
+def _probability_dashboard(frame, destination, *, show, simulation=False, natural=False,
+                           dots=False):
     rhos = (sorted(pd.to_numeric(frame["sharing_strength"], errors="coerce").dropna().unique())
             if simulation else [None])
     figure, axes = plt.subplots(len(rhos), 2, squeeze=False,
@@ -285,7 +287,8 @@ def _probability_dashboard(frame, destination, *, show, simulation=False, natura
         for column, metric in enumerate(("macro_log_loss", "macro_predicted_prevalence")):
             axis = axes[row, column]
             if natural:
-                _dot_panel(axis, selected, metric)
+                comparison_panel = _dot_panel if dots else _benchmark_bars
+                comparison_panel(axis, selected, metric, models=MODEL_ORDER)
                 axis.set_xlabel(_metric_title(metric))
             else:
                 _curve(axis, selected, metric, MODEL_ORDER)
@@ -320,8 +323,9 @@ def plot_results(artifacts: Any, output_dir: str | Path, *, show: bool = True,
     ``artifacts`` provides ``tables`` and ``manifest`` attributes, as returned
     by the shared pipeline. Empty result tables produce an empty mapping. No
     artificial loss-rate axis is fabricated for naturally paired datasets.
-    Their paired-label audit is retained, but horizontal model-comparison dots
-    are omitted unless ``show_single_condition_dots=True`` is requested.
+    Natural paired results use categorical bars alongside the paired-label
+    audit. Horizontal model-comparison dots are used only when
+    ``show_single_condition_dots=True`` is requested.
     """
     frame = _aggregate(artifacts.tables)
     if frame.empty:
@@ -356,21 +360,14 @@ def plot_results(artifacts: Any, output_dir: str | Path, *, show: bool = True,
                 main = directory / f"{stem}_results_0908.pdf"
                 if natural:
                     dataset_audit = audit.loc[audit["dataset"].eq(dataset)] if not audit.empty and "dataset" in audit else audit
-                    if not show_single_condition_dots:
-                        if dataset_audit is not None and not dataset_audit.empty:
-                            figure, axis = plt.subplots(figsize=(6.5, max(3.4, .38 * len(dataset_audit) + 1.)))
-                            _paired_audit(axis, dataset_audit)
-                            axis.set_title("Paired-label audit", loc="left", pad=9)
-                            figure.tight_layout()
-                            _save_display(figure, main, show)
-                            paths[f"{stem}_primary"] = main
-                        continue
-                    _natural_main(selected, dataset_audit, main, show=show)
+                    _natural_main(selected, dataset_audit, main, show=show,
+                                  dots=show_single_condition_dots)
                 else:
                     _real_curves(selected, main, show=show)
                 paths[f"{stem}_primary"] = main
                 probability = directory / f"{stem}_probability_0908.pdf"
-                _probability_dashboard(selected, probability, show=show, natural=natural)
+                _probability_dashboard(selected, probability, show=show, natural=natural,
+                                       dots=show_single_condition_dots)
                 paths[f"{stem}_probability"] = probability
                 if include_all_models and not natural:
                     all_models = directory / f"{stem}_all_models_0908.pdf"
@@ -526,6 +523,48 @@ def _benchmark_dots(axis, frame, metric, models):
                   ha="center", va="center", color="#777777", fontsize=9)
 
 
+def _benchmark_bars(axis, frame, metric, models):
+    """Render a natural paired comparison without inventing a loss-rate axis.
+
+    Bars start at zero, so visual length represents the reported metric.
+    Observed-label-only models are hatched; PU or paired-reference methods use
+    solid fills. Undefined metrics retain their labeled row rather than being
+    converted to zeros or silently dropping a method.
+    """
+    present = tuple(model for model in models if model in set(frame["model"]))
+    any_data = False
+    for index, model in enumerate(present):
+        values = (pd.to_numeric(frame.loc[frame["model"].eq(model), metric], errors="coerce")
+                  if metric in frame else pd.Series([np.nan]))
+        if len(values) != 1:
+            raise ValueError("Natural comparison bars require one estimate per model and scientific setting")
+        value = float(values.iloc[0])
+        if not np.isfinite(value):
+            continue
+        style = _benchmark_style(model, present)
+        observed_only = _benchmark_linestyle(model) == "--"
+        axis.barh(index, value, height=.62, color=style["color"],
+                  edgecolor="white" if observed_only else style["color"],
+                  linewidth=.7, hatch="///" if observed_only else None,
+                  alpha=.83, label=style["label"], zorder=3)
+        axis.annotate(f"{value:.4f}", (value, index), xytext=(4, 0),
+                      textcoords="offset points", va="center", fontsize=8,
+                      color="#444444")
+        any_data = True
+    _style_axis(axis, loss_axis=False)
+    axis.set_yticks(np.arange(len(present)), [_BENCHMARK_LABELS.get(model, model) for model in present])
+    axis.set_ylim(len(present) - .5, -.5)
+    axis.set_xlim(left=0)
+    if any_data:
+        axis.set_xlim(right=axis.get_xlim()[1] * 1.20)
+    axis.grid(False, axis="y")
+    axis.grid(axis="x", color="#E6E6E6", linewidth=.6)
+    axis.xaxis.set_major_locator(MaxNLocator(nbins=4))
+    if not any_data:
+        axis.text(.5, .5, "No defined estimates", transform=axis.transAxes,
+                  ha="center", va="center", color="#777777", fontsize=9)
+
+
 def _benchmark_legend_handles(axes, models):
     """Show line styles only when a plotted panel contains a visible segment."""
     from matplotlib.lines import Line2D
@@ -559,9 +598,10 @@ def plot_benchmark_results(artifacts: Any, output_dir: str | Path, *,
     drawn for each dataset, sharing strength, analysis, mechanism, paired
     fraction and calibration specification: no controls are averaged into
     primary estimates. Three or more measured loss rates produce curves;
-    endpoint-only models have disconnected markers. Natural and single-rate
-    comparisons are omitted by default; ``show_single_condition_dots=True``
-    enables the legacy horizontal model-comparison panels. Exported model names
+    endpoint-only models have disconnected markers. Natural paired comparisons
+    use categorical bars; synthetic single-rate comparisons are omitted by
+    default. ``show_single_condition_dots=True`` enables the legacy horizontal
+    model-comparison panels. Exported model names
     are discovered dynamically, excluding the retired Prevalence arms.
     Solid lines use PU or paired references; other methods use dashed lines.
 
@@ -595,7 +635,8 @@ def plot_detection_only_benchmark_results(
     ``output_dir/detection_only_benchmarks`` and are displayed when ``show`` is
     true. Controls retain separate settings, and natural or single-rate model
     dot panels stay disabled unless explicitly requested. Plotting reads the
-    existing result tables and requires no model refitting.
+    existing result tables and requires no model refitting. Naturally paired
+    datasets use categorical bars instead of an artificial loss-rate curve.
     """
     frame = _benchmark_aggregate(artifacts.tables)
     if not frame.empty:
@@ -645,7 +686,7 @@ def _plot_benchmark_frame(frame: pd.DataFrame, directory: Path, *, show: bool,
                             if "loss_rate" in selected else np.array([]))
             natural = scope.get("mechanism") == "natural" or len(finite_rates) == 0
             curves = not natural and len(finite_rates) > 1
-            if not curves and not show_single_condition_dots:
+            if not curves and not natural and not show_single_condition_dots:
                 continue
             simulation = pd.notna(scope.get("sharing_strength", np.nan))
             title_parts = []
@@ -689,10 +730,14 @@ def _plot_benchmark_frame(frame: pd.DataFrame, directory: Path, *, show: bool,
                 figure, axes = plt.subplots(1, count, squeeze=False,
                     figsize=(5.6 * count, max(3.4, .30 * len(models) + 1.1)))
                 for axis, metric in zip(axes[0], metrics):
-                    _benchmark_dots(axis, selected, metric, models)
+                    comparison_panel = _benchmark_dots if show_single_condition_dots else _benchmark_bars
+                    comparison_panel(axis, selected, metric, models)
                     axis.set_xlabel(_benchmark_metric_title(metric, simulation=simulation))
                 figure.suptitle(title, fontsize=10, y=.995)
-                figure.text(.5, .01, "Means over folds and repetitions; no diagnostic confidence intervals.",
+                explanation = ("" if show_single_condition_dots else
+                               "Solid: PU or paired references; hatched: neither. ")
+                figure.text(.5, .01, explanation +
+                            "Means over folds and repetitions; no diagnostic confidence intervals.",
                             ha="center", va="bottom", fontsize=8, color="#555555")
                 figure.tight_layout(rect=(0, .04, 1, .94), w_pad=2.)
             _save_display(figure, destination, show)
@@ -716,8 +761,8 @@ def plot_information_budget_results(artifacts: Any, output_dir: str | Path, *,
     therefore target the mixed-label probability. Recovery uses PU posterior
     scores for the PU methods and raw RF scores for RF.
     Missing model/rate combinations are never interpolated. Natural paired
-    evaluations and single-rate settings remain in the exported tables and do
-    not create horizontal model-comparison dot panels.
+    evaluations use categorical bars; synthetic single-rate settings remain in
+    the exported tables and do not create horizontal comparison dot panels.
     """
     frame = _primary(_benchmark_aggregate(artifacts.tables))
     if frame.empty:
@@ -739,7 +784,8 @@ def plot_information_budget_results(artifacts: Any, output_dir: str | Path, *,
                                  "keep distinct scientific configurations in separate artifacts")
             rates = (pd.to_numeric(selected["loss_rate"], errors="coerce").dropna().unique()
                      if "loss_rate" in selected else np.array([]))
-            if scope.get("mechanism") == "natural" or len(rates) < 2:
+            natural = scope.get("mechanism") == "natural" or len(rates) == 0
+            if not natural and len(rates) < 2:
                 continue
             available = set(selected["model"].dropna())
             if not set(_INFORMATION_ARMS).issubset(available):
@@ -754,25 +800,27 @@ def plot_information_budget_results(artifacts: Any, output_dir: str | Path, *,
                 title_parts.append(f"paired = {float(fraction):.0%}")
             title_parts.append("Same paired-reference budget")
             figure, axes = plt.subplots(1, len(PRIMARY_METRICS), squeeze=False,
-                                        figsize=(12.4, 4.1))
+                                        figsize=(16.8, 3.5) if natural else (12.4, 4.1))
             for axis, metric in zip(axes[0], PRIMARY_METRICS):
                 if metric in selected:
-                    _benchmark_curve(axis, selected, metric, models)
+                    comparison_panel = _benchmark_bars if natural else _benchmark_curve
+                    comparison_panel(axis, selected, metric, models)
                 else:
-                    _style_axis(axis)
+                    _style_axis(axis, loss_axis=not natural)
                     axis.text(.5, .5, "No defined estimates", transform=axis.transAxes,
                               ha="center", va="center", fontsize=9, color="#777777")
                 axis.set_title(_metric_title(metric, simulation=simulation), loc="left", pad=9)
-            handles = _benchmark_legend_handles(axes[0], models)
-            figure.legend(handles, [_BENCHMARK_LABELS[model] for model in models],
-                          loc="upper center", bbox_to_anchor=(.5, .94), frameon=False,
-                          ncol=len(models), handlelength=2.5, columnspacing=1.6, fontsize=9)
+            if not natural:
+                handles = _benchmark_legend_handles(axes[0], models)
+                figure.legend(handles, [_BENCHMARK_LABELS[model] for model in models],
+                              loc="upper center", bbox_to_anchor=(.5, .94), frameon=False,
+                              ncol=len(models), handlelength=2.5, columnspacing=1.6, fontsize=9)
             figure.suptitle(" · ".join(title_parts), fontsize=10, y=.995)
             figure.text(.5, .012, "Same paired cells, features and splits. Means over folds and repetitions; "
                         "missing fits are not interpolated.\n"
                         "Recovery uses PU posterior scores for PU models and RF scores for RF.",
                         ha="center", va="bottom", fontsize=8, color="#555555")
-            figure.tight_layout(rect=(0, .075, 1, .85), w_pad=2.)
+            figure.tight_layout(rect=(0, .10 if natural else .075, 1, .90 if natural else .85), w_pad=2.)
             stem = "__".join(f"{label}_{_slug(value)}" for label, value in scope.items()
                               if pd.notna(value)) or "results"
             destination = directory / f"{stem}__information_budget_0908.pdf"

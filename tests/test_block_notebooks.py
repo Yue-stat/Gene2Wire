@@ -9,7 +9,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-NAMES = ("BARseq_A1", "BARseq_M1", "Projection_TAGs", "simulation")
+NAMES = ("BARseq_A1", "BARseq_M1", "Projection_TAGs", "simulation", "SPIDER")
 
 
 def builder():
@@ -58,12 +58,12 @@ def test_shared_settings_and_correct_group_source(name):
         "USE_LOCATION": False, "USE_TARGET_FEATURES": False,
         "STRATEGY": "full_joint", "PAIRED_FRACTION": .2,
         "BLOCK_FRACTIONS": (.2, .4, .6, .8), "POSITIVE_LOSS_RATES": (0.,),
-        "INCLUDE_FULL_PANEL_CONTROL": True, "SHOW_FULL_DIAGNOSTICS": True,
+        "INCLUDE_FULL_PANEL_CONTROL": True, "SHOW_FULL_DIAGNOSTICS": False,
         "RUN_INFORMATION_CONTROLS": True, "RUN_RANDOM_FOREST": True, "RUN_QIAO": True,
     }.items():
         assert namespace[key] == expected
     assert namespace["GROUP_MODE"] == (
-        "artificial" if name in {"BARseq_M1", "simulation"} else "animal")
+        "artificial" if name in {"BARseq_M1", "simulation", "SPIDER"} else "animal")
 
 
 def test_location_switch_reaches_simulation_truth_and_settings():
@@ -80,3 +80,22 @@ def test_block_notebook_uses_public_execution_api():
     for name in ("run_block_experiment", "run_block_simulation_experiments", "preview_block_experiment"):
         assert callable(getattr(block_experiment, name))
     assert callable(block_plotting.plot_block_results)
+
+
+def test_spider_reuses_shared_loader_and_never_infers_animal_ids():
+    nb = builder().notebook("SPIDER", "a" * 40, "b" * 64, "0909")
+    code = "\n".join(c["source"] for c in nb["cells"] if c["cell_type"] == "code")
+    prose = "\n".join(c["source"] for c in nb["cells"] if c["cell_type"] == "markdown")
+    assert "from gene2wire.experiments.datasets.spider import load_spider" in code
+    assert "target_features_csv=TARGET_FEATURES_CSV" in code
+    assert "group_mode=GROUP_MODE" in code
+    assert "no verified animal IDs" in prose
+    assert "not relabelled as animals" in prose
+
+
+@pytest.mark.parametrize("name", NAMES)
+def test_block_report_calls_shared_bounded_report_instead_of_dumping_raw_tables(name):
+    nb = builder().notebook(name, "a" * 40, "b" * 64, "0909")
+    final = nb["cells"][-1]["source"]
+    assert "display_diagnostics(artifacts, label=label, full=SHOW_FULL_DIAGNOSTICS)" in final
+    assert "for name in names" not in final

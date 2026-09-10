@@ -51,7 +51,7 @@ def test_clean_valid_python_and_shared_defaults(name):
         "RUN_INFORMATION_CONTROLS": True, "RUN_RANDOM_FOREST": True,
         "RUN_MECHANISM_CONTROLS": True, "RUN_CALIBRATION_CONTROLS": True,
         "RUN_QIAO": True, "PAIRED_FRACTION": .2,
-        "SHOW_FULL_DIAGNOSTICS": True,
+        "SHOW_FULL_DIAGNOSTICS": False,
     }.items():
         assert assignments[key] == expected
     joined = "\n".join(all_code)
@@ -100,7 +100,7 @@ def test_generated_results_only_skips_all_raw_and_fit_cells(name):
     assert "load_existing_exports(" in all_code
     assert "configure_full_display()" in all_code
     assert "display_diagnostics(artifacts, label=label, full=SHOW_FULL_DIAGNOSTICS)" in all_code
-    assert "SHOW_FULL_DIAGNOSTICS = True" in all_code
+    assert "SHOW_FULL_DIAGNOSTICS = False" in all_code
     assert "plot_detection_only_benchmark_results(" in all_code
     assert "plot_information_budget_results(" in all_code
     assert "RUN_QIAO = True" in all_code

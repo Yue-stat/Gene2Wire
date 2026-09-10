@@ -87,9 +87,11 @@ def test_natural_audit_pooled_ratio_and_no_artificial_loss_axis(tmp_path, monkey
         "target": ["t1", "t2"], "standard_positive_count": [1, 3],
         "reference_positive_count": [2, 10], "relative_detection": [.5, .3]})
     plot_results(artifacts, tmp_path)
-    assert len(figures) == 1
-    assert len(figures[0].axes) == 1
+    assert len(figures) == 2
+    assert len(figures[0].axes) == 4
     assert any("33.3%" in text.get_text() for text in figures[0].axes[0].texts)
+    assert all(len(axis.patches) == len(MODEL_ORDER) for axis in figures[0].axes[1:])
+    assert not any(axis.lines for axis in figures[0].axes[1:])
     assert not any(axis.get_xlabel() == "Positive-label loss" for figure in figures for axis in figure.axes)
 
 
@@ -234,8 +236,13 @@ def test_benchmark_natural_all_models_no_loss_axis_and_undefined_scores(tmp_path
     artifacts = _artifacts(natural=True, datasets=("Projection_TAGs",))
     artifacts.tables["aggregate"] = artifacts.tables["aggregate"].query("analysis == 'primary'").copy()
     artifacts.tables["aggregate"]["hidden_recall_at_h"] = np.nan
-    assert plot_benchmark_results(artifacts, tmp_path) == {}
-    assert figures == []
+    paths = plot_benchmark_results(artifacts, tmp_path)
+    assert len(paths) == len(figures) == 1
+    assert len(figures[0].axes[0].patches) == len(MODEL_ORDER)
+    assert len(figures[0].axes[2].patches) == 0
+    assert not any(axis.lines for axis in figures[0].axes)
+    assert any(text.get_text() == "No defined estimates" for text in figures[0].axes[2].texts)
+    figures.clear()
     paths = plot_benchmark_results(artifacts, tmp_path, show_single_condition_dots=True)
     assert len(paths) == 1
     assert all(axis.get_xlabel() != "Positive-label loss" for axis in figures[0].axes)
@@ -336,10 +343,16 @@ def test_information_budget_separates_simulation_rhos_and_paired_fractions(tmp_p
             assert all(np.all(line.get_ydata() == .7) for line in figure.axes[0].lines)
 
 
-def test_information_budget_omits_natural_single_rate_and_incomplete_comparisons(tmp_path, monkeypatch):
+def test_information_budget_natural_bars_and_omitted_synthetic_single_rate_or_incomplete_comparisons(tmp_path, monkeypatch):
     from gene2wire.experiments.plotting import plot_information_budget_results
     figures = _capture_show(monkeypatch)
-    assert plot_information_budget_results(_information_artifacts(natural=True), tmp_path) == {}
+    natural_paths = plot_information_budget_results(_information_artifacts(natural=True), tmp_path)
+    assert len(natural_paths) == len(figures) == 1
+    for axis in figures[0].axes:
+        assert len(axis.patches) == 3
+        assert not axis.lines
+        assert axis.get_xlabel() != "Positive-label loss"
+    figures.clear()
     artifacts = _information_artifacts()
     frame = artifacts.tables["aggregate"]
     artifacts.tables["aggregate"] = frame.loc[frame["loss_rate"].eq(.8)]
@@ -385,11 +398,17 @@ def test_information_budget_never_mixes_probability_semantics(tmp_path):
         plot_information_budget_results(artifacts, tmp_path, show=False)
 
 
-def test_natural_plot_results_without_audit_does_not_fabricate_comparisons(tmp_path, monkeypatch):
+def test_natural_plot_results_without_audit_renders_reported_metrics_as_bars(tmp_path, monkeypatch):
     figures = _capture_show(monkeypatch)
     artifacts = _artifacts(natural=True, datasets=("Projection_TAGs",))
-    assert plot_results(artifacts, tmp_path) == {}
-    assert figures == []
+    paths = plot_results(artifacts, tmp_path)
+    assert len(paths) == len(figures) == 2
+    assert len(figures[0].axes) == 3
+    for axis in figures[0].axes:
+        assert len(axis.patches) == len(MODEL_ORDER)
+        assert not axis.lines
+        assert not axis.collections
+    figures.clear()
     paths = plot_results(artifacts, tmp_path, show_single_condition_dots=True)
     assert len(paths) == len(figures) == 2
     assert len(figures[0].axes) == 3
@@ -443,12 +462,22 @@ def test_detection_only_benchmarks_filter_training_labels_keep_calibration_and_e
     assert any("Paired references may calibrate detection" in text.get_text() for text in figure.texts)
 
 
-def test_detection_only_benchmarks_omit_natural_single_rate_and_excluded_only_tables(
+def test_detection_only_benchmarks_natural_bars_omit_synthetic_single_rate_and_excluded_only_tables(
         tmp_path, monkeypatch):
     from gene2wire.experiments.plotting import plot_detection_only_benchmark_results
 
     figures = _capture_show(monkeypatch)
-    assert plot_detection_only_benchmark_results(_information_artifacts(natural=True), tmp_path) == {}
+    natural_artifacts = _information_artifacts(natural=True)
+    natural_artifacts.tables["aggregate"] = natural_artifacts.tables["aggregate"].query("analysis == 'primary'")
+    natural_paths = plot_detection_only_benchmark_results(natural_artifacts, tmp_path)
+    assert len(natural_paths) == len(figures) == 1
+    for axis in figures[0].axes:
+        labels = [label.get_text() for label in axis.get_yticklabels()]
+        assert "RF (observed labels)" in labels
+        assert not any("Reference" in label or "paired" in label for label in labels)
+        assert len(axis.patches) == len(MODEL_ORDER) + 1
+        assert not axis.lines
+    figures.clear()
     artifacts = _information_artifacts()
     frame = artifacts.tables["aggregate"]
     artifacts.tables["aggregate"] = frame.loc[frame["loss_rate"].eq(.8)]

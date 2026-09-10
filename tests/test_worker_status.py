@@ -7,9 +7,23 @@ import pytest
 from gene2wire.experiments.pipeline import _run_scenario_group
 from gene2wire.experiments.progress import ProgressRelay
 from gene2wire.experiments.workers import NotebookWorkerStatus, worker_capacity, _format_worker_status
+from gene2wire.experiments.workers import _cgroup_cpu_quota, _scheduler_allocations
 
 
-def test_cpu_allowance_is_diagnostic_and_not_cluster_availability(monkeypatch):
+@pytest.fixture
+def controlled_capacity(monkeypatch):
+    """Tests must not inherit CPU quotas or scheduler variables from CI."""
+    for variable in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE", "PBS_NUM_PPN",
+                     "PBS_NP", "NSLOTS", "SLURM_JOB_CPUS_PER_NODE"):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setattr("gene2wire.experiments.workers.os.cpu_count", lambda: 64)
+    monkeypatch.setattr("gene2wire.experiments.workers.os.sched_getaffinity",
+                        lambda _: set(range(16)), raising=False)
+    monkeypatch.setattr("gene2wire.experiments.workers._cgroup_cpu_quota", lambda: None)
+    monkeypatch.setattr("gene2wire.experiments.workers.cpu_count", lambda: 16)
+
+
+def test_cpu_allowance_is_diagnostic_and_not_cluster_availability(monkeypatch, controlled_capacity):
     monkeypatch.setenv("SLURM_CPUS_PER_TASK", "8")
     with patch("gene2wire.experiments.workers.cpu_count", return_value=12):
         capacity = worker_capacity(32)
@@ -24,10 +38,80 @@ def test_cpu_allowance_is_diagnostic_and_not_cluster_availability(monkeypatch):
         assert worker_capacity(32)["slurm_cpus_per_task"] is None
     rendered = _format_worker_status({**capacity, "worker_slots": 15,
         "occupied_workers": 10, "available_workers": 5, "phase": "running"})
-    assert "Workers using 10/15; available 5/15" in rendered
-    assert "Requested: 32" in rendered and "allowance: 8" in rendered
+    assert "Experiment workers running: 10 (pool size: 15)" in rendered
+    assert "configured N_JOBS: 32" in rendered and "allowance: 8" in rendered
+    assert "Machine logical CPUs: 64" in rendered and "kernel CPU affinity: 16" in rendered
+    assert "8 CPUs / task (SLURM_CPUS_PER_TASK)" in rendered
     assert "scheduling is unchanged" in rendered
-    assert "not free CPUs on the cluster" in rendered
+    assert "Globally idle CPUs on this shared node: unknown" in rendered
+    assert "available 5/15" not in rendered and "scheduled slots" not in rendered
+
+
+def test_fractional_quota_is_not_reported_as_idle_worker_slots(monkeypatch, controlled_capacity):
+    monkeypatch.setattr("gene2wire.experiments.workers._cgroup_cpu_quota", lambda: 1.5)
+    capacity = worker_capacity(2)
+    assert capacity["cgroup_cpu_quota"] == capacity["detected_cpu_allowance"] == 1.5
+    assert capacity["globally_idle_cpus"] is None
+    assert capacity["requested_exceeds_cpu_allowance"]
+    rendered = _format_worker_status(capacity)
+    assert "allowance: 1.5 CPU equivalents" in rendered
+    assert "Scheduler allocation: unknown" in rendered
+
+
+def test_scheduler_scopes_and_heterogeneous_node_allocation(monkeypatch, controlled_capacity):
+    monkeypatch.setenv("SLURM_JOB_CPUS_PER_NODE", "32(x2),16")
+    assert _scheduler_allocations() == []  # Cannot know the notebook's node.
+    monkeypatch.setenv("SLURM_JOB_CPUS_PER_NODE", "32(x2),32")
+    assert _scheduler_allocations()[0]["cpus"] == 32
+    monkeypatch.setenv("SLURM_CPUS_ON_NODE", "12")
+    assert _scheduler_allocations() == [
+        {"variable": "SLURM_CPUS_ON_NODE", "scope": "node", "cpus": 12}]
+    assert worker_capacity(8)["detected_cpu_allowance"] == 12
+    monkeypatch.setenv("NSLOTS", "6")
+    assert worker_capacity(8)["detected_cpu_allowance"] == 6
+    assert {"variable": "NSLOTS", "scope": "job", "cpus": 6} in _scheduler_allocations()
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "0")
+    monkeypatch.setenv("PBS_NP", "-1")
+    monkeypatch.setenv("PBS_NUM_PPN", "garbage")
+    assert len(_scheduler_allocations()) == 2
+
+
+def test_unknown_capacity_is_explicit_and_does_not_stop_notebook(monkeypatch, controlled_capacity):
+    monkeypatch.setattr("gene2wire.experiments.workers.os.cpu_count", lambda: None)
+    def unavailable(*args):
+        raise OSError("unavailable")
+    monkeypatch.setattr("gene2wire.experiments.workers.os.sched_getaffinity", unavailable)
+    monkeypatch.setattr("gene2wire.experiments.workers.cpu_count", unavailable)
+    capacity = worker_capacity(32)
+    assert capacity["detected_cpu_allowance"] is None
+    assert not capacity["requested_exceeds_cpu_allowance"]
+    assert "Kernel CPU allowance: unknown" in _format_worker_status(capacity)
+
+
+def test_process_cgroup_quota_uses_strictest_ancestor(monkeypatch):
+    files = {
+        "/proc/self/cgroup": "0::/ondemand/session\n",
+        "/sys/fs/cgroup/cpu.max": "max 100000",
+        "/sys/fs/cgroup/ondemand/cpu.max": "150000 100000",
+        "/sys/fs/cgroup/ondemand/session/cpu.max": "200000 100000",
+    }
+    monkeypatch.setattr("gene2wire.experiments.workers._read_text", lambda path: files.get(str(path)))
+    assert _cgroup_cpu_quota() == 1.5
+
+
+def test_v1_cgroup_quota_and_unlimited_fallback(monkeypatch):
+    files = {
+        "/proc/self/cgroup": "3:cpu,cpuacct:/job\n",
+        "/sys/fs/cgroup/cpu,cpuacct/job/cpu.cfs_quota_us": "400000",
+        "/sys/fs/cgroup/cpu,cpuacct/job/cpu.cfs_period_us": "100000",
+    }
+    monkeypatch.setattr("gene2wire.experiments.workers._read_text", lambda path: files.get(str(path)))
+    assert _cgroup_cpu_quota() == 4
+    files["/sys/fs/cgroup/cpu,cpuacct/job/cpu.cfs_quota_us"] = "-1"
+    assert _cgroup_cpu_quota() is None
+    files.clear()
+    files["/proc/self/cgroup"] = "0::/../../outside\n"
+    assert _cgroup_cpu_quota() is None
 
 
 def test_latest_worker_event_wins_across_files_and_model_boundaries(tmp_path):

@@ -1,7 +1,7 @@
 # Group × target block experiment (0909)
 
 These are independent experiments; the dated primary notebooks are preserved.
-All four use the existing core estimators, information-budget baselines, tuning
+All five use the existing core estimators, information-budget baselines, tuning
 rules and feature adapters. There are no dataset-specific model patches.
 
 | Notebook | Groups | Interpretation |
@@ -10,6 +10,7 @@ rules and feature adapters. There are no dataset-specific model patches.
 | `BARseq_M1_block_masking_0909.ipynb` | Two balanced artificial groups within one animal | Controlled group-panel experiment, not two-animal validation |
 | `Projection_TAGs_block_masking_0909.ipynb` | Recorded animals, retaining native assay coverage | Additional structural blocks over the naturally incomplete assay |
 | `simulation_block_masking_0909.ipynb` | Two artificial groups for each generated dataset | Controlled test across sharing strengths 0, 0.5 and 1 |
+| `SPIDER_block_masking_0909.ipynb` | Two balanced artificial groups | Controlled within-group test; no verified animal IDs in the processed adapter |
 
 ## Masking and splits
 
@@ -35,6 +36,15 @@ pairs hidden. With two equally sized groups and full native coverage, selecting
 target counts and the actual hidden pair/block fractions are exported. Original
 off-panel entries are never scored. Targets unique to one group remain visible
 but are ineligible for artificial masking.
+
+Increasing this x-axis adds targets to the partial panel. It does not increase
+the fraction of groups hidden for an already selected target. With two groups,
+that target loses one group at every setting. Each setting can also evaluate a
+different mix of targets. A roughly constant model gap, or a decreasing raw log
+loss along this axis, is therefore not evidence of a masking error or an
+improvement caused by removing labels. The compact report computes matched
+masked/full losses and the change in each structured model's advantage over PU
+using the same repetition, fold and test entries before aggregation.
 
 Each repetition splits cells within each group into three outer test folds.
 Within each fold, 20% of development cells per group form inner validation;
@@ -119,8 +129,11 @@ available in their original notebooks.
 ## Reuse, progress and exports
 
 Defaults: 32 requested workers, three folds, five repetitions, `full_joint`,
-32 candidates per method, full diagnostics, and one progress line per minute
-in Los Angeles time. The notebook's worker-status cell reports active slots.
+32 candidates per method, bounded essential diagnostics, and one progress line
+per minute in Los Angeles time. `SHOW_FULL_DIAGNOSTICS=False` retains small,
+fully rendered aggregate metric/configuration tables and explicit omission counts;
+setting it to `True` opts into every raw table. The worker cell reports CPU
+allowance and allocation metadata separately from this experiment's active workers.
 The expensive unit is a model with tuning/refit at one repetition, fold and
 training-panel/detection setting; the full control is not counted as a new fit
 for every evaluation fraction. Actual execution capacity depends on scheduled

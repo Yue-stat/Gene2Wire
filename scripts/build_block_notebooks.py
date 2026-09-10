@@ -17,7 +17,7 @@ _spec = importlib.util.spec_from_file_location(
     "_gene2wire_notebook_common", ROOT / "scripts" / "build_notebooks_0908.py")
 _common = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_common)
-NAMES = ("BARseq_A1", "BARseq_M1", "Projection_TAGs", "simulation")
+NAMES = ("BARseq_A1", "BARseq_M1", "Projection_TAGs", "simulation", "SPIDER")
 
 
 CONFIG = '''
@@ -52,7 +52,7 @@ RUN_QIAO = True
 SHOW_PROGRESS = True
 PROGRESS_LEVEL = 'summary'
 PROGRESS_INTERVAL_SECONDS = 60.0
-SHOW_FULL_DIAGNOSTICS = True
+SHOW_FULL_DIAGNOSTICS = False  # True opts into every raw table; output can be large.
 
 BASE_DIR = Path('/home/yueyue/gene2wire').expanduser()
 RAW_DATA_DIR = BASE_DIR / 'raw_data'
@@ -82,7 +82,7 @@ from gene2wire.experiments.block_experiment import (
 )
 from gene2wire.experiments.block_plotting import plot_block_results
 from gene2wire.experiments.reporting import (
-    configure_full_display, configure_compact_display, load_existing_exports,
+    configure_full_display, configure_compact_display, load_existing_exports, display_diagnostics,
 )
 from gene2wire.tuning import full_joint_candidates
 
@@ -107,8 +107,15 @@ block_config = BlockMaskConfig(
     validation_fraction=VALIDATION_FRACTION,
     include_full_panel_control=INCLUDE_FULL_PANEL_CONTROL,
 )
-display(pd.DataFrame([asdict(settings)]).T.rename(columns={0: 'shared settings'}))
-display(pd.DataFrame([asdict(block_config)]).T.rename(columns={0: 'block design'}))
+if SHOW_FULL_DIAGNOSTICS:
+    display(pd.DataFrame([asdict(settings)]).T.rename(columns={0: 'shared settings'}))
+    display(pd.DataFrame([asdict(block_config)]).T.rename(columns={0: 'block design'}))
+else:
+    print({'folds': N_OUTER_FOLDS, 'repetitions': N_REPETITIONS, 'n_jobs': N_JOBS,
+           'use_location': USE_LOCATION, 'use_target_features': USE_TARGET_FEATURES,
+           'paired_fraction': PAIRED_FRACTION, 'block_fractions': BLOCK_FRACTIONS,
+           'positive_loss_rates': POSITIVE_LOSS_RATES, 'group_mode': GROUP_MODE,
+           'full_panel_control': INCLUDE_FULL_PANEL_CONTROL})
 if RESULTS_ONLY:
     all_artifacts = load_existing_exports(
         EXISTING_EXPORT_DIRS, expected_labels=EXPECTED_EXPORT_LABELS)
@@ -134,7 +141,10 @@ def preflight_blocks(dataset):
     }]))
     display(pd.Series(groups).value_counts().rename_axis('group').to_frame('cells'))
     print('Repetition 0 design; actual fractions account for rounded target counts and native coverage:')
-    display(design.summary)
+    summary_columns = ['block_fraction', 'n_eligible_targets', 'n_selected_targets',
+                       'realized_eligible_target_fraction', 'n_hidden_pairs',
+                       'realized_pair_fraction', 'duplicate_of_fraction']
+    display(design.summary if SHOW_FULL_DIAGNOSTICS else design.summary[summary_columns])
     display(pd.DataFrame([
         {'fold': f.outer_fold, 'inner_train': len(f.train_rows),
          'validation': len(f.validation_rows), 'test': len(f.test_rows),
@@ -159,19 +169,7 @@ def preflight_blocks(dataset):
 
 DIAGNOSTICS = '''
 for label, artifacts in all_artifacts.items():
-    print(f'{label}: {artifacts.export_dir}')
-    display(pd.DataFrame([{'table': name, 'rows': len(frame), 'columns': len(frame.columns)}
-                          for name, frame in artifacts.tables.items()]))
-    names = (list(artifacts.tables) if SHOW_FULL_DIAGNOSTICS else
-             ['block_summary', 'aggregate', 'selected', 'failures'])
-    for name in names:
-        frame = artifacts.tables.get(name)
-        if frame is not None:
-            print(f'{name}: {len(frame)} rows')
-            display(frame)
-    if SHOW_FULL_DIAGNOSTICS:
-        import json
-        print(json.dumps(artifacts.manifest, indent=2, default=str))
+    display_diagnostics(artifacts, label=label, full=SHOW_FULL_DIAGNOSTICS)
 print('PDF figures:', FIGURE_DIR)
 print('Persistent checkpoints:', CHECKPOINT_DIR)
 print('Reusable raw data:', RAW_DATA_DIR)
@@ -186,13 +184,15 @@ def notebook(name, commit, source_hash, date_suffix=None):
     if name not in NAMES:
         raise ValueError(f"Unknown block notebook: {name}")
     date_suffix = _common.release_date(date_suffix)
-    artificial = name in {"BARseq_M1", "simulation"}
+    artificial = name in {"BARseq_M1", "simulation", "SPIDER"}
     label = {"BARseq_A1": "A1", "BARseq_M1": "M1",
-             "Projection_TAGs": "Projection-TAGs", "simulation": "simulation"}[name]
+             "Projection_TAGs": "Projection-TAGs", "simulation": "simulation", "SPIDER": "SPIDER"}[name]
     modules = ["numpy", "scipy", "pandas", "sklearn", "joblib", "threadpoolctl",
                "matplotlib", "yaml", "IPython"]
     if name == "Projection_TAGs":
         modules += ["rdata", "openpyxl"]
+    elif name == "SPIDER":
+        modules.append("rdata")
     config = (CONFIG.replace("__GROUP_MODE__", "artificial" if artificial else "animal")
               .replace("__DATE__", date_suffix).replace("__COMMIT__", commit)
               .replace("__HASH__", source_hash).replace("__EXPORT_DIRS__", repr({label: None})))
@@ -202,6 +202,7 @@ def notebook(name, commit, source_hash, date_suffix=None):
         "BARseq_M1": "M1 contains one biological animal. Two balanced, seeded artificial groups test the controlled panel-missingness mechanism; they are not independent animals.",
         "Projection_TAGs": "Projection-TAGs uses recorded animal IDs and preserves the native assay mask. Only targets measured in at least two animals are eligible. Standard detections remain natural; the union reference is an imperfect evaluation reference.",
         "simulation": "Each repetition generates independent data for each sharing strength. Two balanced artificial groups allow known low-rank structure to be tested under partial target panels.",
+        "SPIDER": "The current processed SPIDER adapter exposes slices but no verified animal IDs. Two balanced artificial groups test partial target panels while retaining all input genes. These groups are not animals, and slices are not relabelled as animals.",
     }[name]
     parts = [
         ("markdown", f"""# Gene2Wire {name}: group × target blocks — OnDemand {date_suffix}
@@ -227,7 +228,11 @@ def notebook(name, commit, source_hash, date_suffix=None):
         exports remain under `/home/yueyue/gene2wire/paper_figure_exports`. Figures display here
         and save as PDF only. Every code cell has a table-of-contents section.
         To redraw completed results, set `RESULTS_ONLY=True` and supply exact saved run directories.
-        Progress reports once per minute; the worker cell reports active and available slots."""),
+        Compact diagnostics are the default: key aggregate metrics, selected configurations,
+        convergence and control comparisons stay visible, while raw tables remain exported.
+        Set `SHOW_FULL_DIAGNOSTICS=True` only when complete output is needed.
+        Progress reports once per minute; the worker cell reports CPU allowance and allocation
+        metadata separately from this experiment's active workers."""),
         ("markdown", "## Run configuration and masking strength"), ("code", config),
         ("markdown", "## Load and verify the frozen shared core"), ("code", _common.BOOTSTRAP),
         ("markdown", """## Shared model and block settings
@@ -238,7 +243,12 @@ def notebook(name, commit, source_hash, date_suffix=None):
         entries. Nonzero optional positive loss uses simple SCAR, separately from structural masks.
         Qiao uses target identity when target features are disabled; enabling the switch requires
         the adapter's declared outcome-independent target descriptors."""), ("code", SETTINGS),
-        ("markdown", "## Live worker usage"), ("code", _common.WORKER_STATUS),
+        ("markdown", """## CPU allocation and live experiment workers
+
+        Reports the kernel CPU allowance and detectable machine, affinity, scheduler and cgroup
+        allocation limits. This experiment's active workers are shown separately. Other users'
+        idle CPUs on the node cannot be inferred from this notebook."""),
+        ("code", _common.WORKER_STATUS),
         ("markdown", "## Preview design and tuning candidates"), ("code", PREFLIGHT),
     ]
     if name.startswith("BARseq"):
@@ -262,6 +272,24 @@ def notebook(name, commit, source_hash, date_suffix=None):
                     RAW_DATA_DIR / 'Projection_TAGs',
                     location_features_csv=LOCATION_FEATURES_CSV,
                     target_features_csv=TARGET_FEATURES_CSV)
+                preflight_blocks(dataset)
+            """)),
+        ]
+    elif name == "SPIDER":
+        parts += [
+            ("markdown", """## SPIDER target features and artificial groups
+
+            The original fully measured target panel is used. Location uses native spatial
+            covariates when enabled. Target features require an aligned, outcome-independent
+            numeric CSV. Artificial groups are balanced by cell IDs and seed; their allocation
+            never uses expression, projections or cell type. This is a within-group new-cell
+            experiment, distinct from the primary SPIDER spatial holdout."""),
+            ("code", "TARGET_FEATURES_CSV = None"),
+            ("markdown", "## Load cached SPIDER inputs and preview the panel masks"),
+            ("code", guarded("""
+                from gene2wire.experiments.datasets.spider import load_spider
+                dataset = load_spider(
+                    RAW_DATA_DIR / 'SPIDER', target_features_csv=TARGET_FEATURES_CSV)
                 preflight_blocks(dataset)
             """)),
         ]
@@ -332,7 +360,12 @@ def notebook(name, commit, source_hash, date_suffix=None):
          "    figure_paths[label] = plot_block_results(\n"
          "        artifacts, output_dir=FIGURE_DIR, show=True, include_benchmarks=True)\n"
          "display(figure_paths)"),
-        ("markdown", "## Export inventory, mask audits, metrics and selected hyperparameters"),
+        ("markdown", """## Essential results and selected hyperparameters
+
+        The default report bounds output and retains aggregate metrics, important-model
+        selections by repetition, convergence, calibration and matched block/control diagnostics.
+        It states when rows are omitted. Every raw table remains exported;
+        `SHOW_FULL_DIAGNOSTICS=True` explicitly opts into large output."""),
         ("code", DIAGNOSTICS),
     ]
     return {"cells": [_common.cell(kind, source, i, date_suffix)
