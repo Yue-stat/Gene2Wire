@@ -39,6 +39,7 @@ class Settings:
     run_qiao: bool = True
     calibration_fractions: tuple[float, ...] = (.2,)
     protocol_version: str = PROTOCOL_VERSION
+    supervision_profile: str = "paired_reference"
 
     def __post_init__(self):
         for field in ("n_outer_folds", "n_jobs", "n_repetitions", "candidate_budget",
@@ -52,8 +53,12 @@ class Settings:
             raise ValueError("Unknown tuning strategy")
         if self.parallel_unit not in {"scenario", "fold"}:
             raise ValueError("parallel_unit must be 'scenario' or 'fold'")
-        if not 0 < self.paired_fraction < 1:
-            raise ValueError("paired_fraction must lie strictly between zero and one")
+        if self.supervision_profile not in {"paired_reference", "assay_only"}:
+            raise ValueError("supervision_profile must be 'paired_reference' or 'assay_only'")
+        minimum_ok = (self.paired_fraction >= 0 if self.supervision_profile == "assay_only"
+                      else self.paired_fraction > 0)
+        if not minimum_ok or not self.paired_fraction < 1:
+            raise ValueError("paired_fraction must lie strictly between zero and one (zero is allowed for assay_only)")
         if (not self.loss_rates or len(set(self.loss_rates)) != len(self.loss_rates)
                 or any(not 0 <= r < 1 for r in self.loss_rates)):
             raise ValueError("loss_rates must be unique probabilities below one")
@@ -85,12 +90,15 @@ class Settings:
                             candidate_budget=self.candidate_budget, include_endpoints=True)
 
     def models(self):
-        return tuple(ModelConfig(name=name, kind=kind, rank=rank, pu=pu,
+        models = tuple(ModelConfig(name=name, kind=kind, rank=rank, pu=pu,
                                  use_target_features=self.use_target_features)
                      for name, kind, rank, pu in (
                          ("Logistic", "direct", 0, False), ("MIRT", "lowrank", 1, False),
                          ("Joint", "joint", 1, False), ("PU", "direct", 0, True),
                          ("PU-MIRT", "lowrank", 1, True), ("PU-Joint", "joint", 1, True)))
+        if self.supervision_profile == "assay_only":
+            return tuple(model for model in models if not model.pu)
+        return models
 
 
 def source_hash() -> str:
@@ -110,6 +118,11 @@ def fingerprint(value) -> str:
 
 def scenarios(settings: Settings, *, natural: bool, simulation: bool, sharing_strength=None):
     """Predeclared controls; no dataset outcome can change this matrix."""
+    if settings.supervision_profile == "assay_only":
+        if natural:
+            raise ValueError("assay_only requires one assay outcome, not paired natural observations")
+        return [{"analysis": "primary", "mechanism": "assay_only", "loss_rate": 0.,
+                 "calibration_fraction": 0., "calibration_spec": "not_available"}]
     if natural:
         return [{"analysis": "primary", "mechanism": "natural", "loss_rate": None,
                  "calibration_fraction": settings.paired_fraction, "calibration_spec": "correct"}]

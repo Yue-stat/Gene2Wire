@@ -92,6 +92,8 @@ def _source_context(prepared, repetition):
 
 
 def _scenarios(prepared, settings):
+    if settings.supervision_profile == "assay_only":
+        return scenarios(settings, natural=prepared.natural_observed is not None, simulation=False)
     if prepared.metadata.get("experiment_context", {}).get("experiment") == "target_block":
         mechanism = "natural" if prepared.natural_observed is not None else "scar"
         rates = (None,) if mechanism == "natural" else settings.loss_rates
@@ -145,7 +147,8 @@ def _detector(prepared, observed, paired, scenario, technical_score):
 def _compile(prepared, features, observed, estimated, rows, paired, mode):
     base = _bundle(prepared, features, observed)
     compiled, exposure = compile_training_bundle(
-        base, rows, paired, _reference_view(prepared.reference, paired), estimated, mode)
+        base, rows, paired, None if mode == "observed" else _reference_view(prepared.reference, paired),
+        estimated, mode)
     return compiled.subset_rows(rows), exposure[rows]
 
 
@@ -155,14 +158,16 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
     train, validation, test = fold.train_rows, fold.validation_rows, fold.test_rows
     development = np.sort(np.r_[train, validation])
     n, nt = prepared.reference.shape
+    assay_only = settings.supervision_profile == "assay_only"
     draw_seed = stable_seed(settings.seed, "observation", prepared.name, repetition)
-    design = make_observation_design(n, nt, seed=draw_seed,
-                                     technical_score=prepared.technical_score)
+    design = (None if assay_only else make_observation_design(
+        n, nt, seed=draw_seed, technical_score=prepared.technical_score))
     tables = {name: [] for name in ("metrics", "per_target", "reliability", "tuning",
                                    "selected", "detection", "detection_per_target",
                                    "detection_reliability", "thinning_audit", "failures", "per_group")}
-    groups = next((prepared.groups[k] for k in ("animal", "sample", "animal_id", "sample_id")
-                   if k in prepared.groups), None)
+    group_key = next((k for k in ("animal", "sample", "animal_id", "sample_id")
+                      if k in prepared.groups), None)
+    groups = None if group_key is None else prepared.groups[group_key]
     paired_seed = stable_seed(settings.seed, "paired", prepared.name, repetition, fold.outer_fold)
     source_context = _source_context(prepared, repetition)
     model_checkpoint = Path(checkpoint_dir) / slug(prepared.name)
@@ -175,20 +180,29 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
             if on_progress is not None:
                 on_progress({**context, **event})
         emit({"event": "scenario_start"})
-        paired = sample_paired_rows(development, scenario["calibration_fraction"], paired_seed,
-                                    groups=None if groups is None else groups[development])
+        paired = (np.array([], dtype=int) if assay_only else sample_paired_rows(
+            development, scenario["calibration_fraction"], paired_seed,
+            groups=None if groups is None else groups[development]))
         paired_train = np.intersect1d(paired, train)
-        if scenario["mechanism"] == "natural":
+        if assay_only:
+            observed, true_e, gamma = prepared.reference, None, None
+        elif scenario["mechanism"] == "natural":
             observed, true_e, gamma = prepared.natural_observed, None, None
         else:
             generated = thin_reference(prepared.reference, prepared.measured, train,
                                        scenario["loss_rate"], scenario["mechanism"], design)
             observed, true_e, gamma = generated.observed, generated.sensitivity, generated.gamma
         try:
-            tuning_e, tuning_detector = _detector(prepared, observed, paired_train, scenario, design.technical_score)
-            # Separate refit objects never enter the validation score. Their paired
-            # validation references are authorized only for development fitting.
-            final_e, final_detector = _detector(prepared, observed, paired, scenario, design.technical_score)
+            if assay_only:
+                # A single assay has no paired detection calibration. Ones denote
+                # the absence of *additional* corruption, not biological sensitivity.
+                tuning_e = final_e = np.ones_like(observed, dtype=float)
+                tuning_detector = final_detector = None
+            else:
+                tuning_e, tuning_detector = _detector(prepared, observed, paired_train, scenario, design.technical_score)
+                # Separate refit objects never enter the validation score. Their paired
+                # validation references are authorized only for development fitting.
+                final_e, final_detector = _detector(prepared, observed, paired, scenario, design.technical_score)
         except CalibrationNotEstimable as error:
             tables["failures"].append({**context, "stage": "calibration", "error": str(error)})
             emit({"event": "calibration_failed", "error": str(error)})
@@ -207,19 +221,24 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                      "feature_names_refit": prepared.refit_features.feature_names,
                      "features_tuning": prepared.train_features.metadata,
                      "features_refit": prepared.refit_features.metadata,
-                     "fold": fold.metadata}, audit_dir / "audit.json")
-        diagnostic = detection_diagnostics(observed, prepared.reference, prepared.measured,
-                                            final_e, rows=test, true_sensitivity=true_e)
-        tables["detection"].append({**context, **diagnostic})
-        detection_evaluation = evaluate_detection_calibration(
-            prepared.reference[test], observed[test], prepared.measured[test], final_e[test],
-            true_sensitivity=None if true_e is None else true_e[test], target_ids=prepared.target_ids)
-        tables["detection_per_target"].extend({**context, **row} for row in detection_evaluation["per_target"])
-        tables["detection_reliability"].extend({**context, **row} for row in detection_evaluation["reliability"])
+                     "fold": fold.metadata,
+                     **({"supervision_profile": "assay_only", "reference_interpretation": "observed assay outcome",
+                         "exposure_interpretation": "no additional corruption; biological sensitivity unestimated"}
+                        if assay_only else {})}, audit_dir / "audit.json")
+        if not assay_only:
+            diagnostic = detection_diagnostics(observed, prepared.reference, prepared.measured,
+                                                final_e, rows=test, true_sensitivity=true_e)
+            tables["detection"].append({**context, **diagnostic})
+            detection_evaluation = evaluate_detection_calibration(
+                prepared.reference[test], observed[test], prepared.measured[test], final_e[test],
+                true_sensitivity=None if true_e is None else true_e[test], target_ids=prepared.target_ids)
+            tables["detection_per_target"].extend({**context, **row} for row in detection_evaluation["per_target"])
+            tables["detection_reliability"].extend({**context, **row} for row in detection_evaluation["reliability"])
         atomic_npz(audit_dir / "observation.npz", reference=prepared.reference[test],
                    observed=observed[test], measured=prepared.measured[test],
-                   technical_score=design.technical_score[test],
-                   estimated_sensitivity=final_e[test], target_offsets=design.target_offsets,
+                   **({"additional_retention": final_e[test]} if assay_only else {
+                       "technical_score": design.technical_score[test],
+                       "estimated_sensitivity": final_e[test], "target_offsets": design.target_offsets}),
                    **({} if true_e is None else {"true_sensitivity": true_e[test]}))
         for split_name, rows in (("train", train), ("validation", validation), ("test", test)):
             for target_index, target in enumerate(prepared.target_ids):
@@ -230,7 +249,7 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                     "measured_count": measured_count, "reference_positive_count": positive_count,
                     "detected_positive_count": detected_count,
                     "realized_positive_loss": 1-detected_count/positive_count if positive_count else np.nan})
-        prior = _train_prevalence(prepared.reference, prepared.measured, paired)
+        prior = _train_prevalence(prepared.reference, prepared.measured, development if assay_only else paired)
 
         def record(name, prediction, semantics, extra=None, *, ranking_score=None):
             prefix = {**context, "model": name, "probability_semantics": semantics,
@@ -264,22 +283,43 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                 prepared.measured[test], prediction, final_e[test],
                 probability_semantics=semantics, train_reference_prevalence=prior,
                 target_ids=prepared.target_ids, ranking_score=ranking_score)
+            if assay_only:
+                # The shared evaluator also computes paired-detector diagnostics.
+                # A single assay provides no evidence for those quantities.
+                def assay_fields(row):
+                    return {key: value for key, value in row.items()
+                            if not key.startswith("detection_") and "_detection_" not in key
+                            and "hidden" not in key and key != "n_h_undefined"}
+                evaluated["summary"] = assay_fields(evaluated["summary"])
+                evaluated["per_target"] = [assay_fields(row) for row in evaluated["per_target"]]
+                evaluated["reliability"] = [row for row in evaluated["reliability"]
+                                            if row["scope"] != "detection"]
+                evaluated["scores"].pop("e", None)
             tables["metrics"].append({**prefix, **evaluated["summary"]})
             tables["per_target"].extend({**prefix, **row} for row in evaluated["per_target"])
             tables["reliability"].extend({**prefix, **row} for row in evaluated["reliability"])
             scores = {key: value for key, value in evaluated["scores"].items()
                       if value is not None and key != "prediction"}
+            if ranking_score is not None:
+                # Keep raw off-panel ranking scores for prediction-only exports;
+                # the evaluator's score arrays intentionally mask W=0 with NaN.
+                scores["ranking_score"] = ranking_score
             atomic_npz(audit_dir / f"{slug(name)}_predictions.npz", prediction=prediction,
                        reference=prepared.reference[test], observed=observed[test],
-                       measured=prepared.measured[test], estimated_sensitivity=final_e[test],
+                       measured=prepared.measured[test],
+                       **({"additional_retention": final_e[test]} if assay_only else {
+                           "estimated_sensitivity": final_e[test]}),
                        cell_ids=np.asarray(prepared.cell_ids)[test].astype(str),
-                       target_ids=np.asarray(prepared.target_ids, dtype=str), **scores)
+                       target_ids=np.asarray(prepared.target_ids, dtype=str),
+                       **({"group_ids": np.asarray(groups)[test].astype(str)}
+                          if assay_only and groups is not None else {}), **scores)
 
         safe_validation = _bundle(prepared, prepared.train_features, observed).subset_rows(validation)
+        training_mode = "observed" if assay_only else "calibrated_pu"
         train_bundle, train_e = _compile(prepared, prepared.train_features, observed, tuning_e,
-                                         train, paired_train, "calibrated_pu")
+                                         train, paired_train, training_mode)
         refit_bundle, refit_e = _compile(prepared, prepared.refit_features, observed, final_e,
-                                         development, paired, "calibrated_pu")
+                                         development, paired, training_mode)
         tuning = settings.tuning_config(min(prepared.train_features.X.shape[1],
                                            prepared.refit_features.X.shape[1]), nt)
         models = settings.models()
@@ -298,7 +338,7 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                 seed=stable_seed(settings.seed, prepared.name, repetition, fold.outer_fold),
                 code_version=code_hash, on_progress=emit)
 
-        result = core_run(models, train_bundle, train_e, refit_bundle, refit_e, "calibrated_pu")
+        result = core_run(models, train_bundle, train_e, refit_bundle, refit_e, training_mode)
         for name, model_result in result.models.items():
             semantics = "reference" if model_result.fitted.config.pu else "observed"
             record(name, model_result.latent_probability, semantics)
@@ -309,7 +349,7 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                                      "converged": trial.converged, "iterations": trial.iterations,
                                      "seed": trial.seed} for trial in model_result.tuning.trials)
         primary = scenario["analysis"] == "primary"
-        if primary and settings.run_information_controls:
+        if primary and settings.run_information_controls and not assay_only:
             pu_models = {model.name: model for model in settings.models() if model.pu}
             controls = (
                 ("reference_only", (pu_models["PU"].with_updates(name="Reference-only"),)),
@@ -346,8 +386,7 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
         if primary and settings.run_random_forest:
             from .baselines import fit_baseline
             kind = "random_forest"
-            for semantics, role in (("observed", "observed"), ("reference", "reference_only"),
-                                     ("mixed", "reference_plus_observed")):
+            for semantics, role in _random_forest_roles(settings):
                 if role == "observed":
                     tb, rb = train_bundle, refit_bundle
                 else:
@@ -434,6 +473,12 @@ def _summarize(tables, *, simulation):
                                             var_name="metric", value_name="value")
 
 
+def _random_forest_roles(settings):
+    roles = (("observed", "observed"), ("reference", "reference_only"),
+             ("mixed", "reference_plus_observed"))
+    return roles[:1] if settings.supervision_profile == "assay_only" else roles
+
+
 def _planned_models(prepared, settings):
     """Model evaluations per fold/repetition, before any outcome is examined."""
     rows = []
@@ -441,10 +486,10 @@ def _planned_models(prepared, settings):
         names = [m.name for m in settings.models()
                  if m.pu or not scenario["analysis"].startswith("calibration")]
         if scenario["analysis"] == "primary":
-            if settings.run_information_controls:
+            if settings.run_information_controls and settings.supervision_profile != "assay_only":
                 names += ["Reference-only", "Reference+PU", "Reference+PU-MIRT", "Reference+PU-Joint"]
             if settings.run_random_forest:
-                names += ["RF-observed", "RF-reference", "RF-mixed"]
+                names += [f"RF-{semantics}" for semantics, _ in _random_forest_roles(settings)]
             if settings.run_qiao:
                 from .qiao import qiao_model_names
                 names += list(qiao_model_names(settings.use_target_features))

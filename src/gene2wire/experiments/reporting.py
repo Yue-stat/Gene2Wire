@@ -377,9 +377,11 @@ def compact_summaries(tables: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataFr
 
 _IMPORTANT_MODELS = ("PU", "PU-MIRT", "PU-Joint", "Reference+PU-Joint")
 _PU_MODELS = _IMPORTANT_MODELS[:3]
+_ASSAY_MODELS = ("Logistic", "MIRT", "Joint")
 _REPORT_LIMITS = {
     "primary_endpoint_metrics": 48,
     "pu_curves": 48,
+    "per_animal_measured_metrics": 48,
     "selected_hyperparameters_by_repetition": 60,
     "selection_and_convergence": 36,
     "joint_validation_selection": 36,
@@ -387,6 +389,17 @@ _REPORT_LIMITS = {
     "matched_full_panel_control": 36,
     "failed_units": 12,
 }
+
+
+def _assay_only(frame: pd.DataFrame) -> bool:
+    """Require an explicit assay-only mechanism; never infer it from model names."""
+    return (not frame.empty and "mechanism" in frame
+            and frame["mechanism"].notna().all()
+            and frame["mechanism"].eq("assay_only").all())
+
+
+def _important_models(frame: pd.DataFrame) -> tuple[str, ...]:
+    return _ASSAY_MODELS if _assay_only(frame) else _IMPORTANT_MODELS
 
 
 def _report_scope(frame: pd.DataFrame, *, endpoint: bool = False,
@@ -435,7 +448,7 @@ def _metric_columns(frame: pd.DataFrame) -> list[str]:
     choices = ["macro_auprc", "macro_log_loss", "macro_brier",
                "hidden_recall_at_h", "macro_hidden_recall_at_h", "macro_predicted_prevalence",
                "macro_reference_prevalence"]
-    if "block_fraction" in frame or "training_panel" in frame:
+    if "block_fraction" in frame or "training_panel" in frame or _assay_only(frame):
         choices = [name for name in choices if "hidden_recall" not in name]
     return [name for name in choices if name in frame]
 
@@ -482,7 +495,8 @@ def _bounded_report(frame: pd.DataFrame, limit: int) -> pd.DataFrame:
         # Round-robin contexts prevents a head() preview containing only rho=0
         # or the first dataset. Within a context, important models come first.
         if "model" in frame:
-            priority = {name: index for index, name in enumerate(_IMPORTANT_MODELS)}
+            priority = {name: index for index, name in enumerate(
+                (*_important_models(frame), *_ASSAY_MODELS))}
             balanced = []
             for indices in groups:
                 model_rows = {}
@@ -529,7 +543,7 @@ def _selected_by_repetition(selected: pd.DataFrame) -> pd.DataFrame:
     selected = _report_scope(selected, endpoint=True)
     if selected.empty or "model" not in selected:
         return pd.DataFrame()
-    selected = selected.loc[selected.model.isin(_IMPORTANT_MODELS)]
+    selected = selected.loc[selected.model.isin(_important_models(selected))]
     groups = [name for name in (*_CONTEXT, "repetition") if name in selected]
     rows = []
     for key, frame in selected.groupby(groups, dropna=False, observed=True, sort=False):
@@ -553,7 +567,7 @@ def _selection_health(tables: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
     tuning = _report_scope(tables.get("tuning", pd.DataFrame()), masked=False)
     if selected.empty or "model" not in selected:
         return pd.DataFrame()
-    selected = selected.loc[selected.model.isin(_IMPORTANT_MODELS)]
+    selected = selected.loc[selected.model.isin(_important_models(selected))]
     groups = [name for name in ("dataset", "sharing_strength", "mechanism", "calibration_fraction",
         "calibration_spec", "training_panel", "model") if name in selected]
     rows = []
@@ -672,6 +686,7 @@ def notebook_summaries(tables: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataF
     if aggregate.empty:
         raw = tables.get("metrics", pd.DataFrame())
         aggregate = _equal_repetition_mean(raw, _metric_columns(raw))
+    assay_only = _assay_only(aggregate)
     if not aggregate.empty:
         endpoint = _report_scope(aggregate, endpoint=True)
         if not endpoint.empty:
@@ -681,8 +696,15 @@ def notebook_summaries(tables: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataF
             curves = curves.loc[curves.model.isin(_PU_MODELS)]
         if "block_fraction" in curves:
             curves = _endpoint(curves)  # all blocks; largest positive loss within each block
-        if not curves.empty:
+        if not curves.empty and not assay_only:
             output["pu_curves"] = _report_view(curves, _metric_columns(curves)[:4])
+        if assay_only:
+            animals = tables.get("per_animal_aggregate", pd.DataFrame())
+            if not animals.empty:
+                output["per_animal_measured_metrics"] = _report_view(animals,
+                    [name for name in ("macro_auprc", "macro_log_loss", "macro_brier",
+                     "macro_auroc", "macro_predicted_prevalence", "macro_reference_prevalence")
+                     if name in animals], extra=("animal",))
     selections = _selected_by_repetition(tables.get("selected", pd.DataFrame()))
     if not selections.empty:
         output["selected_hyperparameters_by_repetition"] = _report_view(selections,
@@ -705,7 +727,7 @@ def notebook_summaries(tables: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataF
     detection = _report_scope(tables.get("detection", pd.DataFrame()), endpoint=True)
     values = [name for name in ("detection_log_loss", "detection_brier", "detection_mean",
         "detection_observed_rate", "sensitivity_mae", "sensitivity_rmse") if name in detection]
-    if not detection.empty and values:
+    if not detection.empty and values and not assay_only:
         output["detection_calibration"] = _report_view(_equal_repetition_mean(detection, values), values)
     controls = _matched_panel_control(tables)
     if not controls.empty:
@@ -734,10 +756,14 @@ def display_diagnostics(artifacts, *, label: str | None = None,
     print(f"\n{label or 'Experiment'} — concise diagnostics", flush=True)
     print(f"All result tables, predictions and settings: {artifacts.export_dir}", flush=True)
     protocol = artifacts.manifest.get("protocol", {})
+    assay_only = any(_assay_only(artifacts.tables.get(name, pd.DataFrame()))
+                     for name in ("aggregate", "metrics"))
     if isinstance(protocol, Mapping):
         saved_settings = {name: protocol[name] for name in (
             "n_outer_folds", "n_repetitions", "use_location", "use_target_features",
-            "paired_fraction", "strategy", "candidate_budget") if name in protocol}
+            "paired_fraction", "strategy", "candidate_budget", "supervision_profile") if name in protocol}
+        if assay_only:
+            saved_settings.pop("paired_fraction", None)
         if saved_settings:
             print(f"Saved run settings (authoritative for these results): {saved_settings}", flush=True)
     runtime = {name: artifacts.manifest[name] for name in (
@@ -746,11 +772,17 @@ def display_diagnostics(artifacts, *, label: str | None = None,
         "new_or_mixed_model_evaluations", "unknown_fit_model_evaluations") if name in artifacts.manifest}
     if runtime:
         print(f"Execution settings recorded in this export: {runtime}", flush=True)
-    print("Metric means give folds equal weight within each repetition, then repetitions equal weight. "
-          "Endpoints use each model's largest recorded primary loss (or natural paired labels); "
-          "block experiments use the largest block fraction and masked training. "
-          "PU curves retain all primary loss rates, or all blocks at the largest positive loss. "
-          "Selection/convergence summarizes all primary rates. No fold-based confidence intervals.", flush=True)
+    if assay_only:
+        print("Measured-assay metrics give folds equal weight within each repetition, then repetitions equal weight. "
+              "Only naturally measured entries are evaluated. Unassayed-target predictions are unvalidated "
+              "assay-score extrapolations, not measured anatomical connectivity. "
+              "No paired reference or detector calibration is used. No fold-based confidence intervals.", flush=True)
+    else:
+        print("Metric means give folds equal weight within each repetition, then repetitions equal weight. "
+              "Endpoints use each model's largest recorded primary loss (or natural paired labels); "
+              "block experiments use the largest block fraction and masked training. "
+              "PU curves retain all primary loss rates, or all blocks at the largest positive loss. "
+              "Selection/convergence summarizes all primary rates. No fold-based confidence intervals.", flush=True)
     summaries = notebook_summaries(artifacts.tables)
     for name, frame in summaries.items():
         total = frame.attrs.get("total_rows", len(frame))
