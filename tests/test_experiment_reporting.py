@@ -171,3 +171,34 @@ def test_compact_baseline_parameters_and_nonprimary_convergence():
         'Qiao-ID-logit', 'unique_bilinear_penalties'] == 2
     only_control = compact_summaries({'selected': selected.iloc[[-1]]})
     assert only_control['convergence_all_scenarios'].iloc[0]['not_converged'] == 1
+
+
+def test_block_summaries_keep_panel_coordinates_without_hidden_recall():
+    rows, selections = [], []
+    base = {"dataset": "BARseq A1", "analysis": "primary", "model": "PU-Joint",
+            "experiment": "animal_target_blocks", "group_mode": "animal"}
+    for panel, training_fraction in (("masked", .2), ("masked", .8), ("full", .0)):
+        unit = {**base, "training_panel": panel, "training_block_fraction": training_fraction}
+        selections.append({**unit, "rank": 2, "kind": "joint", "final_converged": True,
+                           "converged": True})
+        for evaluation_fraction in (.2, .8):
+            for scope in ("blocked", "observed"):
+                for rate in (.0, .8):
+                    rows.append({**unit, "block_fraction": evaluation_fraction,
+                                 "evaluation_scope": scope, "loss_rate": rate,
+                                 "macro_auprc": .3, "macro_log_loss": .4, "macro_brier": .1})
+    summaries = compact_summaries({"aggregate": pd.DataFrame(rows),
+                                   "selected": pd.DataFrame(selections),
+                                   "tuning": pd.DataFrame(selections)})
+    endpoints = summaries["primary_endpoint_metrics"]
+    assert len(endpoints) == 12
+    assert (endpoints.loss_rate == .8).all()
+    for key in ("experiment", "group_mode", "training_panel", "training_block_fraction",
+                "block_fraction", "evaluation_scope"):
+        assert key in endpoints
+    assert "macro_brier" in endpoints
+    assert not any("hidden" in key for key in endpoints)
+    for name in ("selection_and_convergence_all_primary_rates", "candidate_coverage_all_primary_rates"):
+        frame = summaries[name]
+        assert len(frame) == 3
+        assert {"training_panel", "training_block_fraction", "experiment", "group_mode"} <= set(frame)

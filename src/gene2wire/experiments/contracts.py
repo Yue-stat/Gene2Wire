@@ -38,6 +38,35 @@ class FeatureSet:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class EvaluationSpec:
+    """Evaluation-only labels/support; never passed to preprocessing or learners.
+
+    A separate object is essential for structural block experiments: fitting
+    arrays contain only visible entries, while this object retains the original
+    assay reference solely for scoring held-out cells after fitting.
+    """
+    reference: np.ndarray
+    masks: Mapping[float, np.ndarray]
+    groups: np.ndarray
+    source_measured: np.ndarray
+
+    def validate(self, shape: tuple[int, int]) -> None:
+        z, w = np.asarray(self.reference), np.asarray(self.source_measured)
+        if z.shape != shape or w.shape != shape or not np.all(np.isin(z, [0, 1])):
+            raise ValueError("Evaluation reference/source mask must be aligned binary arrays")
+        if not np.all(np.isin(w, [0, 1])) or np.any(z.astype(bool) & ~w.astype(bool)):
+            raise ValueError("Evaluation positives cannot occur outside original assays")
+        if np.asarray(self.groups).shape != (shape[0],) or not self.masks:
+            raise ValueError("Evaluation groups and masks must be supplied")
+        for fraction, mask in self.masks.items():
+            mask = np.asarray(mask)
+            if not 0 <= float(fraction) <= 1 or mask.shape != shape or not np.all(np.isin(mask, [0, 1])):
+                raise ValueError("Blocked evaluation masks must be aligned binary arrays")
+            if np.any(mask.astype(bool) & ~w.astype(bool)):
+                raise ValueError("Blocked evaluation cannot include naturally unassayed entries")
+
+
 @dataclass
 class ExperimentDataset:
     name: str
@@ -54,6 +83,7 @@ class ExperimentDataset:
     platform: np.ndarray | None = None
     technical_score: np.ndarray | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    evaluation: EvaluationSpec | None = None
 
     def validate(self) -> None:
         z, w = np.asarray(self.reference), np.asarray(self.measured)
@@ -70,6 +100,8 @@ class ExperimentDataset:
         for name, values in self.groups.items():
             if np.asarray(values).shape != (z.shape[0],):
                 raise ValueError(f"Group {name!r} is not aligned to cells")
+        if self.evaluation is not None:
+            self.evaluation.validate(z.shape)
         if self.natural_observed is not None:
             d = np.asarray(self.natural_observed)
             if d.shape != z.shape or not np.all(np.isin(d, [0, 1])):

@@ -36,6 +36,22 @@ Legacy notebooks under `archive/legacy/` document previous implementations. They
 are not alternative entry points for this protocol and must not supply numbers
 to the new result exports.
 
+An independent [0909 group × target block experiment](docs/BLOCK_MASKING_0909.md)
+keeps all input gene features and evaluates artificially unassayed target blocks
+on held-out cells within represented groups:
+
+| Notebook | Groups |
+|---|---|
+| [BARseq_A1_block_masking_0909.ipynb](BARseq_A1_block_masking_0909.ipynb) | A1's two biological animals |
+| [BARseq_M1_block_masking_0909.ipynb](BARseq_M1_block_masking_0909.ipynb) | Two artificial groups within M1's single animal |
+| [Projection_TAGs_block_masking_0909.ipynb](Projection_TAGs_block_masking_0909.ipynb) | Recorded animals, preserving native assay coverage |
+| [simulation_block_masking_0909.ipynb](simulation_block_masking_0909.ipynb) | Two artificial groups, sharing strengths 0/0.5/1 |
+
+These notebooks include a matched full-training-panel control and use separate
+checkpoints and result families. Default additional positive loss is zero;
+Projection-TAGs keeps natural detections. Block fractions refer to selected
+target columns, not positive loss. The primary notebooks above remain unchanged.
+
 Every notebook starts with the same defaults:
 
 ```python

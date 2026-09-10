@@ -16,8 +16,15 @@ import numpy as np
 import pandas as pd
 
 
+# Optional coordinates distinguish the additional block-masking experiment.
+# Fitting records use training_block_fraction; evaluation records additionally
+# use block_fraction/evaluation_scope because one full-panel fit can be scored
+# on several distinct held-out target panels. Only existing columns are used,
+# so diagnostics of historical standard exports keep their original shape.
+_BLOCK_CONTEXT = ("experiment", "group_mode", "training_panel", "training_block_fraction",
+                  "block_fraction", "evaluation_scope")
 _CONTEXT = ("dataset", "sharing_strength", "analysis", "mechanism", "loss_rate",
-            "calibration_fraction", "calibration_spec", "model")
+            "calibration_fraction", "calibration_spec", *_BLOCK_CONTEXT, "model")
 _CONFIG = ("kind", "rank", "shared_l2", "residual_l2", "use_target_features", "target_l2")
 _TABLE_ORDER = ("aggregate", "per_repetition", "selected", "tuning", "metrics",
                 "per_target", "reliability", "detection", "detection_per_target",
@@ -302,7 +309,8 @@ def compact_summaries(tables: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataFr
     aggregate = tables.get("aggregate", pd.DataFrame())
     if not aggregate.empty:
         endpoint = _endpoint(aggregate)
-        columns = [name for name in ("dataset", "sharing_strength", "mechanism", "loss_rate", "model",
+        columns = [name for name in ("dataset", "sharing_strength", "mechanism", "loss_rate",
+            *_BLOCK_CONTEXT, "model",
             "macro_auprc", "macro_log_loss", "macro_hidden_recall_at_h", "macro_brier",
             "macro_predicted_prevalence", "macro_reference_prevalence") if name in endpoint]
         for name in ("calibration_fraction", "calibration_spec"):
@@ -311,7 +319,8 @@ def compact_summaries(tables: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataFr
         output["primary_endpoint_metrics"] = endpoint.loc[:, columns].reset_index(drop=True)
     selected = _primary(tables.get("selected", pd.DataFrame()))
     tuning = _primary(tables.get("tuning", pd.DataFrame()))
-    groups = [name for name in ("dataset", "sharing_strength", "model") if name in selected]
+    groups = [name for name in ("dataset", "sharing_strength", *_BLOCK_CONTEXT, "model")
+              if name in selected]
     if not selected.empty and groups:
         rows = []
         for key, frame in selected.groupby(groups, dropna=False, observed=True):
@@ -344,7 +353,8 @@ def compact_summaries(tables: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataFr
             "final_iterations", "validation_observed_log_loss") if name in incomplete]
         output["nonconverged_final_fits_first_10_see_selected_csv"] = incomplete.loc[:, columns].head(10)
     if not tuning.empty:
-        group_cols = [name for name in ("dataset", "sharing_strength", "model") if name in tuning]
+        group_cols = [name for name in ("dataset", "sharing_strength", *_BLOCK_CONTEXT, "model")
+                      if name in tuning]
         if group_cols:
             rows = []
             for key, frame in tuning.groupby(group_cols, dropna=False, observed=True):

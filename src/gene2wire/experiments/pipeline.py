@@ -24,7 +24,7 @@ from ..runner import run_model_grid
 from ..seeds import stable_seed
 from .calibration import (CalibrationNotEstimable, detection_diagnostics,
                           fit_detection_calibrator, sample_paired_rows)
-from .contracts import ExperimentDataset, FeatureSet, Fold
+from .contracts import EvaluationSpec, ExperimentDataset, FeatureSet, Fold
 from .evaluation import evaluate_detection_calibration, evaluate_predictions
 from .io import atomic_json, atomic_npz, jsonable
 from .observation import make_observation_design, thin_reference
@@ -55,6 +55,7 @@ class PreparedFold:
     refit_features: FeatureSet
     fold: Fold
     metadata: dict
+    evaluation: EvaluationSpec | None = None
 
 
 def slug(value: str) -> str:
@@ -80,7 +81,26 @@ def _prepare(dataset, fold, settings):
     return PreparedFold(dataset.name, dataset.reference, dataset.measured,
                         dataset.cell_ids, dataset.target_ids, dataset.groups,
                         dataset.natural_observed, dataset.platform, dataset.technical_score,
-                        train_features, refit_features, fold, metadata)
+                        train_features, refit_features, fold, metadata, dataset.evaluation)
+
+
+def _source_context(prepared, repetition):
+    return {"dataset": prepared.name, "repetition": repetition,
+            "outer_fold": prepared.fold.outer_fold,
+            "sharing_strength": prepared.metadata.get("sharing_strength"),
+            **prepared.metadata.get("experiment_context", {})}
+
+
+def _scenarios(prepared, settings):
+    if prepared.metadata.get("experiment_context", {}).get("experiment") == "target_block":
+        mechanism = "natural" if prepared.natural_observed is not None else "scar"
+        rates = (None,) if mechanism == "natural" else settings.loss_rates
+        return [{"analysis": "primary", "mechanism": mechanism, "loss_rate": rate,
+                 "calibration_fraction": settings.paired_fraction,
+                 "calibration_spec": "correct"} for rate in rates]
+    return scenarios(settings, natural=prepared.natural_observed is not None,
+                     simulation=prepared.metadata.get("independent_unit") == "generated_dataset",
+                     sharing_strength=prepared.metadata.get("sharing_strength"))
 
 
 def _bundle(prepared, features, observed):
@@ -135,23 +155,19 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
     train, validation, test = fold.train_rows, fold.validation_rows, fold.test_rows
     development = np.sort(np.r_[train, validation])
     n, nt = prepared.reference.shape
-    rho = prepared.metadata.get("sharing_strength")
-    is_simulation = prepared.metadata.get("independent_unit") == "generated_dataset"
     draw_seed = stable_seed(settings.seed, "observation", prepared.name, repetition)
     design = make_observation_design(n, nt, seed=draw_seed,
                                      technical_score=prepared.technical_score)
     tables = {name: [] for name in ("metrics", "per_target", "reliability", "tuning",
                                    "selected", "detection", "detection_per_target",
-                                   "detection_reliability", "thinning_audit", "failures")}
+                                   "detection_reliability", "thinning_audit", "failures", "per_group")}
     groups = next((prepared.groups[k] for k in ("animal", "sample", "animal_id", "sample_id")
                    if k in prepared.groups), None)
     paired_seed = stable_seed(settings.seed, "paired", prepared.name, repetition, fold.outer_fold)
-    source_context = {"dataset": prepared.name, "repetition": repetition,
-                      "outer_fold": fold.outer_fold, "sharing_strength": rho}
+    source_context = _source_context(prepared, repetition)
     model_checkpoint = Path(checkpoint_dir) / slug(prepared.name)
 
-    selected_scenarios = (scenarios(settings, natural=prepared.natural_observed is not None,
-                                   simulation=is_simulation, sharing_strength=rho)
+    selected_scenarios = (_scenarios(prepared, settings)
                           if scenario is None else [scenario])
     for scenario in selected_scenarios:
         context = {**source_context, **scenario}
@@ -217,12 +233,37 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
         prior = _train_prevalence(prepared.reference, prepared.measured, paired)
 
         def record(name, prediction, semantics, extra=None, *, ranking_score=None):
+            prefix = {**context, "model": name, "probability_semantics": semantics,
+                      **(extra or {})}
+            if prepared.evaluation is not None:
+                from .block_evaluation import evaluate_block_predictions
+                spec = prepared.evaluation
+                for fraction, mask in spec.masks.items():
+                    evaluated = evaluate_block_predictions(
+                        spec.reference[test], mask[test], prediction,
+                        target_ids=prepared.target_ids, groups=spec.groups[test],
+                        ranking_score=ranking_score,
+                        train_reference_prevalence=prior)
+                    evaluation_prefix = {**prefix, "evaluation_scope": "blocked",
+                                         "block_fraction": float(fraction)}
+                    tables["metrics"].append({**evaluation_prefix, **evaluated["summary"]})
+                    for key in ("per_target", "reliability", "per_group"):
+                        tables[key].extend({**evaluation_prefix, **row} for row in evaluated[key])
+                atomic_npz(audit_dir / f"{slug(name)}_predictions.npz",
+                           prediction=prediction, reference=spec.reference[test],
+                           training_measured=prepared.measured[test],
+                           source_measured=spec.source_measured[test],
+                           block_fractions=np.asarray(tuple(spec.masks), dtype=float),
+                           evaluation_masks=np.stack([mask[test] for mask in spec.masks.values()]),
+                           block_groups=np.asarray(spec.groups[test], dtype=str),
+                           cell_ids=np.asarray(prepared.cell_ids)[test].astype(str),
+                           target_ids=np.asarray(prepared.target_ids, dtype=str),
+                           **({} if ranking_score is None else {"ranking_score": ranking_score}))
+                return
             evaluated = evaluate_predictions(prepared.reference[test], observed[test],
                 prepared.measured[test], prediction, final_e[test],
                 probability_semantics=semantics, train_reference_prevalence=prior,
                 target_ids=prepared.target_ids, ranking_score=ranking_score)
-            prefix = {**context, "model": name, "probability_semantics": semantics,
-                      **(extra or {})}
             tables["metrics"].append({**prefix, **evaluated["summary"]})
             tables["per_target"].extend({**prefix, **row} for row in evaluated["per_target"])
             tables["reliability"].extend({**prefix, **row} for row in evaluated["reliability"])
@@ -360,7 +401,8 @@ def _atomic_csv(frame, destination):
 
 
 _GROUP_COLUMNS = ["dataset", "sharing_strength", "analysis", "mechanism", "loss_rate",
-                  "calibration_fraction", "calibration_spec", "model", "probability_semantics"]
+                  "calibration_fraction", "calibration_spec", "model", "probability_semantics",
+                  "experiment", "group_mode", "training_panel", "training_block_fraction", "evaluation_scope", "block_fraction"]
 
 
 def _summarize(tables, *, simulation):
@@ -395,10 +437,7 @@ def _summarize(tables, *, simulation):
 def _planned_models(prepared, settings):
     """Model evaluations per fold/repetition, before any outcome is examined."""
     rows = []
-    simulation = prepared.metadata.get("independent_unit") == "generated_dataset"
-    for scenario in scenarios(settings, natural=prepared.natural_observed is not None,
-                              simulation=simulation,
-                              sharing_strength=prepared.metadata.get("sharing_strength")):
+    for scenario in _scenarios(prepared, settings):
         names = [m.name for m in settings.models()
                  if m.pu or not scenario["analysis"].startswith("calibration")]
         if scenario["analysis"] == "primary":
@@ -442,13 +481,9 @@ def _run_checkpointed_fold(prepared, repetition, settings, checkpoint_dir,
     tables = _run_fold(prepared, repetition, settings, checkpoint_dir, export_path,
                        fit_version, on_progress=writer, scenario=scenario)
     if not tables["failures"]:
-        prefix = {"dataset": prepared.name, "repetition": repetition,
-                  "outer_fold": prepared.fold.outer_fold,
-                  "sharing_strength": prepared.metadata.get("sharing_strength")}
+        prefix = _source_context(prepared, repetition)
         files = []
-        selected_scenarios = (scenarios(settings, natural=prepared.natural_observed is not None,
-                                        simulation=prepared.metadata.get("independent_unit") == "generated_dataset",
-                                        sharing_strength=prepared.metadata.get("sharing_strength"))
+        selected_scenarios = (_scenarios(prepared, settings)
                               if scenario is None else [scenario])
         for scenario in selected_scenarios:
             files.extend((export_path / "units" / fingerprint({**prefix, **scenario})).glob("*"))
@@ -484,7 +519,8 @@ def _run_scenario_group(tasks, settings, checkpoint_dir, export_path, fit_versio
 
 
 def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
-             progress_interval=60., progress_level="summary", worker_status=None):
+             progress_interval=60., progress_level="summary", worker_status=None,
+             export_name=None, supplementary_tables=None, manifest_extra=None):
     code_hash = source_hash()
     contexts = []
     metadata = []
@@ -498,8 +534,10 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
             visits[fold.test_rows] += 1
         if len(folds) != settings.n_outer_folds or not np.all(visits == 1):
             raise ValueError("Requested outer CV must test every cell exactly once")
-        reps = ([int(dataset.metadata["repetition"])] if is_simulation
-                else range(settings.n_repetitions))
+        reps = ([int(dataset.metadata["experiment_repetition"])]
+                if "experiment_repetition" in dataset.metadata else
+                ([int(dataset.metadata["repetition"])] if is_simulation
+                 else range(settings.n_repetitions)))
         fold_inputs = []
         for fold in folds:
             prepared = _prepare(dataset, fold, settings)
@@ -513,7 +551,13 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
                 "train_Y": None if prepared.train_features.Y_target is None else sha256_array(prepared.train_features.Y_target),
                 "refit_Y": None if prepared.refit_features.Y_target is None else sha256_array(prepared.refit_features.Y_target)})
         input_identities.append({"name": dataset.name,
-            "repetition": dataset.metadata.get("repetition"),
+            "repetition": dataset.metadata.get("experiment_repetition", dataset.metadata.get("repetition")),
+            "experiment_context": dataset.metadata.get("experiment_context", {}),
+            "evaluation": None if dataset.evaluation is None else {
+                "reference": sha256_array(dataset.evaluation.reference),
+                "source_measured": sha256_array(dataset.evaluation.source_measured),
+                "groups": sha256_array(np.asarray(dataset.evaluation.groups, dtype=str)),
+                "masks": {str(f): sha256_array(m) for f, m in dataset.evaluation.masks.items()}},
             "sharing_strength": dataset.metadata.get("sharing_strength"),
             "reference": sha256_array(dataset.reference), "measured": sha256_array(dataset.measured),
             "cell_ids": sha256_array(np.asarray(dataset.cell_ids, dtype=str)),
@@ -536,7 +580,8 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
     run_id = fingerprint({"protocol": settings.scientific_dict(), "source_hash": code_hash,
                           "input_identities": input_identities, "software": manifest["software"]})
     fit_version = code_hash + ":" + fingerprint(manifest["software"])
-    export_path = Path(export_dir) / ("simulation_0908" if is_simulation else slug(datasets[0].name) + "_0908") / run_id
+    export_path = Path(export_dir) / (export_name or ("simulation_0908" if is_simulation else slug(datasets[0].name) + "_0908")) / run_id
+    manifest.update(manifest_extra or {})
     export_path.mkdir(parents=True, exist_ok=True)
     manifest.update(run_id=run_id, requested_n_jobs=settings.n_jobs, completed=False,
                     checkpoint_dir=str(Path(checkpoint_dir).resolve()))
@@ -548,14 +593,9 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
     results, pending, inventory, evaluation_plan = [], [], [], []
     for fold_group, (prepared, repetition) in enumerate(contexts):
         planned_models = _planned_models(prepared, settings)
-        for scenario in scenarios(settings, natural=prepared.natural_observed is not None,
-                                  simulation=prepared.metadata.get("independent_unit") == "generated_dataset",
-                                  sharing_strength=prepared.metadata.get("sharing_strength")):
+        for scenario in _scenarios(prepared, settings):
             index = len(results)
-            unit_context = {"dataset": prepared.name, "repetition": repetition,
-                            "outer_fold": prepared.fold.outer_fold,
-                            "sharing_strength": prepared.metadata.get("sharing_strength"),
-                            **scenario}
+            unit_context = {**_source_context(prepared, repetition), **scenario}
             key = fingerprint({"run_id": run_id, **unit_context})
             cached = _load_unit_result(store, key, run_id, export_path)
             model_count = sum(all(row[name] == value for name, value in scenario.items())
@@ -611,6 +651,7 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
                 results[index] = result
     names = results[0].keys()
     tables = {name: pd.DataFrame([row for result in results for row in result[name]]) for name in names}
+    tables.update(supplementary_tables or {})
     tables["checkpoint_inventory"] = pd.DataFrame(inventory)
     tables["model_evaluation_plan"] = pd.DataFrame(evaluation_plan)
     accounting = [{**row, "accounting": "restored_results"} for row in evaluation_plan
