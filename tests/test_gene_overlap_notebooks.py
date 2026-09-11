@@ -19,8 +19,8 @@ def test_overlap_notebooks_are_clean_pinned_and_editable():
         assert "N_REPETITIONS = 10" in source
         assert "RUN_RANDOM_FOREST = False" in source
         assert "RF is disabled and is never scheduled" in source
-        assert "CORE_COMMIT = 'e0ffa16876c158523bf08e4f4bbe6542c4cfc07f'" in source
-        assert "EXPECTED_SOURCE_HASH = '95b5a806452e966f5464850e9db83652fc3097b8061022a473137e2cb910b0e3'" in source
+        assert "CORE_COMMIT = '90749963f58d75871db4ec50a405a044932f3524'" in source
+        assert "EXPECTED_SOURCE_HASH = '94622155b2ba98beb67e041f18140cc7a559c5d66e47827b14057dfeeca71993'" in source
         for cell in notebook["cells"]:
             if cell["cell_type"] == "code":
                 assert cell["outputs"] == []
