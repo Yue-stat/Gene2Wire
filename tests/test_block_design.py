@@ -34,6 +34,17 @@ def test_actual_animal_groups_require_explicit_metadata_and_two_animals():
         make_block_groups(data, BlockMaskConfig(), 2)
 
 
+def test_recorded_sample_groups_are_explicit_and_distinct_from_animals():
+    data = SimpleNamespace(cell_ids=("a", "b", "c", "d"),
+                           groups={"sample": ["S1", "S1", "S2", "S2"]})
+    config = BlockMaskConfig(group_mode="sample")
+    np.testing.assert_array_equal(make_block_groups(data, config, 2),
+                                  ["S1", "S1", "S2", "S2"])
+    data.groups = {"animal": ["A", "A", "B", "B"]}
+    with pytest.raises(ValueError, match="explicit sample"):
+        make_block_groups(data, config, 2)
+
+
 def test_cell_folds_cover_every_cell_once_and_keep_every_group_in_every_role():
     groups = np.repeat(["a", "b", "c"], [31, 35, 39])
     folds = make_block_folds(groups, 3, seed=7)
@@ -138,7 +149,7 @@ def test_sparse_cyclic_overlap_uses_feasible_assignment_instead_of_greedy_failur
 
 @pytest.mark.parametrize("overrides", [
     {"fractions": ()}, {"fractions": (.2, .2)}, {"fractions": (float("nan"),)},
-    {"fractions": (1.1,)}, {"group_mode": "sample"}, {"n_artificial_groups": 1},
+    {"fractions": (1.1,)}, {"group_mode": "batch"}, {"n_artificial_groups": 1},
     {"n_artificial_groups": True}, {"validation_fraction": 0.},
 ])
 def test_invalid_config_rejected(overrides):

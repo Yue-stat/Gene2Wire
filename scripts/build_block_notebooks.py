@@ -17,7 +17,8 @@ _spec = importlib.util.spec_from_file_location(
     "_gene2wire_notebook_common", ROOT / "scripts" / "build_notebooks_0908.py")
 _common = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_common)
-NAMES = ("BARseq_A1", "BARseq_M1", "Projection_TAGs", "simulation", "SPIDER")
+NAMES = ("BARseq_A1", "BARseq_M1", "Projection_TAGs", "MERGE_seq",
+         "simulation", "SPIDER")
 
 
 CONFIG = '''
@@ -184,16 +185,19 @@ def notebook(name, commit, source_hash, date_suffix=None):
     if name not in NAMES:
         raise ValueError(f"Unknown block notebook: {name}")
     date_suffix = _common.release_date(date_suffix)
-    artificial = name in {"BARseq_M1", "simulation", "SPIDER"}
+    group_mode = ("sample" if name == "MERGE_seq" else
+                  "artificial" if name in {"BARseq_M1", "simulation", "SPIDER"}
+                  else "animal")
     label = {"BARseq_A1": "A1", "BARseq_M1": "M1",
-             "Projection_TAGs": "Projection-TAGs", "simulation": "simulation", "SPIDER": "SPIDER"}[name]
+             "Projection_TAGs": "Projection-TAGs", "MERGE_seq": "MERGE-seq",
+             "simulation": "simulation", "SPIDER": "SPIDER"}[name]
     modules = ["numpy", "scipy", "pandas", "sklearn", "joblib", "threadpoolctl",
                "matplotlib", "yaml", "IPython"]
     if name == "Projection_TAGs":
         modules += ["rdata", "openpyxl"]
     elif name == "SPIDER":
         modules.append("rdata")
-    config = (CONFIG.replace("__GROUP_MODE__", "artificial" if artificial else "animal")
+    config = (CONFIG.replace("__GROUP_MODE__", group_mode)
               .replace("__DATE__", date_suffix).replace("__COMMIT__", commit)
               .replace("__HASH__", source_hash).replace("__EXPORT_DIRS__", repr({label: None})))
     config += f"\nREQUIRED_MODULES = {modules!r}\nEXPECTED_EXPORT_LABELS = {(label,)!r}\n"
@@ -201,6 +205,7 @@ def notebook(name, commit, source_hash, date_suffix=None):
         "BARseq_A1": "A1 uses its two biological animals as groups. This is a within-animal new-cell evaluation, not leave-one-animal-out validation.",
         "BARseq_M1": "M1 contains one biological animal. Two balanced, seeded artificial groups test the controlled panel-missingness mechanism; they are not independent animals.",
         "Projection_TAGs": "Projection-TAGs uses recorded animal IDs and preserves the native assay mask. Only targets measured in at least two animals are eligible. Standard detections remain natural; the union reference is an imperfect evaluation reference.",
+        "MERGE_seq": "MERGE-seq uses its four recorded experimental sample IDs as groups. This is a within-sample new-cell evaluation under partial target panels, not leave-one-sample-out validation.",
         "simulation": "Each repetition generates independent data for each sharing strength. Two balanced artificial groups allow known low-rank structure to be tested under partial target panels.",
         "SPIDER": "The current processed SPIDER adapter exposes slices but no verified animal IDs. Two balanced artificial groups test partial target panels while retaining all input genes. These groups are not animals, and slices are not relabelled as animals.",
     }[name]
@@ -293,6 +298,24 @@ def notebook(name, commit, source_hash, date_suffix=None):
                 preflight_blocks(dataset)
             """)),
         ]
+    elif name == "MERGE_seq":
+        parts += [
+            ("markdown", """## MERGE-seq sample groups and optional feature inputs
+
+            The four recorded sample IDs define the natural groups. Native physical cell
+            locations and outcome-independent target descriptors are not bundled; aligned
+            CSVs are required before enabling either optional feature switch."""),
+            ("code", "N_GENE_FEATURES = 128\nLOCATION_FEATURES_CSV = None\nTARGET_FEATURES_CSV = None"),
+            ("markdown", "## Load cached MERGE-seq inputs and preview the panel masks"),
+            ("code", guarded("""
+                from gene2wire.experiments.datasets.merge_seq import load_merge_seq
+                dataset = load_merge_seq(
+                    RAW_DATA_DIR / 'MERGE_seq', n_gene_features=N_GENE_FEATURES,
+                    location_features_csv=LOCATION_FEATURES_CSV,
+                    target_features_csv=TARGET_FEATURES_CSV)
+                preflight_blocks(dataset)
+            """)),
+        ]
     else:
         parts += [
             ("markdown", """## Simulation truth and input settings
@@ -354,8 +377,10 @@ def notebook(name, commit, source_hash, date_suffix=None):
         All scores use raw predictions; a missing assay is not an observed negative and receives
         no non-detection posterior. Thus Hidden Recall@H is not used in this experiment.
         Additional plots show all benchmarks, methods without direct reference supervision,
-        and the three same-budget reference-plus-observation methods. Curves are descriptive
-        averages over folds and repetitions, not confidence intervals across animals."""),
+        and the three same-budget reference-plus-observation methods. A separate
+        `extra_sharing_gain_auprc` plot shows masked-panel minus full-panel model advantage,
+        with one standard error across repetitions after averaging folds. Real-data error bars
+        describe repeated mask/split variation, not biological sampling uncertainty."""),
         ("code", "figure_paths = {}\nfor label, artifacts in all_artifacts.items():\n"
          "    figure_paths[label] = plot_block_results(\n"
          "        artifacts, output_dir=FIGURE_DIR, show=True, include_benchmarks=True)\n"

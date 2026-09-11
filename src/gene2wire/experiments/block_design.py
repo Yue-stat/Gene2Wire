@@ -46,8 +46,8 @@ class BlockMaskConfig:
 
     def __post_init__(self):
         _fractions(self.fractions)
-        if self.group_mode not in {"animal", "artificial"}:
-            raise ValueError("group_mode must be 'animal' or 'artificial'")
+        if self.group_mode not in {"animal", "sample", "artificial"}:
+            raise ValueError("group_mode must be 'animal', 'sample', or 'artificial'")
         if (isinstance(self.n_artificial_groups, bool)
                 or not isinstance(self.n_artificial_groups, (int, np.integer))
                 or self.n_artificial_groups < 2):
@@ -76,15 +76,18 @@ def make_block_groups(dataset: ExperimentDataset, config: BlockMaskConfig,
     ids = _labels(dataset.cell_ids, name="cell_ids")
     if len(set(ids)) != len(ids):
         raise ValueError("cell_ids must be unique")
-    if config.group_mode == "animal":
-        key = next((key for key in ("animal", "animal_id") if key in dataset.groups), None)
+    if config.group_mode in {"animal", "sample"}:
+        aliases = ("animal", "animal_id") if config.group_mode == "animal" else ("sample",)
+        key = next((key for key in aliases if key in dataset.groups), None)
         if key is None:
-            raise ValueError("Animal block masking requires explicit animal or animal_id metadata")
-        groups = _labels(dataset.groups[key], name="animal groups")
+            choices = "animal or animal_id" if config.group_mode == "animal" else "sample"
+            raise ValueError(f"{config.group_mode.capitalize()} block masking requires explicit {choices} metadata")
+        groups = _labels(dataset.groups[key], name=f"{config.group_mode} groups")
         if groups.shape != ids.shape:
-            raise ValueError("Animal groups must align with cell_ids")
+            raise ValueError(f"{config.group_mode.capitalize()} groups must align with cell_ids")
         if len(np.unique(groups)) < 2:
-            raise ValueError("Animal block masking requires at least two animals")
+            plural = "animals" if config.group_mode == "animal" else "samples"
+            raise ValueError(f"{config.group_mode.capitalize()} block masking requires at least two {plural}")
         return groups.copy()
     if len(ids) < config.n_artificial_groups:
         raise ValueError("There must be at least one cell per artificial group")

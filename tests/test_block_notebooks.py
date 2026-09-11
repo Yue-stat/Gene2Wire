@@ -9,7 +9,8 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-NAMES = ("BARseq_A1", "BARseq_M1", "Projection_TAGs", "simulation", "SPIDER")
+NAMES = ("BARseq_A1", "BARseq_M1", "Projection_TAGs", "MERGE_seq",
+         "simulation", "SPIDER")
 
 
 def builder():
@@ -62,8 +63,10 @@ def test_shared_settings_and_correct_group_source(name):
         "RUN_INFORMATION_CONTROLS": True, "RUN_RANDOM_FOREST": True, "RUN_QIAO": True,
     }.items():
         assert namespace[key] == expected
-    assert namespace["GROUP_MODE"] == (
-        "artificial" if name in {"BARseq_M1", "simulation", "SPIDER"} else "animal")
+    expected_group = ("sample" if name == "MERGE_seq" else
+                      "artificial" if name in {"BARseq_M1", "simulation", "SPIDER"}
+                      else "animal")
+    assert namespace["GROUP_MODE"] == expected_group
 
 
 def test_location_switch_reaches_simulation_truth_and_settings():
@@ -91,6 +94,16 @@ def test_spider_reuses_shared_loader_and_never_infers_animal_ids():
     assert "group_mode=GROUP_MODE" in code
     assert "no verified animal IDs" in prose
     assert "not relabelled as animals" in prose
+
+
+def test_merge_uses_recorded_sample_groups_and_shared_loader():
+    nb = builder().notebook("MERGE_seq", "a" * 40, "b" * 64, "0911")
+    code = "\n".join(c["source"] for c in nb["cells"] if c["cell_type"] == "code")
+    prose = "\n".join(c["source"] for c in nb["cells"] if c["cell_type"] == "markdown")
+    assert "from gene2wire.experiments.datasets.merge_seq import load_merge_seq" in code
+    assert "GROUP_MODE = 'sample'" in code
+    assert "four recorded sample IDs" in prose
+    assert "not leave-one-sample-out" in prose
 
 
 @pytest.mark.parametrize("name", NAMES)

@@ -1,7 +1,7 @@
 # Group × target block experiment (0909)
 
 These are independent experiments; the dated primary notebooks are preserved.
-All five use the existing core estimators, information-budget baselines, tuning
+All six use the existing core estimators, information-budget baselines, tuning
 rules and feature adapters. There are no dataset-specific model patches.
 
 | Notebook | Groups | Interpretation |
@@ -9,6 +9,7 @@ rules and feature adapters. There are no dataset-specific model patches.
 | `BARseq_A1_block_masking_0909.ipynb` | Two recorded biological animals | Within-animal new-cell prediction under complementary target panels |
 | `BARseq_M1_block_masking_0909.ipynb` | Two balanced artificial groups within one animal | Controlled group-panel experiment, not two-animal validation |
 | `Projection_TAGs_block_masking_0909.ipynb` | Recorded animals, retaining native assay coverage | Additional structural blocks over the naturally incomplete assay |
+| `MERGE_seq_block_masking_0911.ipynb` | Four recorded experimental samples | Within-sample new-cell prediction under partial target panels |
 | `simulation_block_masking_0909.ipynb` | Two artificial groups for each generated dataset | Controlled test across sharing strengths 0, 0.5 and 1 |
 | `SPIDER_block_masking_0909.ipynb` | Two balanced artificial groups | Controlled within-group test; no verified animal IDs in the processed adapter |
 
@@ -122,9 +123,12 @@ The notebooks display and save PDF curves for the primary PU trio, all
 benchmarks, methods without direct reference training, and the same-budget
 reference-plus-PU/RF-mixed/reference-plus-PU-Joint trio. Main columns show AUPRC,
 log loss and Brier; rows compare masked and full training panels on matched
-test subsets. Lines are descriptive fold/repetition averages, without invented
-animal-level confidence intervals. The original dated primary plots remain
-available in their original notebooks.
+test subsets. A separate figure shows the matched change in PU-MIRT and PU-Joint
+AUPRC advantage under masking (`extra_sharing_gain_auprc`), with folds averaged
+inside each repetition and error bars equal to one standard error across
+repetitions. For real data these bars describe mask/split-design variation, not
+biological sampling uncertainty. The original dated primary plots remain available
+in their original notebooks.
 
 ## Reuse, progress and exports
 

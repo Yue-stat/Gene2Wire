@@ -8,7 +8,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from gene2wire.experiments.block_plotting import _block_aggregate, plot_block_results
+from gene2wire.experiments.block_plotting import (
+    _block_aggregate,
+    _extra_sharing_gain_auprc,
+    plot_block_results,
+)
 
 
 def _artifacts(*, natural=False):
@@ -31,6 +35,28 @@ def _artifacts(*, natural=False):
                              "macro_log_loss": .45, "macro_brier": .12,
                              "hidden_recall_at_h": 999.})
     return SimpleNamespace(tables={"aggregate": pd.DataFrame(rows)})
+
+
+def _gain_artifacts():
+    artifacts = _artifacts()
+    template = artifacts.tables["aggregate"].iloc[0].to_dict()
+    rows = []
+    for repetition in range(3):
+        for outer_fold in range(2):
+            for fraction in (.2, .4):
+                for model, full_advantage, multiplier in (
+                    ("PU", 0., 0.), ("PU-MIRT", .01, .5), ("PU-Joint", .01, 1.)):
+                    extra_gain = multiplier * (fraction / 10 + repetition / 100)
+                    for panel, baseline_score in (("masked", .30), ("full", .40)):
+                        advantage = full_advantage + (extra_gain if panel == "masked" else 0.)
+                        rows.append({**template, "model": model, "training_panel": panel,
+                                     "training_block_fraction": fraction if panel == "masked" else 0.,
+                                     "block_fraction": fraction, "repetition": repetition,
+                                     "outer_fold": outer_fold,
+                                     "probability_semantics": "p",
+                                     "macro_auprc": baseline_score + advantage})
+    artifacts.tables["metrics"] = pd.DataFrame(rows)
+    return artifacts
 
 
 def test_block_plots_keep_panel_controls_reference_budgets_and_pdf_display(tmp_path, monkeypatch):
@@ -84,6 +110,28 @@ def test_natural_labels_still_make_block_fraction_curves(tmp_path, monkeypatch):
     assert "natural" in figures[0]._suptitle.get_text()
     assert "positive-label loss" not in figures[0]._suptitle.get_text()
     assert all(np.allclose(line.get_xdata(), [.2, .4, .6, .8]) for line in figures[0].axes[0].lines)
+
+
+def test_extra_sharing_gain_is_paired_then_gets_repetition_level_se(tmp_path, monkeypatch):
+    artifacts = _gain_artifacts()
+    summary = _extra_sharing_gain_auprc(artifacts.tables)
+    joint = summary.loc[summary["model"].eq("PU-Joint")].sort_values("block_fraction")
+    np.testing.assert_allclose(joint["extra_sharing_gain_auprc"], [.03, .05])
+    np.testing.assert_allclose(joint["extra_sharing_gain_auprc_se"],
+                               np.repeat(.01 / np.sqrt(3), 2))
+    assert joint["n_repetitions"].tolist() == [3, 3]
+
+    figures = []
+    monkeypatch.setattr(plt, "show", lambda: figures.append(plt.gcf()))
+    paths = plot_block_results(artifacts, tmp_path, include_benchmarks=False)
+    assert len(paths) == len(figures) == 2
+    gain_key = next(key for key in paths if key.endswith("extra_sharing_gain_auprc"))
+    assert "extra_sharing_gain" in paths[gain_key].parts
+    assert paths[gain_key].read_bytes().startswith(b"%PDF")
+    gain_figure = figures[-1]
+    assert len(gain_figure.axes[0].containers) == 2
+    assert "Extra sharing gain" in gain_figure.axes[0].get_ylabel()
+    assert "±1 SE" in " ".join(text.get_text() for text in gain_figure.texts)
 
 
 def test_block_settings_never_average_across_loss_mechanism_or_rho(tmp_path, monkeypatch):
