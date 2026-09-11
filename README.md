@@ -234,6 +234,11 @@ plus the recorded selected family and its validation margin versus direct.
 This audits the recorded Joint search, not an inferred full MIRT grid. Full
 diagnostics derive the same table from older saved trials without refitting.
 
+The separate partial gene-panel overlap workflow is documented in
+`docs/GENE_OVERLAP_0910.md`. Its four generated notebooks keep projection
+targets fixed, expose an editable `OVERLAP_GRID`, mask only input expression,
+and disable random forest by default.
+
 ## Tests and development
 
 From a user-owned development environment:

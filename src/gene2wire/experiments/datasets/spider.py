@@ -359,6 +359,8 @@ def spider_dataset(
         name="SPIDER", reference=data.Z_reference, measured=data.W_measured,
         cell_ids=data.cell_ids, target_ids=data.target_ids,
         feature_builder=features, split_builder=splits,
+        gene_matrix=np.log1p(np.clip(data.X_gene_raw, 0, None)),
+        gene_names=tuple(data.gene_names),
         groups={"slice": data.slice_ids},
         metadata={
             "source_url": SPIDER_RDS_URL, "source_sha256": data.source_sha256,

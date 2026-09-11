@@ -267,6 +267,22 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
             tables["metrics"].append({**prefix, **evaluated["summary"]})
             tables["per_target"].extend({**prefix, **row} for row in evaluated["per_target"])
             tables["reliability"].extend({**prefix, **row} for row in evaluated["reliability"])
+            evaluation_group = prepared.metadata.get("evaluation_group")
+            if evaluation_group is not None:
+                if evaluation_group not in prepared.groups:
+                    raise ValueError(f"Unknown evaluation group {evaluation_group!r}")
+                labels = np.asarray(prepared.groups[evaluation_group])[test]
+                for label in np.unique(labels):
+                    selected_rows = np.flatnonzero(labels == label)
+                    group_evaluated = evaluate_predictions(
+                        prepared.reference[test][selected_rows], observed[test][selected_rows],
+                        prepared.measured[test][selected_rows], prediction[selected_rows],
+                        final_e[test][selected_rows], probability_semantics=semantics,
+                        train_reference_prevalence=prior, target_ids=prepared.target_ids,
+                        ranking_score=None if ranking_score is None else ranking_score[selected_rows])
+                    tables["per_group"].append({**prefix, "group_kind": evaluation_group,
+                                                "group": str(label),
+                                                **group_evaluated["summary"]})
             scores = {key: value for key, value in evaluated["scores"].items()
                       if value is not None and key != "prediction"}
             atomic_npz(audit_dir / f"{slug(name)}_predictions.npz", prediction=prediction,
@@ -283,6 +299,12 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
         tuning = settings.tuning_config(min(prepared.train_features.X.shape[1],
                                            prepared.refit_features.X.shape[1]), nt)
         models = settings.models()
+        model_allowlist = prepared.metadata.get("model_allowlist")
+        if model_allowlist is not None:
+            allowed = set(map(str, model_allowlist))
+            models = tuple(model for model in models if model.name in allowed)
+            if not models:
+                raise ValueError("model_allowlist removed every configured model")
         if scenario["analysis"].startswith("calibration"):
             models = tuple(m for m in models if m.pu)
         runner_context = {k: v for k, v in context.items() if k != "analysis"}
@@ -402,7 +424,9 @@ def _atomic_csv(frame, destination):
 
 _GROUP_COLUMNS = ["dataset", "sharing_strength", "analysis", "mechanism", "loss_rate",
                   "calibration_fraction", "calibration_spec", "model", "probability_semantics",
-                  "experiment", "group_mode", "training_panel", "training_block_fraction", "evaluation_scope", "block_fraction"]
+                  "experiment", "group_mode", "training_panel", "training_block_fraction",
+                  "evaluation_scope", "block_fraction", "panel_design", "arm",
+                  "requested_overlap", "actual_overlap", "panel_size"]
 
 
 def _summarize(tables, *, simulation):
@@ -438,8 +462,12 @@ def _planned_models(prepared, settings):
     """Model evaluations per fold/repetition, before any outcome is examined."""
     rows = []
     for scenario in _scenarios(prepared, settings):
+        allowlist = prepared.metadata.get("model_allowlist")
         names = [m.name for m in settings.models()
                  if m.pu or not scenario["analysis"].startswith("calibration")]
+        if allowlist is not None:
+            allowed = set(map(str, allowlist))
+            names = [name for name in names if name in allowed]
         if scenario["analysis"] == "primary":
             if settings.run_information_controls:
                 names += ["Reference-only", "Reference+PU", "Reference+PU-MIRT", "Reference+PU-Joint"]
@@ -553,6 +581,7 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
         input_identities.append({"name": dataset.name,
             "repetition": dataset.metadata.get("experiment_repetition", dataset.metadata.get("repetition")),
             "experiment_context": dataset.metadata.get("experiment_context", {}),
+            "model_allowlist": dataset.metadata.get("model_allowlist"),
             "evaluation": None if dataset.evaluation is None else {
                 "reference": sha256_array(dataset.evaluation.reference),
                 "source_measured": sha256_array(dataset.evaluation.source_measured),

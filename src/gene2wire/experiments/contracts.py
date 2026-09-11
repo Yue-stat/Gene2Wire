@@ -84,6 +84,11 @@ class ExperimentDataset:
     technical_score: np.ndarray | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
     evaluation: EvaluationSpec | None = None
+    # Optional fold-independent gene-scale matrix used by panel-overlap views.
+    # Values must be on the transform scale immediately before standardization
+    # (for example log1p counts). It is never passed directly to a learner.
+    gene_matrix: np.ndarray | None = None
+    gene_names: tuple[str, ...] = ()
 
     def validate(self) -> None:
         z, w = np.asarray(self.reference), np.asarray(self.measured)
@@ -97,6 +102,12 @@ class ExperimentDataset:
             raise ValueError("Cell IDs must be unique and aligned")
         if len(self.target_ids) != z.shape[1] or len(set(self.target_ids)) != z.shape[1]:
             raise ValueError("Target IDs must be unique and aligned")
+        if self.gene_matrix is not None:
+            x = np.asarray(self.gene_matrix)
+            if x.ndim != 2 or x.shape[0] != z.shape[0] or not np.all(np.isfinite(x)):
+                raise ValueError("gene_matrix must be a finite cell-by-gene matrix")
+            if len(self.gene_names) != x.shape[1] or len(set(self.gene_names)) != x.shape[1]:
+                raise ValueError("gene_names must be unique and aligned with gene_matrix")
         for name, values in self.groups.items():
             if np.asarray(values).shape != (z.shape[0],):
                 raise ValueError(f"Group {name!r} is not aligned to cells")
