@@ -8,6 +8,7 @@ from gene2wire.experiments.gene_overlap import (
     crossed_panel_assignment,
     draw_gene_panels,
     overlap_view,
+    paired_group_folds,
     validate_overlap_grid,
 )
 
@@ -69,4 +70,16 @@ def test_views_keep_targets_outcomes_and_outer_splits_unchanged():
         changed = view.split_builder(2, 10)
         for left, right in zip(original, changed):
             np.testing.assert_array_equal(left.test_rows, right.test_rows)
+
+
+def test_paired_group_folds_put_a_complete_pair_in_each_role():
+    base = _simulation()
+    groups = np.repeat(np.arange(1, 7), 10)
+    grouped = replace(base, groups={**base.groups, "animal": groups})
+    paired = paired_group_folds(grouped, "animal", ((1, 4), (2, 5), (3, 6)))
+    folds = paired.split_builder(3, 0)
+    for fold in folds:
+        assert len(np.unique(groups[fold.train_rows])) == 2
+        assert len(np.unique(groups[fold.validation_rows])) == 2
+        assert len(np.unique(groups[fold.test_rows])) == 2
 
