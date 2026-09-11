@@ -33,8 +33,12 @@ Defaults: three folds, five repetitions, 32 requested workers, location and targ
 features disabled, the shared `full_joint` search with candidate budget 32.
 Logistic, MIRT, Joint, RF-observed and both Qiao formulations use the same feature
 and label budget. The Qiao comparison uses target IDs unless independent target
-descriptors are supplied. Joint retains its exact direct and residual-off search
-endpoints. No estimator or tuning grid is customized for SPIDER-Seq.
+descriptors are supplied. Joint receives the native 32-candidate shared-plus-
+specific search plus the exact selected Logistic and MIRT endpoints; endpoint
+fits are reused through the common caches. No estimator or tuning grid is
+customized for SPIDER-Seq. The companion `SPIDER_Seq_block_masking_0911.ipynb`
+evaluates the same native animal panels under held-out target blocks; its masked
+test entries have known original references and are therefore scored separately.
 
 Cell counts are normalized to 10,000 and log transformed. The default selects
 2,000 training-variable genes and fits 50 training-only principal components.
@@ -65,7 +69,7 @@ same likelihood as their corresponding ordinary structures here and are omitted.
 ## Outputs and interpretation
 
 Outputs remain under `/home/yueyue/gene2wire/paper_figure_exports`. Model checkpoints
-use `checkpoints/native_panels_v1`; raw/processed files use `raw_data/SPIDER_Seq`.
+use `checkpoints/native_panels_v2`; raw/processed files use `raw_data/SPIDER_Seq`.
 Progress is reported once per minute in Los Angeles time. Worker status separates
 kernel CPU allowance from running experiment workers.
 

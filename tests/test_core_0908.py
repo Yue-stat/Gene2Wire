@@ -63,6 +63,46 @@ def test_budget_keeps_exact_endpoints_with_target_features():
         full_joint_candidates(base, tuning(include_endpoints=True, candidate_budget=2))
 
 
+def test_joint_native_budget_and_explicit_winner_endpoints():
+    train, validation, _, _, _ = partitions()
+    direct_winner = ModelConfig(name="Logistic", kind="direct", residual_l2=0.007)
+    lowrank_winner = ModelConfig(name="MIRT", kind="lowrank", rank=2,
+                                 shared_l2=0.013)
+    result = tune_model(
+        train, validation, .65, .65,
+        ModelConfig(name="Joint", kind="joint", rank=1),
+        tuning(candidate_budget=3, include_endpoints=True),
+        fit=fit_config(), seed=92,
+        required_endpoints=(direct_winner, lowrank_winner),
+    )
+    assert len(result.trials) == 5
+    assert sum(trial.config.kind == "joint" for trial in result.trials) == 3
+    assert sum(trial.stage == "inherited_endpoint" for trial in result.trials) == 2
+    identities = {str(model_identity(trial.config)) for trial in result.trials}
+    assert str(model_identity(direct_winner)) in identities
+    assert str(model_identity(lowrank_winner)) in identities
+
+
+def test_staged_joint_native_budget_appends_exact_endpoints():
+    train, validation, _, _, _ = partitions()
+    direct_winner = ModelConfig(name="Logistic", kind="direct", residual_l2=.007)
+    lowrank_winner = ModelConfig(name="MIRT", kind="lowrank", rank=2,
+                                 shared_l2=.013)
+    result = tune_model(
+        train, validation, .65, .65,
+        ModelConfig(name="Joint", kind="joint", rank=1),
+        tuning(strategy="staged_rank_l2", candidate_budget=4,
+               include_endpoints=True),
+        fit=fit_config(), seed=94,
+        required_endpoints=(direct_winner, lowrank_winner),
+    )
+    assert len(result.trials) == 6
+    assert sum(trial.config.kind == "joint" for trial in result.trials) == 4
+    assert {trial.stage for trial in result.trials} == {
+        "rank", "penalty", "inherited_endpoint"
+    }
+
+
 def test_rank_zero_is_exact_direct_even_with_finite_iterations():
     train, _, _, _, _ = partitions()
     direct = ModelConfig(name="PU", kind="direct", residual_l2=.1)

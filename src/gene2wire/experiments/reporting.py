@@ -647,7 +647,10 @@ def _matched_panel_control(tables: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
     required = {"training_panel", "model", "repetition", "outer_fold", "block_fraction"}
     if metrics.empty or not required.issubset(metrics):
         return pd.DataFrame()
-    metrics = metrics.loc[metrics.model.isin(_PU_MODELS)]
+    assay_only = _assay_only(metrics)
+    baseline_name = "Logistic" if assay_only else "PU"
+    structure_models = ("Logistic", "MIRT", "Joint") if assay_only else _PU_MODELS
+    metrics = metrics.loc[metrics.model.isin(structure_models)]
     values = [name for name in ("macro_auprc", "macro_log_loss", "macro_brier") if name in metrics]
     groups = [name for name in (*_CONTEXT, "repetition", "outer_fold") if name in metrics
               and name not in ("training_panel", "training_block_fraction")]
@@ -664,7 +667,7 @@ def _matched_panel_control(tables: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
         paired[column] = sign * (paired[f"{name}_masked"]-paired[f"{name}_full"])
         loss_columns.append(column)
     baseline_groups = [name for name in groups if name != "model"]
-    baseline = paired.loc[paired.model.eq("PU"), baseline_groups+loss_columns]
+    baseline = paired.loc[paired.model.eq(baseline_name), baseline_groups+loss_columns]
     paired = paired.merge(baseline, on=baseline_groups, how="left", suffixes=("", "_PU"), validate="many_to_one")
     difference_columns = []
     for name in loss_columns:

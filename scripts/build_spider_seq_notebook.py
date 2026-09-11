@@ -42,7 +42,7 @@ EXPORT_CELL_FORECASTS = True  # Compressed CSV means/SDs; per-fold NPZs are alwa
 
 BASE_DIR = Path('/home/yueyue/gene2wire').expanduser()
 RAW_DATA_DIR = BASE_DIR / 'raw_data'
-CHECKPOINT_DIR = BASE_DIR / 'checkpoints' / 'native_panels_v1'
+CHECKPOINT_DIR = BASE_DIR / 'checkpoints' / 'native_panels_v2'
 EXPORT_DIR = BASE_DIR / 'paper_figure_exports'
 FIGURE_DIR = BASE_DIR / 'figures' / '__DATE__' / 'SPIDER_Seq_native_panels'
 CODE_CACHE_DIR = BASE_DIR / 'code'
@@ -146,10 +146,14 @@ def notebook(commit, source_hash, date_suffix):
 
         No independent paired reference is available here. Models therefore predict
         the probability of an assay-positive call. Logistic, MIRT and Joint use the
-        same core estimators and tuning rules as the other notebooks. With unit
-        additional retention, their PU counterparts have identical likelihoods;
-        duplicate aliases are not fitted. This does not assume perfect biological
-        detection. RF and Qiao use the same observed labels and feature budget.'''),
+        same core estimators and tuning rules as the other notebooks. Joint uses
+        the native candidate budget for genuine shared-plus-specific candidates
+        and carries the exact selected Logistic and MIRT configurations as two
+        mandatory endpoints when those models are in the run. This prevents the
+        bounded Joint grid from silently omitting the best standalone low-rank
+        configuration. Endpoint fits are reused from the common caches. This
+        does not assume perfect biological detection. RF and Qiao use the same
+        observed labels and feature budget.'''),
         ('code', SETTINGS),
         ('markdown', '''## Kernel CPU allowance and experiment workers
 
@@ -174,8 +178,11 @@ def notebook(commit, source_hash, date_suffix):
 
         Each cell is held out once per repetition. All models receive the same
         cells, features, assay mask and validation observations. Joint searches
-        include exact direct and residual-off endpoints. Compatible complete and
-        partial checkpoints resume automatically. Feature preparation and model
+        include the exact independently tuned direct and low-rank winners as
+        inherited endpoints. `CANDIDATE_BUDGET` counts only genuine Joint
+        candidates; the maximum Joint selection set is therefore `B + 2` when
+        both standalone endpoints are available. Compatible complete and partial
+        checkpoints resume automatically. Feature preparation and model
         fitting report separately in Los Angeles time. With the defaults,
         5 repetitions x 3 folds x 2 fit roles gives 30 feature sets before the
         model-unit progress denominator begins.'''),
@@ -186,6 +193,30 @@ def notebook(commit, source_hash, date_suffix):
         progress=SHOW_PROGRESS, progress_interval=PROGRESS_INTERVAL_SECONDS,
         worker_status=worker_status, export_cell_forecasts=EXPORT_CELL_FORECASTS)
     all_artifacts = {'SPIDER-Seq': artifacts}'''),
+        ('markdown', '''## Audit the Joint candidate budget and inherited endpoints
+
+        This compact audit is useful for interpreting a Joint result. The native
+        candidate budget is the number of newly evaluated genuine Joint fits;
+        `inherited_endpoint` rows are exact standalone winners carried into the
+        same validation comparison and normally loaded from the shared candidate
+        cache. Complete trial records remain in `tuning.csv`.'''),
+        ('code', '''if not RESULTS_ONLY:
+    tuning_audit = artifacts.tables.get('tuning', pd.DataFrame()).copy()
+    if not tuning_audit.empty:
+        joint_audit = tuning_audit.loc[tuning_audit['model'].eq('Joint')].copy()
+        if not joint_audit.empty:
+            endpoint_summary = (joint_audit.assign(
+                endpoint=joint_audit['stage'].eq('inherited_endpoint'),
+                genuine_joint=joint_audit['kind'].eq('joint'))
+                .groupby(['repetition', 'outer_fold'], observed=True)
+                [['endpoint', 'genuine_joint']].sum().reset_index())
+            endpoint_summary['max_selectable'] = endpoint_summary['endpoint'] + endpoint_summary['genuine_joint']
+            display(endpoint_summary)
+            print({'native_joint_budget': CANDIDATE_BUDGET,
+                   'expected_inherited_endpoints': 2,
+                   'expected_max_selectable': CANDIDATE_BUDGET + 2})
+    else:
+        print('No tuning table available in RESULTS_ONLY mode; inspect tuning.csv.')'''),
         ('markdown', '''## Recover observed-panel summaries and unassayed forecasts
 
         This step can run from saved predictions alone. Measured-test metrics and

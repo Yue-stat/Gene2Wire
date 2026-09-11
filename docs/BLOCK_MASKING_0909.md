@@ -93,7 +93,8 @@ the original standard assay and union reference, without artificial thinning.
 All enabled models run at every configured setting. Defaults retain the six
 ordinary/PU structures, reference-only logistic, three reference-plus-PU
 structures, three random-forest supervision variants, and two declared Qiao
-adaptations. Existing exact direct and residual-off Joint endpoints and common
+adaptations. The shared core gives Joint its native 32-candidate search and
+appends the exact selected direct and low-rank endpoints; common
 tuning budgets are unchanged. At zero additional thinning, ordinary and PU
 objectives may coincide. These runs test sharing under missing panels, not an
 assumed benefit of PU correction in the absence of positive loss.

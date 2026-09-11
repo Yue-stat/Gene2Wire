@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, replace
 from itertools import product
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Callable, Iterable, Mapping, MutableMapping
+from typing import Any, Callable, Iterable, Mapping, MutableMapping, Sequence
 
 import numpy as np
 
@@ -313,6 +313,7 @@ def tune_model(
     warm_start_cache: DirectWarmStartCache | None = None,
     candidate_cache: MutableMapping[str, TrialResult] | None = None,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
+    required_endpoints: Sequence[ModelConfig] | None = None,
 ) -> TuningResult:
     """Tune only on explicitly supplied train and validation bundles.
 
@@ -320,6 +321,13 @@ def tune_model(
     observed-label log loss for ``q=e*p`` on measured validation entries.
     ``on_progress`` receives stage-specific cache inventories and timed candidate
     events. Its diagnostics do not participate in fitting or cache identity.
+
+    When ``required_endpoints`` is supplied for a Joint model, the bounded
+    ``candidate_budget`` applies only to genuine ``kind='joint'`` candidates.
+    The supplied direct and low-rank configurations are evaluated as mandatory
+    boundary candidates in addition to that budget. Their statistical fits are
+    eligible for the shared candidate/refit caches, so carrying a tuned
+    standalone winner into Joint does not duplicate optimization work.
     """
 
     _validate_schema_alignment(train, validation, base_model)
@@ -341,6 +349,27 @@ def tune_model(
     train_safe = train.without_reference()
     validation_safe = validation.without_reference()
     trials: list[TrialResult] = []
+
+    required = tuple(required_endpoints or ())
+    if required:
+        if base_model.kind != "joint":
+            raise ValueError("required_endpoints are supported only for Joint tuning")
+        normalized_required = []
+        seen_required = set()
+        for endpoint in required:
+            if not isinstance(endpoint, ModelConfig):
+                raise TypeError("required_endpoints must contain ModelConfig values")
+            config = canonical_model_config(endpoint).with_updates(name=base_model.name)
+            if config.kind not in {"direct", "lowrank"}:
+                raise ValueError("required Joint endpoints must be direct or lowrank")
+            if (config.pu != base_model.pu
+                    or config.use_target_features != base_model.use_target_features):
+                raise ValueError("required Joint endpoints must match PU and target-feature settings")
+            identity = canonical_json(model_identity(config))
+            if identity not in seen_required:
+                normalized_required.append(config)
+                seen_required.add(identity)
+        required = tuple(normalized_required)
     # Also protect standalone tune_model callers: a supplied cache namespace is
     # never permission to reuse scores for different labels or exposures.
     hashes = {}
@@ -455,7 +484,60 @@ def tune_model(
              elapsed_seconds=perf_counter() - stage_started)
         return tuple(stage_trials)
 
-    if tuning.strategy == "full_joint" or base_model.kind == "direct":
+    if required:
+        # The incumbent endpoint policy is deliberately independent of the
+        # enumeration used by the legacy include_endpoints grid.  Positive
+        # ranks are genuine Joint configurations; rank zero is a direct alias
+        # and is therefore not counted against the native Joint budget.
+        positive_ranks = tuple(rank for rank in tuning.ranks if rank > 0)
+        native_trials: tuple[TrialResult, ...]
+        if not positive_ranks:
+            native_trials = ()
+        else:
+            # Keep the declared search strategy.  In particular, a staged
+            # Joint search gets a rank stage followed by a penalty stage; the
+            # only difference from the ordinary path is that its budget is
+            # reserved for genuine Joint candidates and exact standalone
+            # winners are appended afterwards.
+            native_tuning = replace(
+                tuning, ranks=positive_ranks, include_endpoints=False
+            )
+            if tuning.strategy == "staged_rank_l2":
+                first = _stage_one_candidates(base_model, native_tuning)
+                if tuning.candidate_budget is not None:
+                    first_budget = min(
+                        tuning.candidate_budget,
+                        max(1, tuning.candidate_budget // 2),
+                    )
+                    first = _budget_candidates(first, first_budget)
+                rank_trials = evaluate(first, "rank")
+                selected = _winner(rank_trials).config
+                second = _stage_two_candidates(
+                    selected, native_tuning, selected.rank
+                )
+                done = {
+                    canonical_json(model_identity(trial.config))
+                    for trial in rank_trials
+                }
+                second = tuple(
+                    candidate
+                    for candidate in second
+                    if canonical_json(model_identity(candidate)) not in done
+                )
+                if tuning.candidate_budget is not None:
+                    remaining = tuning.candidate_budget - len(rank_trials)
+                    second = (
+                        ()
+                        if remaining <= 0
+                        else _budget_candidates(second, remaining)
+                    )
+                native_trials = (*rank_trials, *evaluate(second, "penalty"))
+            else:
+                native = full_joint_candidates(base_model, native_tuning)
+                native_trials = evaluate(native, "joint_grid")
+        endpoint_trials = evaluate(required, "inherited_endpoint")
+        selectable = (*native_trials, *endpoint_trials)
+    elif tuning.strategy == "full_joint" or base_model.kind == "direct":
         selectable = evaluate(full_joint_candidates(base_model, tuning), "joint_grid")
     else:
         first = _stage_one_candidates(base_model, tuning)

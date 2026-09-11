@@ -118,7 +118,17 @@ def _block_curve(axis, frame: pd.DataFrame, metric: str, models: tuple[str, ...]
 
 def _categories(frame: pd.DataFrame, include_benchmarks: bool):
     available = _benchmark_models(frame)
-    primary = tuple(model for model in PU_MODELS if model in available)
+    # Single-assay native-panel runs declare their supervision profile in the
+    # exported mechanism coordinate.  Do not infer assay-only status merely
+    # because Logistic/MIRT/Joint rows happen to be present in a mixed table.
+    assay_primary = ("Logistic", "MIRT", "Joint")
+    assay_only = (
+        "mechanism" in frame
+        and frame["mechanism"].notna().all()
+        and frame["mechanism"].eq("assay_only").all()
+    )
+    primary_order = assay_primary if assay_only else PU_MODELS
+    primary = tuple(model for model in primary_order if model in available)
     if primary:
         yield "primary", primary
     if not include_benchmarks:

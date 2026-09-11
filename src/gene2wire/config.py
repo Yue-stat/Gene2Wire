@@ -101,6 +101,9 @@ class TuningConfig:
     anchor_residual_l2: float = 1e-3
     anchor_target_l2: float = 1e-3
     metric: str = "observed_log_loss"
+    # The budget counts candidates in the model's native structural family.
+    # For Joint with include_endpoints=True, exact independently tuned direct
+    # and low-rank winners may be appended without consuming this budget.
     candidate_budget: int | None = None
     include_endpoints: bool = False
 

@@ -32,7 +32,7 @@ from .seeds import stable_seed
 from .tuning import TuningResult, tune_model
 
 
-CORE_API_VERSION = "0.3.2"
+CORE_API_VERSION = "0.3.3"
 
 
 @dataclass(frozen=True)
@@ -260,6 +260,52 @@ def run_model_grid(
     if not isinstance(code_version, str) or not code_version:
         raise ValueError("code_version must be nonempty")
 
+    # Joint is a nested model family.  When exact endpoints are requested,
+    # direct and low-rank models with the same PU/target-feature semantics are
+    # tuned first, even if the caller supplied a different model order.  This
+    # keeps the public API order-independent while making the inherited winner
+    # available to Joint tuning and to the shared candidate/refit caches.
+    def endpoint_sources(base_model: ModelConfig) -> tuple[ModelConfig, ...]:
+        model_tuning = _resolve_tuning(tuning, base_model.name)
+        if base_model.kind != "joint" or not model_tuning.include_endpoints:
+            return ()
+        matches = [candidate for candidate in base_models
+                   if candidate.kind in {"direct", "lowrank"}
+                   and candidate.pu == base_model.pu
+                   and candidate.use_target_features == base_model.use_target_features]
+        by_kind = {}
+        for candidate in matches:
+            by_kind.setdefault(candidate.kind, []).append(candidate)
+        selected = []
+        for kind in ("direct", "lowrank"):
+            values = by_kind.get(kind, [])
+            if len(values) > 1:
+                raise ValueError(
+                    f"Joint model {base_model.name!r} has multiple compatible {kind} "
+                    "models; exact endpoint inheritance is ambiguous"
+                )
+            if values:
+                source = values[0]
+                if asdict(_resolve_fit(fit, source.name)) != asdict(_resolve_fit(fit, base_model.name)):
+                    raise ValueError(
+                        f"Joint model {base_model.name!r} and its {kind} endpoint "
+                        "must use the same FitConfig"
+                    )
+                selected.append(source)
+        return tuple(selected)
+
+    endpoint_source_map = {
+        model.name: endpoint_sources(model)
+        for model in base_models if model.kind == "joint"
+    }
+    # A source model is always executed before its dependent Joint alias.  The
+    # returned mapping below is restored to the caller's order.
+    kind_order = {"direct": 0, "lowrank": 1, "joint": 2}
+    execution_models = tuple(sorted(
+        base_models,
+        key=lambda model: (int(model.pu), kind_order[model.kind], base_models.index(model)),
+    ))
+
     test_array = np.asarray(test_X, dtype=np.float64)
     if test_array.ndim != 2 or test_array.shape[1] != train.n_features:
         raise ValueError("test_X must be 2-D with the fitted feature count")
@@ -342,7 +388,12 @@ def run_model_grid(
         model.name: experiment_fingerprint(
             {"data_fingerprint": data_fingerprint, "model": asdict(model),
              "tuning": asdict(_resolve_tuning(tuning, model.name)),
-             "fit": asdict(_resolve_fit(fit, model.name))},
+             "fit": asdict(_resolve_fit(fit, model.name)),
+             "inherited_endpoint_sources": [
+                 {"model": model_identity(source),
+                  "tuning": asdict(_resolve_tuning(tuning, source.name)),
+                  "fit": asdict(_resolve_fit(fit, source.name))}
+                 for source in endpoint_source_map.get(model.name, ())]},
             input_hashes=input_hashes, code_version=code_version,
             seeds={"base_seed": seed}, source_hash=source_hash,
         ) for model in base_models
@@ -395,7 +446,7 @@ def run_model_grid(
         if on_progress is not None:
             on_progress({"event": event, "model": model, **details})
 
-    for model_index, base_model in enumerate(base_models, start=1):
+    for model_index, base_model in enumerate(execution_models, start=1):
         model_started = perf_counter()
         model_key = unit_key(task="completed_model", **context, model=base_model.name)
         model_fingerprint = model_fingerprints[base_model.name]
@@ -441,6 +492,11 @@ def run_model_grid(
         model_tuning = _resolve_tuning(tuning, base_model.name)
         model_fit = _resolve_fit(fit, base_model.name)
         tuning_seed = stable_seed(seed, "tune")
+        required = tuple(
+            results[source.name].tuning.best_config.with_updates(name=base_model.name)
+            for source in endpoint_source_map.get(base_model.name, ())
+            if source.name in results
+        )
         tuned = tune_model(
             train=train,
             validation=validation,
@@ -456,6 +512,7 @@ def run_model_grid(
             warm_start_cache=tuning_warm_starts,
             candidate_cache=candidate_cache,
             on_progress=on_progress,
+            required_endpoints=required or None,
         )
         refit_started = perf_counter()
         refit_key, final_seed = final_coordinates(tuned.best_config, model_fit)
@@ -525,5 +582,5 @@ def run_model_grid(
         fingerprint=fingerprint,
         code_version=code_version,
         test_cell_ids=test_ids,
-        models=results,
+        models={model.name: results[model.name] for model in base_models},
     )

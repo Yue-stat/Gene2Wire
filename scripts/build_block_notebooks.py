@@ -17,7 +17,7 @@ _spec = importlib.util.spec_from_file_location(
     "_gene2wire_notebook_common", ROOT / "scripts" / "build_notebooks_0908.py")
 _common = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_common)
-NAMES = ("BARseq_A1", "BARseq_M1", "Projection_TAGs", "simulation", "SPIDER")
+NAMES = ("BARseq_A1", "BARseq_M1", "Projection_TAGs", "simulation", "SPIDER", "SPIDER_Seq")
 
 
 CONFIG = '''
@@ -34,6 +34,7 @@ STRATEGY = 'full_joint'
 CANDIDATE_BUDGET = 32
 SEED = 20260909
 PAIRED_FRACTION = 0.20
+SUPERVISION_PROFILE = '__SUPERVISION_PROFILE__'
 
 # Fraction of eligible TARGETS receiving a partial group panel, not positive loss.
 BLOCK_FRACTIONS = (0.20, 0.40, 0.60, 0.80)
@@ -72,7 +73,7 @@ for variable in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
 
 
 SETTINGS = '''
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import numpy as np
 import pandas as pd
 from IPython.display import display
@@ -95,11 +96,13 @@ settings = Settings(
     use_target_features=USE_TARGET_FEATURES, n_jobs=N_JOBS,
     parallel_unit=PARALLEL_UNIT, n_repetitions=N_REPETITIONS,
     strategy=STRATEGY, candidate_budget=CANDIDATE_BUDGET, seed=SEED,
-    paired_fraction=PAIRED_FRACTION, calibration_fractions=(PAIRED_FRACTION,),
+    paired_fraction=0.0 if SUPERVISION_PROFILE == 'assay_only' else PAIRED_FRACTION,
+    calibration_fractions=() if SUPERVISION_PROFILE == 'assay_only' else (PAIRED_FRACTION,),
     loss_rates=POSITIVE_LOSS_RATES,
-    run_information_controls=RUN_INFORMATION_CONTROLS,
+    run_information_controls=(RUN_INFORMATION_CONTROLS and SUPERVISION_PROFILE != 'assay_only'),
     run_random_forest=RUN_RANDOM_FOREST, run_qiao=RUN_QIAO,
     run_mechanism_controls=False, run_calibration_controls=False,
+    supervision_profile=SUPERVISION_PROFILE,
 )
 block_config = BlockMaskConfig(
     fractions=BLOCK_FRACTIONS, group_mode=GROUP_MODE,
@@ -113,7 +116,8 @@ if SHOW_FULL_DIAGNOSTICS:
 else:
     print({'folds': N_OUTER_FOLDS, 'repetitions': N_REPETITIONS, 'n_jobs': N_JOBS,
            'use_location': USE_LOCATION, 'use_target_features': USE_TARGET_FEATURES,
-           'paired_fraction': PAIRED_FRACTION, 'block_fractions': BLOCK_FRACTIONS,
+           'paired_fraction': settings.paired_fraction, 'supervision_profile': SUPERVISION_PROFILE,
+           'block_fractions': BLOCK_FRACTIONS,
            'positive_loss_rates': POSITIVE_LOSS_RATES, 'group_mode': GROUP_MODE,
            'full_panel_control': INCLUDE_FULL_PANEL_CONTROL})
 if RESULTS_ONLY:
@@ -154,15 +158,32 @@ def preflight_blocks(dataset):
     tuning = settings.tuning_config(features.X.shape[1], len(dataset.target_ids))
     candidates = []
     for model in settings.models():
-        candidates.extend({'model': model.name, 'candidate': index, **asdict(candidate)}
-                          for index, candidate in enumerate(full_joint_candidates(model, tuning), 1))
+        if model.kind == 'joint' and tuning.include_endpoints:
+            positive_ranks = tuple(rank for rank in tuning.ranks if rank > 0)
+            native_tuning = replace(tuning, ranks=positive_ranks,
+                                    include_endpoints=False) if positive_ranks else None
+            native = () if native_tuning is None else full_joint_candidates(model, native_tuning)
+            candidates.extend({'model': model.name, 'candidate': index,
+                               'candidate_role': 'genuine_joint', **asdict(candidate)}
+                              for index, candidate in enumerate(native, 1))
+            candidates.extend([{'model': model.name, 'candidate': pd.NA,
+                                'candidate_role': 'inherited_endpoint', 'kind': kind,
+                                'rank': pd.NA, 'shared_l2': pd.NA, 'residual_l2': pd.NA,
+                                'use_target_features': model.use_target_features,
+                                'target_l2': pd.NA, 'pu': model.pu}
+                               for kind in ('direct', 'lowrank')])
+        else:
+            candidates.extend({'model': model.name, 'candidate': index,
+                               'candidate_role': 'native', **asdict(candidate)}
+                              for index, candidate in enumerate(full_joint_candidates(model, tuning), 1))
     candidate_table = pd.DataFrame(candidates)
     if SHOW_FULL_DIAGNOSTICS:
         display(candidate_table)
         display(pd.DataFrame([asdict(settings.fit_config())]))
     else:
         display(candidate_table.groupby('model').size().to_frame('candidates'))
-    print('No input genes are masked. Each group appears in training, validation and test.')
+    print('Joint rows marked inherited_endpoint are the two exact standalone winners; '
+          'they are selected after the standalone fits and reuse their caches.')
     print('Blocked entries are excluded from calibration, model fitting and validation scoring.')
 '''
 
@@ -186,14 +207,18 @@ def notebook(name, commit, source_hash, date_suffix=None):
     date_suffix = _common.release_date(date_suffix)
     artificial = name in {"BARseq_M1", "simulation", "SPIDER"}
     label = {"BARseq_A1": "A1", "BARseq_M1": "M1",
-             "Projection_TAGs": "Projection-TAGs", "simulation": "simulation", "SPIDER": "SPIDER"}[name]
+             "Projection_TAGs": "Projection-TAGs", "simulation": "simulation", "SPIDER": "SPIDER",
+             "SPIDER_Seq": "SPIDER-Seq"}[name]
     modules = ["numpy", "scipy", "pandas", "sklearn", "joblib", "threadpoolctl",
                "matplotlib", "yaml", "IPython"]
     if name == "Projection_TAGs":
         modules += ["rdata", "openpyxl"]
+    elif name == "SPIDER_Seq":
+        modules.append("rdata")
     elif name == "SPIDER":
         modules.append("rdata")
     config = (CONFIG.replace("__GROUP_MODE__", "artificial" if artificial else "animal")
+              .replace("__SUPERVISION_PROFILE__", "assay_only" if name == "SPIDER_Seq" else "paired_reference")
               .replace("__DATE__", date_suffix).replace("__COMMIT__", commit)
               .replace("__HASH__", source_hash).replace("__EXPORT_DIRS__", repr({label: None})))
     config += f"\nREQUIRED_MODULES = {modules!r}\nEXPECTED_EXPORT_LABELS = {(label,)!r}\n"
@@ -203,6 +228,7 @@ def notebook(name, commit, source_hash, date_suffix=None):
         "Projection_TAGs": "Projection-TAGs uses recorded animal IDs and preserves the native assay mask. Only targets measured in at least two animals are eligible. Standard detections remain natural; the union reference is an imperfect evaluation reference.",
         "simulation": "Each repetition generates independent data for each sharing strength. Two balanced artificial groups allow known low-rank structure to be tested under partial target panels.",
         "SPIDER": "The current processed SPIDER adapter exposes slices but no verified animal IDs. Two balanced artificial groups test partial target panels while retaining all input genes. These groups are not animals, and slices are not relabelled as animals.",
+        "SPIDER_Seq": "SPIDER-Seq Adult1/2/3 provide verified biological animal IDs and partially overlapping native target panels. Only targets measured in at least two animals are eligible for a held-out block.",
     }[name]
     parts = [
         ("markdown", f"""# Gene2Wire {name}: group × target blocks — OnDemand {date_suffix}
@@ -290,6 +316,25 @@ def notebook(name, commit, source_hash, date_suffix=None):
                 from gene2wire.experiments.datasets.spider import load_spider
                 dataset = load_spider(
                     RAW_DATA_DIR / 'SPIDER', target_features_csv=TARGET_FEATURES_CSV)
+                preflight_blocks(dataset)
+            """)),
+        ]
+    elif name == "SPIDER_Seq":
+        parts += [
+            ("markdown", """## SPIDER-Seq native animal panels
+
+            Adult1, Adult2 and Adult3 use the verified partially overlapping target
+            panels from the same SPIDER-Seq study. Only targets measured in at least
+            two animals are eligible for block masking. The biological animal IDs are
+            retained; no artificial groups are introduced."""),
+            ("code", "TARGET_FEATURES_CSV = None"),
+            ("markdown", "## Load cached SPIDER-Seq inputs and preview native panel masks"),
+            ("code", guarded("""
+                from gene2wire.experiments.datasets.spider_seq import load_spider_seq
+                dataset = load_spider_seq(
+                    RAW_DATA_DIR / 'SPIDER_Seq', n_hvg=2000, n_gene_components=50,
+                    location_features_csv=LOCATION_FEATURES_CSV,
+                    target_features_csv=TARGET_FEATURES_CSV)
                 preflight_blocks(dataset)
             """)),
         ]

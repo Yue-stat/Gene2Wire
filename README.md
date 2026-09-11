@@ -44,7 +44,7 @@ Legacy notebooks under `archive/legacy/` document previous implementations. They
 are not alternative entry points for this protocol and must not supply numbers
 to the new result exports.
 
-An independent [0909 group × target block experiment](docs/BLOCK_MASKING_0909.md)
+The independent [group × target block experiment](docs/BLOCK_MASKING_0909.md)
 keeps all input gene features and evaluates artificially unassayed target blocks
 on held-out cells within represented groups:
 
@@ -55,6 +55,7 @@ on held-out cells within represented groups:
 | [Projection_TAGs_block_masking_0909.ipynb](Projection_TAGs_block_masking_0909.ipynb) | Recorded animals, preserving native assay coverage |
 | [simulation_block_masking_0909.ipynb](simulation_block_masking_0909.ipynb) | Two artificial groups, sharing strengths 0/0.5/1 |
 | [SPIDER_block_masking_0909.ipynb](SPIDER_block_masking_0909.ipynb) | Two artificial groups; the current adapter has no verified animal IDs |
+| [SPIDER_Seq_block_masking_0911.ipynb](SPIDER_Seq_block_masking_0911.ipynb) | Adult1/2/3 native animal panels; targets measured in at least two animals |
 
 These notebooks include a matched full-training-panel control and use separate
 checkpoints and result families. Default additional positive loss is zero;
@@ -74,10 +75,13 @@ SHOW_FULL_DIAGNOSTICS = False
 ```
 
 `full_joint` searches simultaneous rank/penalty combinations from a deterministic
-bounded Cartesian grid. The common profile caps selectable configurations at
-32 per method and includes exact direct and residual-off candidates in Joint's
-budget. It does not imply exhaustive evaluation of an arbitrarily large grid.
-Actual candidates and selected configurations are exported.
+bounded Cartesian grid. The common profile gives each model family a native
+budget of 32 genuine candidates. Joint additionally evaluates the exact selected
+direct and low-rank winners when compatible standalone models are present, so its
+selection set can contain up to 34 rows; those endpoint fits are reused from the
+standalone candidate/refit caches. It does not imply exhaustive evaluation of an
+arbitrarily large grid. Actual candidates, endpoint provenance and selected
+configurations are exported.
 
 In simulation, the default `truth_uses_location = USE_LOCATION` controls the
 generated projection signal as well as predictor inputs. Gene-only simulation

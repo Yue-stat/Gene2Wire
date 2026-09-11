@@ -9,7 +9,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-NAMES = ("BARseq_A1", "BARseq_M1", "Projection_TAGs", "simulation", "SPIDER")
+NAMES = ("BARseq_A1", "BARseq_M1", "Projection_TAGs", "simulation", "SPIDER", "SPIDER_Seq")
 
 
 def builder():
@@ -62,6 +62,7 @@ def test_shared_settings_and_correct_group_source(name):
         "RUN_INFORMATION_CONTROLS": True, "RUN_RANDOM_FOREST": True, "RUN_QIAO": True,
     }.items():
         assert namespace[key] == expected
+    assert namespace["SUPERVISION_PROFILE"] == ("assay_only" if name == "SPIDER_Seq" else "paired_reference")
     assert namespace["GROUP_MODE"] == (
         "artificial" if name in {"BARseq_M1", "simulation", "SPIDER"} else "animal")
 
@@ -91,6 +92,16 @@ def test_spider_reuses_shared_loader_and_never_infers_animal_ids():
     assert "group_mode=GROUP_MODE" in code
     assert "no verified animal IDs" in prose
     assert "not relabelled as animals" in prose
+
+
+def test_spider_seq_block_notebook_uses_native_animals_and_assay_only_profile():
+    nb = builder().notebook("SPIDER_Seq", "a" * 40, "b" * 64, "0911")
+    code = "\n".join(c["source"] for c in nb["cells"] if c["cell_type"] == "code")
+    prose = "\n".join(c["source"] for c in nb["cells"] if c["cell_type"] == "markdown")
+    assert "from gene2wire.experiments.datasets.spider_seq import load_spider_seq" in code
+    assert "supervision_profile=SUPERVISION_PROFILE" in code
+    assert "SPIDER-Seq" in prose and "biological animal IDs" in prose
+    assert "GROUP_MODE = 'animal'" in code
 
 
 @pytest.mark.parametrize("name", NAMES)
