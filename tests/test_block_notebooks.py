@@ -102,6 +102,11 @@ def test_spider_seq_block_notebook_uses_native_animals_and_assay_only_profile():
     assert "supervision_profile=SUPERVISION_PROFILE" in code
     assert "SPIDER-Seq" in prose and "biological animal IDs" in prose
     assert "GROUP_MODE = 'animal'" in code
+    location_definition = code.index("LOCATION_FEATURES_CSV = None")
+    target_definition = code.index("TARGET_FEATURES_CSV = None")
+    loader_call = code.index("location_features_csv=LOCATION_FEATURES_CSV")
+    assert location_definition < loader_call
+    assert target_definition < loader_call
 
 
 @pytest.mark.parametrize("name", NAMES)

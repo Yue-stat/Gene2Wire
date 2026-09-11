@@ -327,7 +327,8 @@ def notebook(name, commit, source_hash, date_suffix=None):
             panels from the same SPIDER-Seq study. Only targets measured in at least
             two animals are eligible for block masking. The biological animal IDs are
             retained; no artificial groups are introduced."""),
-            ("code", "TARGET_FEATURES_CSV = None"),
+            ("code", "LOCATION_FEATURES_CSV = None  # SPIDER-Seq has no bundled spatial coordinates.\n"
+                     "TARGET_FEATURES_CSV = None"),
             ("markdown", "## Load cached SPIDER-Seq inputs and preview native panel masks"),
             ("code", guarded("""
                 from gene2wire.experiments.datasets.spider_seq import load_spider_seq
