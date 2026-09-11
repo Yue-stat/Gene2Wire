@@ -27,8 +27,8 @@ SEED = 20260910
 
 # Shared expression preprocessing; every model receives exactly the same features.
 # Both variable-gene selection and PCA are fitted on training cells only.
-N_HVG = 2000
-N_GENE_COMPONENTS = 50  # None uses the selected normalized genes directly; slower.
+N_HVG = 2000  # Train-only variance selection from 26,902 genes; try 1000/5000 as a sensitivity check.
+N_GENE_COMPONENTS = 50  # Train-only PCA; None uses N_HVG genes directly and is much slower.
 LOCATION_FEATURES_CSV = None  # No native cell location in this scRNA-seq object.
 TARGET_FEATURES_CSV = None    # Outcome-independent descriptors, indexed by exact target IDs.
 RUN_RANDOM_FOREST = True
@@ -175,8 +175,10 @@ def notebook(commit, source_hash, date_suffix):
         Each cell is held out once per repetition. All models receive the same
         cells, features, assay mask and validation observations. Joint searches
         include exact direct and residual-off endpoints. Compatible complete and
-        partial checkpoints resume automatically. Progress reports once per minute
-        in Los Angeles time. The first run also prepares training-only features.'''),
+        partial checkpoints resume automatically. Feature preparation and model
+        fitting report separately in Los Angeles time. With the defaults,
+        5 repetitions x 3 folds x 2 fit roles gives 30 feature sets before the
+        model-unit progress denominator begins.'''),
         ('code', '''if not RESULTS_ONLY:
     print('Preparing training-only features and running the shared native-panel benchmark...')
     artifacts = run_native_panel_experiment(

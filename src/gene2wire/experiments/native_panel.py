@@ -7,8 +7,11 @@ on genuinely unassayed entries without inventing reference labels there.
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime
 import json
 from pathlib import Path
+import time
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -57,11 +60,40 @@ def run_native_panel_experiment(dataset: ExperimentDataset, settings: Settings, 
     tables = native_panel_tables(dataset)
     features = _MemoizedFeatures(dataset.feature_builder)
     views, split_rows = [], []
+    feature_rows = []
+    feature_total = 2 * settings.n_repetitions * settings.n_outer_folds
+    feature_done = 0
+    feature_started = feature_last = time.monotonic()
+    if progress:
+        print(f"[features] finished feature sets 0/{feature_total}; "
+              "each split fits tuning and final-refit transforms before model scheduling")
     for repetition in range(settings.n_repetitions):
         split_seed = stable_seed(settings.seed, "native_panel_splits", dataset.name, repetition)
         folds = tuple(dataset.split_builder(settings.n_outer_folds, split_seed))
         for fold in folds:
             fold.validate(len(dataset.cell_ids))
+            development = np.sort(np.r_[fold.train_rows, fold.validation_rows])
+            for fit_role, fit_rows in (("tuning", fold.train_rows),
+                                       ("final_refit", development)):
+                started = time.monotonic()
+                prepared = features(fit_rows, settings.use_location,
+                                    settings.use_target_features)
+                feature_done += 1
+                feature_rows.append({"repetition": repetition,
+                    "outer_fold": fold.outer_fold, "feature_fit": fit_role,
+                    "n_fit_cells": len(fit_rows),
+                    "n_output_features": prepared.X.shape[1],
+                    "n_hvg_used": prepared.metadata.get("n_hvg_used"),
+                    "elapsed_seconds": time.monotonic() - started})
+                now = time.monotonic()
+                if progress and (now - feature_last >= progress_interval
+                                 or feature_done == feature_total):
+                    elapsed_minutes = int((now - feature_started) // 60)
+                    timestamp = datetime.now(ZoneInfo("America/Los_Angeles")).strftime(
+                        "%Y-%m-%d %H:%M:%S %Z")
+                    print(f"[features {elapsed_minutes}min] finished feature sets "
+                          f"{feature_done}/{feature_total}, current time {timestamp}")
+                    feature_last = now
             for role, indices in (("train", fold.train_rows), ("validation", fold.validation_rows),
                                   ("test", fold.test_rows)):
                 split_rows.extend({"repetition": repetition, "outer_fold": fold.outer_fold,
@@ -70,6 +102,7 @@ def run_native_panel_experiment(dataset: ExperimentDataset, settings: Settings, 
             metadata={**dataset.metadata, "experiment_repetition": repetition,
                 "experiment_context": {"experiment": "native_panels"}}))
     tables["native_splits"] = pd.DataFrame(split_rows)
+    tables["feature_preparation"] = pd.DataFrame(feature_rows)
     artifacts = _execute(views, settings, checkpoint_dir, export_dir, progress=progress,
         progress_interval=progress_interval, progress_level=progress_level,
         worker_status=worker_status, export_name=slug(dataset.name)+"_native_panels",

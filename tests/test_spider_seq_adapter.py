@@ -137,6 +137,21 @@ def test_preprocessing_never_densifies_all_genes(monkeypatch):
     assert max(n for n, _ in allocations[1:]) == 4
 
 
+def test_dataset_normalizes_sparse_counts_once_across_split_feature_fits(monkeypatch):
+    data = _data()
+    original = seq._normalize_rna_counts
+    calls = []
+    def counted(counts):
+        calls.append(counts.shape)
+        return original(counts)
+    monkeypatch.setattr(seq, "_normalize_rna_counts", counted)
+    dataset = seq.spider_seq_dataset(data, n_hvg=8, n_gene_components=3)
+    folds = dataset.split_builder(3, 100)
+    dataset.feature_builder(folds[0].train_rows, False, False)
+    dataset.feature_builder(folds[1].train_rows, False, False)
+    assert calls == [data.X_gene_raw.shape]
+
+
 def test_within_animal_folds_are_seeded_and_cover_test_once():
     data = _data()
     dataset = seq.spider_seq_dataset(data)

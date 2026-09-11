@@ -34,12 +34,20 @@ def _source(n=90):
 
 def test_real_native_mask_repeated_splits_full_oof_forecasts_and_resume(tmp_path):
     data = _source()
+    feature_calls = []
+    original_features = data.feature_builder
+    def counted_features(rows, use_location, use_target):
+        feature_calls.append(tuple(rows))
+        return original_features(rows, use_location, use_target)
+    data = replace(data, feature_builder=counted_features)
     settings = Settings(supervision_profile='assay_only', paired_fraction=0., n_jobs=1,
         n_repetitions=2, n_outer_folds=3, penalties=(.01,), candidate_budget=3,
         maxiter=50, retry_maxiter=100, tolerance=1e-5,
         run_random_forest=False, run_qiao=False)
     kwargs = dict(checkpoint_dir=tmp_path/'checkpoints', export_dir=tmp_path/'exports', progress=False)
     result = run_native_panel_experiment(data, settings, **kwargs)
+    assert len(feature_calls) == 2*2*3
+    assert len(result.tables['feature_preparation']) == 2*2*3
     assert result.manifest['completed_model_evaluations'] == 2*3*3
     assert set(result.tables['metrics'].model) == {'Logistic', 'MIRT', 'Joint'}
     assert result.tables['detection'].empty

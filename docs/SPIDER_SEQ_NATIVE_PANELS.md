@@ -1,6 +1,6 @@
 # SPIDER-Seq: naturally incomplete target panels
 
-Run `SPIDER_Seq_natural_panels_0910.ipynb` in the existing OnDemand environment.
+Run `SPIDER_Seq_natural_panels_0911.ipynb` in the existing OnDemand environment.
 This uses the authors' scRNA-seq `Adult.Ex.rds`, not spatial `sp.PFC.rds`.
 The new notebook preserves earlier dated notebooks and pins its own shared core.
 
@@ -41,6 +41,10 @@ Cell counts are normalized to 10,000 and log transformed. The default selects
 `N_HVG` and `N_GENE_COMPONENTS` are exposed in the notebook; setting components to
 `None` uses selected gene features directly. Validation and test data do not fit
 these transformations. Final refits fit transformations on development cells.
+The cell-local normalization is computed once, while gene selection and PCA stay
+split-specific. At the default five repetitions and three folds, the run prepares
+30 transforms (tuning and final refit for each fold) and reports this stage
+separately before model-unit progress starts.
 Location and target switches require aligned, independently measured CSV files;
 no anatomical target descriptors are inferred from barcode outcomes.
 

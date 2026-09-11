@@ -261,35 +261,38 @@ def _positive_integer(value, name):
     return int(value)
 
 
-def prepare_spider_seq_features(data: SpiderSeqData, train_rows, *, n_hvg=2000,
-                                n_gene_components=50, transform_batch_size=1024) -> FeatureSet:
-    """Select genes and fit centered PCA on train only; transform in batches.
+def _normalize_rna_counts(counts):
+    """Apply the cell-local library-size transform once for all CV splits."""
+    x = counts.copy().astype(np.float32)
+    library = np.asarray(x.sum(axis=1)).ravel()
+    factors = np.divide(1e4, library, out=np.zeros_like(library), where=library > 0)
+    x = x.multiply(factors[:, None]).tocsr()
+    np.log1p(x.data, out=x.data)
+    return x
 
-    Sparse full-RNA counts remain sparse. Dense allocation is bounded by the
-    training-by-selected-gene matrix plus one batch, never all genes by all cells.
-    Per-cell library normalization does not learn across cells.
-    """
+
+def _prepare_normalized_spider_seq_features(x, gene_names, train_rows, *,
+                                             n_hvg=2000, n_gene_components=50,
+                                             transform_batch_size=1024) -> FeatureSet:
+    """Fit split-specific gene selection/PCA from normalized sparse counts."""
     n_hvg = _positive_integer(n_hvg, "n_hvg")
     if n_gene_components is not None:
         n_gene_components = _positive_integer(n_gene_components, "n_gene_components")
     transform_batch_size = _positive_integer(transform_batch_size, "transform_batch_size")
     train = np.asarray(train_rows, dtype=int)
-    n = len(data.cell_ids)
+    n = x.shape[0]
     if (train.ndim != 1 or len(train) < 2 or len(np.unique(train)) != len(train)
             or np.any(train < 0) or np.any(train >= n)):
         raise ValueError("At least two unique, in-range training rows are required")
-    x = data.X_gene_raw.copy().astype(np.float32)
-    library = np.asarray(x.sum(axis=1)).ravel()
-    factors = np.divide(1e4, library, out=np.zeros_like(library), where=library > 0)
-    x = x.multiply(factors[:, None]).tocsr()
-    np.log1p(x.data, out=x.data)
+    if not sparse.isspmatrix_csr(x) or x.shape[1] != len(gene_names):
+        raise ValueError("Normalized RNA matrix and gene names are misaligned")
     train_sparse = x[train]
     _, variance = mean_variance_axis(train_sparse, axis=0)
     order = np.lexsort((np.arange(x.shape[1]), -variance))
     selected = order[variance[order] > 1e-10][:n_hvg]
     if len(selected) == 0:
         raise ValueError("No RNA gene varies in the training subset")
-    selected_names = tuple(data.gene_names[j] for j in selected)
+    selected_names = tuple(gene_names[j] for j in selected)
     train_dense = train_sparse[:, selected].toarray()
     metadata = {
         "fit_rows": train.tolist(), "n_hvg_requested": n_hvg,
@@ -297,7 +300,6 @@ def prepare_spider_seq_features(data: SpiderSeqData, train_rows, *, n_hvg=2000,
         "selected_gene_names": list(selected_names),
     }
     if n_gene_components is None:
-        # Optional direct-gene predictors retain the same train-only HVG rule.
         scaler = StandardScaler().fit(train_dense)
         scores = np.empty((n, len(selected)), dtype=np.float64)
         for start in range(0, n, transform_batch_size):
@@ -329,6 +331,20 @@ def prepare_spider_seq_features(data: SpiderSeqData, train_rows, *, n_hvg=2000,
                       feature_names=names, metadata=metadata)
 
 
+def prepare_spider_seq_features(data: SpiderSeqData, train_rows, *, n_hvg=2000,
+                                n_gene_components=50, transform_batch_size=1024) -> FeatureSet:
+    """Select genes and fit centered PCA on train only; transform in batches.
+
+    Sparse full-RNA counts remain sparse. Dense allocation is bounded by the
+    training-by-selected-gene matrix plus one batch, never all genes by all cells.
+    Per-cell library normalization does not learn across cells.
+    """
+    return _prepare_normalized_spider_seq_features(
+        _normalize_rna_counts(data.X_gene_raw), data.gene_names, train_rows,
+        n_hvg=n_hvg, n_gene_components=n_gene_components,
+        transform_batch_size=transform_batch_size)
+
+
 def spider_seq_dataset(data: SpiderSeqData, *, n_hvg=2000, n_gene_components=50,
                        location_features_csv=None, target_features_csv=None) -> ExperimentDataset:
     """Expose the common API with native W and within-animal held-out cells."""
@@ -339,6 +355,12 @@ def spider_seq_dataset(data: SpiderSeqData, *, n_hvg=2000, n_gene_components=50,
                 _aligned_numeric_csv(location_features_csv, data.cell_ids, "Cell location"))
     target = (None if target_features_csv is None else
               _aligned_numeric_csv(target_features_csv, data.target_ids, "Target feature"))
+    # This transform is cell-local and learns no population parameter. Computing
+    # it once avoids copying and normalizing the 79-million-entry sparse matrix
+    # for every fold. HVG selection and PCA below remain fitted on train rows.
+    normalized_counts = _normalize_rna_counts(data.X_gene_raw)
+    gene_names = data.gene_names
+    animal_ids = np.asarray(data.animal_ids, dtype=str)
 
     def features(train_rows, use_location=False, use_target_features=False):
         if not isinstance(use_location, bool) or not isinstance(use_target_features, bool):
@@ -347,8 +369,9 @@ def spider_seq_dataset(data: SpiderSeqData, *, n_hvg=2000, n_gene_components=50,
             raise ValueError("SPIDER-Seq has no bundled spatial coordinates; supply location_features_csv or use USE_LOCATION=False")
         if use_target_features and target is None:
             raise ValueError("Supply independent target_features_csv descriptors or use USE_TARGET_FEATURES=False")
-        base = prepare_spider_seq_features(data, train_rows, n_hvg=n_hvg,
-                                           n_gene_components=n_gene_components)
+        base = _prepare_normalized_spider_seq_features(
+            normalized_counts, gene_names, train_rows, n_hvg=n_hvg,
+            n_gene_components=n_gene_components)
         x, blocks, names = base.X, dict(base.feature_blocks), base.feature_names
         if use_location:
             loc = StandardScaler().fit(location[0][train_rows]).transform(location[0])
@@ -361,13 +384,13 @@ def spider_seq_dataset(data: SpiderSeqData, *, n_hvg=2000, n_gene_components=50,
                                   "target_feature_names": target[1] if use_target_features else ()})
 
     def splits(n_outer_folds=3, seed=0):
-        return make_block_folds(data.animal_ids, n_outer_folds, seed)
+        return make_block_folds(animal_ids, n_outer_folds, seed)
 
     result = ExperimentDataset(
         name="SPIDER-Seq", reference=data.Z_reference, measured=data.W_measured,
         cell_ids=data.cell_ids, target_ids=data.target_ids,
         feature_builder=features, split_builder=splits,
-        groups={"animal": np.asarray(data.animal_ids, dtype=str)},
+        groups={"animal": animal_ids},
         metadata={**dict(data.metadata), "source_url": SPIDER_SEQ_URL,
                   "source_sha256": data.source_sha256, "source_revision": SPIDER_SEQ_REVISION,
                   "source_code_commit": SPIDER_SEQ_SOURCE_COMMIT,

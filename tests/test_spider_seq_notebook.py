@@ -9,7 +9,7 @@ def test_native_notebook_is_a_shared_core_entrypoint_with_truthful_defaults():
     spec = importlib.util.spec_from_file_location('seq_builder', root/'scripts/build_spider_seq_notebook.py')
     builder = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(builder)
-    book = nbformat.from_dict(builder.notebook('a'*40, 'b'*64, '0910'))
+    book = nbformat.from_dict(builder.notebook('a'*40, 'b'*64, '0911'))
     nbformat.validate(book)
     code = '\n'.join(c.source for c in book.cells if c.cell_type == 'code')
     assert 'N_OUTER_FOLDS = 3' in code and 'N_REPETITIONS = 5' in code

@@ -14,11 +14,13 @@ that one method outperforms another.
 
 ## Paper experiment entry points
 
-The new [SPIDER_Seq_natural_panels_0910.ipynb](SPIDER_Seq_natural_panels_0910.ipynb)
+The latest [SPIDER_Seq_natural_panels_0911.ipynb](SPIDER_Seq_natural_panels_0911.ipynb)
 uses the scRNA-seq Adult1/2/3 panels with native missing targets and no artificial
 masking. It compares shared core assay-outcome predictors and exports unvalidated
-forecasts for truly unassayed entries. This is distinct from the spatial SPIDER
-notebooks below. See the [data audit and protocol](docs/SPIDER_SEQ_NATIVE_PANELS.md).
+forecasts for truly unassayed entries. Its feature stage reports progress and
+normalizes the sparse count matrix once before split-specific HVG/PCA fitting.
+This is distinct from the spatial SPIDER notebooks below. See the
+[data audit and protocol](docs/SPIDER_SEQ_NATIVE_PANELS.md).
 
 Open one of these notebooks in an OnDemand Python kernel and run its cells from
 top to bottom. Figures display in the notebook and save as PDF; raw data,
