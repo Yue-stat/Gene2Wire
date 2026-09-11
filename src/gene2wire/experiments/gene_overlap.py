@@ -17,6 +17,7 @@ import pandas as pd
 from ..seeds import stable_seed
 from .contracts import ExperimentDataset, FeatureSet, Fold
 from .pipeline import Artifacts, _execute, _atomic_csv
+from .io import atomic_json
 from .protocol import Settings
 
 
@@ -341,12 +342,20 @@ def build_overlap_views(dataset: ExperimentDataset, overlap_grid: Sequence[float
     return tuple(views)
 
 
+_OVERLAP_SCENARIO_CONTEXT = (
+    "dataset", "sharing_strength", "analysis", "mechanism", "loss_rate",
+    "calibration_fraction", "calibration_spec", "experiment", "group_mode",
+    "training_panel", "training_block_fraction", "evaluation_scope",
+    "block_fraction", "panel_design", "panel_size", "probability_semantics",
+)
+
+
 def _write_overlap_summaries(artifacts: Artifacts) -> None:
     per_group = artifacts.tables.get("per_group", pd.DataFrame())
     if not per_group.empty:
         keys = [column for column in (
-            "dataset", "panel_design", "arm", "requested_overlap", "actual_overlap",
-            "panel_size", "model", "probability_semantics", "repetition", "outer_fold",
+            *_OVERLAP_SCENARIO_CONTEXT, "arm", "requested_overlap", "actual_overlap",
+            "model", "repetition", "outer_fold",
         ) if column in per_group]
         metrics = [column for column in ("macro_auprc", "macro_log_loss", "macro_brier")
                    if column in per_group]
@@ -365,13 +374,22 @@ def _write_overlap_summaries(artifacts: Artifacts) -> None:
     required = {"arm", "model", "actual_overlap", "repetition"}
     if per_rep.empty or not required.issubset(per_rep):
         return
-    context = [column for column in ("dataset", "panel_design", "repetition") if column in per_rep]
+    # Keep every fixed scenario coordinate in the matching key.  In particular,
+    # simulation artifacts contain several sharing strengths; dropping rho makes
+    # a baseline lookup return a Series instead of one scalar and corrupts R_M.
+    context = [column for column in (*_OVERLAP_SCENARIO_CONTEXT, "repetition")
+               if column in per_rep]
     union = per_rep[per_rep["arm"] == "union"].copy()
     rows = []
     for values, frame in union.groupby(context, dropna=False, observed=True):
         prefix = dict(zip(context, values if isinstance(values, tuple) else (values,)))
         baseline = frame[frame["model"] == "PU"].set_index("actual_overlap")
         endpoints = frame[np.isclose(frame["actual_overlap"], 1.0)].set_index("model")
+        if baseline.index.has_duplicates or endpoints.index.has_duplicates:
+            raise ValueError(
+                "Gene-overlap summaries require one PU baseline and one model endpoint "
+                "per scenario/repetition/actual_overlap; include all scenario keys."
+            )
         if "PU" not in endpoints.index:
             continue
         for _, candidate in frame[frame["model"].isin(("PU-MIRT", "PU-Joint"))].iterrows():
@@ -381,13 +399,29 @@ def _write_overlap_summaries(artifacts: Artifacts) -> None:
             for metric, direction in (("macro_auprc", 1.), ("macro_log_loss", -1.), ("macro_brier", -1.)):
                 if metric not in frame:
                     continue
-                current = direction * (candidate[metric] - baseline.loc[overlap, metric])
-                endpoint = direction * (endpoints.loc[candidate["model"], metric] - endpoints.loc["PU", metric])
+                current = direction * (candidate[metric] - baseline.at[overlap, metric])
+                endpoint = direction * (
+                    endpoints.at[candidate["model"], metric] - endpoints.at["PU", metric]
+                )
                 rows.append({**prefix, "model": candidate["model"], "metric": metric,
                              "actual_overlap": overlap, "joint_or_mirt_minus_pu": current,
                              "difference_vs_100pct_overlap": current - endpoint})
     artifacts.tables["overlap_contrasts"] = pd.DataFrame(rows)
     _atomic_csv(artifacts.tables["overlap_contrasts"], artifacts.export_dir / "overlap_contrasts.csv")
+
+
+def rebuild_overlap_summaries(artifacts: Artifacts) -> Artifacts:
+    """Rebuild overlap-specific tables and persist them in an existing export.
+
+    This is intentionally safe for ``RESULTS_ONLY`` notebooks: it only reads
+    the saved per-group/per-repetition tables and rewrites derived summaries;
+    it never launches model fitting.
+    """
+    _write_overlap_summaries(artifacts)
+    table_files = {str(name) + ".csv" for name in artifacts.tables}
+    artifacts.manifest["table_files"] = sorted(table_files)
+    atomic_json(artifacts.manifest, artifacts.export_dir / "manifest.json")
+    return artifacts
 
 
 def run_gene_overlap_experiment(views: Sequence[ExperimentDataset], settings: Settings, *,
@@ -407,5 +441,4 @@ def run_gene_overlap_experiment(views: Sequence[ExperimentDataset], settings: Se
         manifest_extra={"experiment": "gene_overlap", "targets_unchanged": True,
                         "missing_expression_representation": "visible-train standardized; hidden=0"},
     )
-    _write_overlap_summaries(artifacts)
-    return artifacts
+    return rebuild_overlap_summaries(artifacts)

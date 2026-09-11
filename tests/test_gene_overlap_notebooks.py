@@ -16,10 +16,11 @@ def test_overlap_notebooks_are_clean_pinned_and_editable():
         assert len(ids) == len(set(ids))
         source = "\n".join(cell["source"] for cell in notebook["cells"])
         assert "OVERLAP_GRID = [0.0, 0.25, 0.50, 0.75, 1.0]" in source
+        assert "N_REPETITIONS = 10" in source
         assert "RUN_RANDOM_FOREST = False" in source
         assert "RF is disabled and is never scheduled" in source
-        assert "CORE_COMMIT = '5d1d5fefa73ac45b91594c8634045404c5e30d33'" in source
-        assert "EXPECTED_SOURCE_HASH = '1301b7c19b61d5860ba997f2b7b0701d8096fb6067cc19902afa9a8d0b6c18d5'" in source
+        assert "CORE_COMMIT = 'e0ffa16876c158523bf08e4f4bbe6542c4cfc07f'" in source
+        assert "EXPECTED_SOURCE_HASH = '95b5a806452e966f5464850e9db83652fc3097b8061022a473137e2cb910b0e3'" in source
         for cell in notebook["cells"]:
             if cell["cell_type"] == "code":
                 assert cell["outputs"] == []

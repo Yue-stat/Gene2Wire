@@ -28,7 +28,7 @@ PANEL_SIZE = None  # None uses floor(number_of_genes / 2).
 INCLUDE_CONTROLS = True
 
 N_OUTER_FOLDS = 3
-N_REPETITIONS = 5
+N_REPETITIONS = 10
 N_JOBS = 32
 PARALLEL_UNIT = 'scenario'
 STRATEGY = 'full_joint'
@@ -220,8 +220,15 @@ def notebook(name: str, commit: str, source_hash: str):
         after centering, meaning the visible-training mean rather than biological zero.
 
         Primary comparisons are mask-aware union PU, PU-MIRT and PU-Joint. Controls
-        include intersection-only PU, panel-separated PU, the same-K 100% endpoint,
-        and an all-gene PU oracle. RF is disabled and is never scheduled.
+        include intersection-only PU, a disjoint-feature panel-separated PU
+        parameterization, the same-K 100% endpoint, and an all-gene PU oracle. The
+        panel-separated arm has distinct A/B slopes and intercepts but shares one
+        tuning and detection-calibration run; it is not two independently calibrated
+        fits. RF is disabled and is never scheduled.
+
+        Scope boundary: this primary v1 does not include the separate-A MIRT ablation,
+        an unpenalized animal-by-target nuisance model, or the optional Tech-SAR 80%
+        sensitivity analysis. Do not use these notebooks alone for those claims.
 
         Run top to bottom in the OnDemand environment. Change `OVERLAP_GRID` in the
         first code cell if needed. Compact diagnostics remain on by default; complete

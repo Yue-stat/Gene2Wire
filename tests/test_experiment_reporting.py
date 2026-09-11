@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -219,6 +220,46 @@ def test_notebook_fallback_means_folds_then_repetitions_and_preserves_context():
     assert result.sharing_strength.tolist() == [0., .5, 1.]
     assert result.macro_auprc.tolist() == pytest.approx([.5, .55, .6])
     assert result.macro_log_loss.tolist() == pytest.approx([.5, .5, .5])
+
+
+def test_notebook_overlap_contrasts_aggregate_repetitions_and_keep_uncertainty():
+    rows = []
+    for repetition, value in ((0, .02), (1, .06)):
+        rows.append(dict(dataset="simulation", sharing_strength=.5,
+            panel_design="crossed", arm="union", model="PU-Joint",
+            metric="macro_auprc", actual_overlap=.5, repetition=repetition,
+            joint_or_mirt_minus_pu=value + .1,
+            difference_vs_100pct_overlap=value))
+    result = notebook_summaries({"overlap_contrasts": pd.DataFrame(rows)})[
+        "overlap_contrasts"]
+    assert len(result) == 1
+    assert "repetition" not in result
+    assert result.loc[0, "mean_advantage_vs_PU"] == pytest.approx(.14)
+    assert result.loc[0, "mean_R_vs_100pct"] == pytest.approx(.04)
+    assert result.loc[0, "sd_R_vs_100pct"] == pytest.approx(np.sqrt(.0008))
+    assert result.loc[0, "n_repetitions"] == 2
+
+
+def test_notebook_endpoint_includes_aggregated_worst_panel_metrics():
+    aggregate = pd.DataFrame([dict(dataset="A1", analysis="primary",
+        panel_design="crossed", arm="union", requested_overlap=.5,
+        actual_overlap=6/11, panel_size=11, model="PU-Joint",
+        macro_auprc=.4, macro_log_loss=.5, macro_brier=.2)])
+    worst = pd.DataFrame([
+        dict(dataset="A1", analysis="primary", panel_design="crossed",
+             arm="union", requested_overlap=.5, actual_overlap=6/11,
+             panel_size=11, model="PU-Joint", repetition=repetition,
+             outer_fold=fold, worst_panel_macro_auprc=value,
+             worst_panel_macro_log_loss=1-value,
+             worst_panel_macro_brier=.3-value/10)
+        for repetition, fold, value in ((0, 0, .2), (0, 1, .4), (1, 0, .8))
+    ])
+    result = notebook_summaries({"aggregate": aggregate, "worst_panel": worst})[
+        "primary_endpoint_metrics"]
+    assert len(result) == 1
+    # Rep 0 contributes mean(.2, .4)=.3 and rep 1 contributes .8.
+    assert result.loc[0, "worst_panel_macro_auprc"] == pytest.approx(.55)
+    assert result.loc[0, "worst_panel_macro_log_loss"] == pytest.approx(.45)
 
 
 def test_notebook_block_endpoints_and_configurations_keep_actual_rep_choices():

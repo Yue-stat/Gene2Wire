@@ -23,13 +23,15 @@ import pandas as pd
 # so diagnostics of historical standard exports keep their original shape.
 _BLOCK_CONTEXT = ("experiment", "group_mode", "training_panel", "training_block_fraction",
                   "block_fraction", "evaluation_scope")
+_OVERLAP_CONTEXT = ("panel_design", "arm", "requested_overlap", "actual_overlap", "panel_size")
 _CONTEXT = ("dataset", "sharing_strength", "analysis", "mechanism", "loss_rate",
-            "calibration_fraction", "calibration_spec", *_BLOCK_CONTEXT, "model")
+            "calibration_fraction", "calibration_spec", *_BLOCK_CONTEXT,
+            *_OVERLAP_CONTEXT, "model")
 _CONFIG = ("kind", "rank", "shared_l2", "residual_l2", "use_target_features", "target_l2")
 _TABLE_ORDER = ("aggregate", "per_repetition", "selected", "tuning", "metrics",
                 "per_target", "reliability", "detection", "detection_per_target",
                 "detection_reliability", "thinning_audit", "paired_audit", "failures",
-                "simulation_intervals", "metrics_long")
+                "simulation_intervals", "metrics_long", "worst_panel", "overlap_contrasts")
 
 
 def configure_full_display() -> None:
@@ -111,8 +113,14 @@ def load_existing_exports(export_dirs: Mapping[str, str | Path | None], *, expec
     for label, result in artifacts.items():
         datasets = result.manifest.get("datasets", [])
         names = {str(item.get("name")) for item in datasets if isinstance(item, dict)}
-        # A1/M1 are notebook labels; the pipeline names are BARseq A1/BARseq M1.
-        allowed = {"A1": {"BARseq A1"}, "M1": {"BARseq M1"}}.get(label, {label})
+        # BARseq notebook labels carry the panel design suffix while the
+        # pipeline manifest keeps the biological dataset name.
+        if str(label) == "A1" or str(label).startswith("BARseq A1"):
+            allowed = {"BARseq A1"}
+        elif str(label) == "M1" or str(label).startswith("BARseq M1"):
+            allowed = {"BARseq M1"}
+        else:
+            allowed = {label}
         if names and not names.issubset(allowed):
             raise ValueError(f"Export for {label!r} contains datasets {sorted(names)}, expected {sorted(allowed)}")
     return artifacts
@@ -310,7 +318,7 @@ def compact_summaries(tables: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataFr
     if not aggregate.empty:
         endpoint = _endpoint(aggregate)
         columns = [name for name in ("dataset", "sharing_strength", "mechanism", "loss_rate",
-            *_BLOCK_CONTEXT, "model",
+            *_BLOCK_CONTEXT, *_OVERLAP_CONTEXT, "model",
             "macro_auprc", "macro_log_loss", "macro_hidden_recall_at_h", "macro_brier",
             "macro_predicted_prevalence", "macro_reference_prevalence") if name in endpoint]
         for name in ("calibration_fraction", "calibration_spec"):
@@ -319,7 +327,8 @@ def compact_summaries(tables: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataFr
         output["primary_endpoint_metrics"] = endpoint.loc[:, columns].reset_index(drop=True)
     selected = _primary(tables.get("selected", pd.DataFrame()))
     tuning = _primary(tables.get("tuning", pd.DataFrame()))
-    groups = [name for name in ("dataset", "sharing_strength", *_BLOCK_CONTEXT, "model")
+    groups = [name for name in ("dataset", "sharing_strength", *_BLOCK_CONTEXT,
+                                *_OVERLAP_CONTEXT, "model")
               if name in selected]
     if not selected.empty and groups:
         rows = []
@@ -353,7 +362,8 @@ def compact_summaries(tables: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataFr
             "final_iterations", "validation_observed_log_loss") if name in incomplete]
         output["nonconverged_final_fits_first_10_see_selected_csv"] = incomplete.loc[:, columns].head(10)
     if not tuning.empty:
-        group_cols = [name for name in ("dataset", "sharing_strength", *_BLOCK_CONTEXT, "model")
+        group_cols = [name for name in ("dataset", "sharing_strength", *_BLOCK_CONTEXT,
+                                        *_OVERLAP_CONTEXT, "model")
                       if name in tuning]
         if group_cols:
             rows = []
@@ -385,8 +395,61 @@ _REPORT_LIMITS = {
     "joint_validation_selection": 36,
     "detection_calibration": 24,
     "matched_full_panel_control": 36,
+    "overlap_contrasts": 60,
     "failed_units": 12,
 }
+
+
+def _overlap_contrast_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate the paired overlap contrast across repetitions for display.
+
+    ``overlap_contrasts.csv`` intentionally keeps one row per repetition. A
+    concise notebook table must not hide that repetition identifier while
+    showing raw rows, so this display-only summary reports the equal-weight
+    mean, paired between-repetition SD, and number of recorded repetitions.
+    """
+    required = {"model", "metric", "actual_overlap",
+                "joint_or_mirt_minus_pu", "difference_vs_100pct_overlap"}
+    if frame.empty or not required.issubset(frame):
+        return pd.DataFrame()
+    values = ("joint_or_mirt_minus_pu", "difference_vs_100pct_overlap")
+    numeric = frame.copy()
+    for name in values:
+        numeric[name] = pd.to_numeric(numeric[name], errors="coerce")
+    groups = list(dict.fromkeys(
+        name for name in (*_CONTEXT, "metric", "actual_overlap")
+        if name in numeric
+    ))
+    if not groups:
+        return pd.DataFrame()
+    grouped = numeric.groupby(groups, dropna=False, observed=True)
+    result = grouped[list(values)].mean().rename(columns={
+        "joint_or_mirt_minus_pu": "mean_advantage_vs_PU",
+        "difference_vs_100pct_overlap": "mean_R_vs_100pct",
+    })
+    result["sd_R_vs_100pct"] = grouped["difference_vs_100pct_overlap"].std(ddof=1)
+    if "repetition" in numeric:
+        result["n_repetitions"] = grouped["repetition"].nunique()
+    else:
+        result["n_repetitions"] = grouped.size()
+    return result.reset_index()
+
+
+def _merge_worst_panel_metrics(endpoint: pd.DataFrame,
+                               worst_panel: pd.DataFrame) -> pd.DataFrame:
+    """Attach fold-then-repetition averaged worst-panel metrics to endpoints."""
+    values = [name for name in (
+        "worst_panel_macro_auprc", "worst_panel_macro_log_loss",
+        "worst_panel_macro_brier",
+    ) if name in worst_panel]
+    if endpoint.empty or worst_panel.empty or not values:
+        return endpoint
+    worst = _report_scope(worst_panel, endpoint=True)
+    worst = _equal_repetition_mean(worst, values)
+    keys = [name for name in _CONTEXT if name in endpoint and name in worst]
+    if not keys or worst.duplicated(keys).any():
+        return endpoint
+    return endpoint.merge(worst[keys + values], on=keys, how="left", validate="many_to_one")
 
 
 def _report_scope(frame: pd.DataFrame, *, endpoint: bool = False,
@@ -555,7 +618,7 @@ def _selection_health(tables: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
         return pd.DataFrame()
     selected = selected.loc[selected.model.isin(_IMPORTANT_MODELS)]
     groups = [name for name in ("dataset", "sharing_strength", "mechanism", "calibration_fraction",
-        "calibration_spec", "training_panel", "model") if name in selected]
+        "calibration_spec", *_OVERLAP_CONTEXT, "training_panel", "model") if name in selected]
     rows = []
     for key, frame in selected.groupby(groups, dropna=False, observed=True, sort=False):
         row = dict(zip(groups, key if isinstance(key, tuple) else (key,)))
@@ -674,8 +737,15 @@ def notebook_summaries(tables: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataF
         aggregate = _equal_repetition_mean(raw, _metric_columns(raw))
     if not aggregate.empty:
         endpoint = _report_scope(aggregate, endpoint=True)
+        endpoint = _merge_worst_panel_metrics(
+            endpoint, tables.get("worst_panel", pd.DataFrame()))
         if not endpoint.empty:
-            output["primary_endpoint_metrics"] = _report_view(endpoint, _metric_columns(endpoint))
+            endpoint_values = _metric_columns(endpoint)
+            endpoint_values.extend(name for name in (
+                "worst_panel_macro_auprc", "worst_panel_macro_log_loss",
+                "worst_panel_macro_brier",
+            ) if name in endpoint)
+            output["primary_endpoint_metrics"] = _report_view(endpoint, endpoint_values)
         curves = _report_scope(aggregate)
         if "model" in curves:
             curves = curves.loc[curves.model.isin(_PU_MODELS)]
@@ -714,6 +784,15 @@ def notebook_summaries(tables: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataF
         controls = _endpoint(controls)
         values = [name for name in controls if name.startswith(("masking_loss_", "extra_sharing_gain_"))]
         output["matched_full_panel_control"] = _report_view(controls, values)
+    contrasts = tables.get("overlap_contrasts", pd.DataFrame())
+    if not contrasts.empty:
+        contrast_summary = _overlap_contrast_summary(contrasts)
+        values = [name for name in ("metric", "mean_advantage_vs_PU",
+                                    "mean_R_vs_100pct", "sd_R_vs_100pct",
+                                    "n_repetitions") if name in contrast_summary]
+        if not contrast_summary.empty and values:
+            output["overlap_contrasts"] = _report_view(
+                contrast_summary, values, extra=("actual_overlap",))
     failures = tables.get("failures", pd.DataFrame())
     if not failures.empty:
         values = [name for name in ("stage", "reason", "error", "exception") if name in failures]

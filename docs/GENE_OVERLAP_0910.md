@@ -24,13 +24,23 @@ a target-specific panel intercept through the ordinary coefficient matrix; no
 per-gene missingness indicators are added.
 
 Primary models are PU, PU-MIRT and PU-Joint. Explicit controls are intersection
-only, panel-separated direct PU, same-K/100% overlap and an all-gene direct-PU
-oracle. Random forest, Qiao and the separate reference-information suite are
-disabled. Default positive-label loss is zero; Projection-TAGs retains its
-natural observation mechanism.
+only, a disjoint-feature panel-separated direct PU parameterization,
+same-K/100% overlap and an all-gene direct-PU oracle. The panel-separated arm
+has distinct A/B slopes and intercepts, but it uses one selected penalty and
+one detection-calibration run rather than two independently calibrated fits.
+Random forest, Qiao and the separate reference-information suite are disabled.
+Default positive-label loss is zero; Projection-TAGs retains its natural
+observation mechanism. The formal notebooks default to ten outcome-independent
+panel draws.
+
+This primary v1 does not implement the separate-A MIRT ablation, a free
+unpenalized animal-by-target nuisance model, or the optional Tech-SAR 80%
+sensitivity analysis. Consequently, the panel-separated control should not be
+described as two independent fits, and these notebooks alone do not identify a
+shared-A-specific effect. Those extensions require additional statistical-model
+and orchestration work rather than a notebook-only switch.
 
 All results retain repetition and fold identifiers. Exports include aggregate,
 per-target, per-panel, worst-panel, selected-hyperparameter and overlap-contrast
 tables plus PDF figures. The contrast subtracts each model's advantage over PU
 at 100% overlap from its advantage at the current overlap.
-
