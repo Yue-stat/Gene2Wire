@@ -58,6 +58,37 @@ class PreparedFold:
     evaluation: EvaluationSpec | None = None
 
 
+@dataclass(frozen=True)
+class DeferredPreparedFold:
+    """Lightweight fold plan that builds dense features only in its worker.
+
+    Gene-overlap experiments contain many views of the same cells.  Retaining
+    both tuning- and refit-standardized full-N matrices for every view can use
+    tens of GiB on SPIDER before training starts.  This proxy exposes only the
+    metadata needed for scheduling; `_run_checkpointed_fold` materializes one
+    pending fold at execution time.  A separate sequential hash pass below
+    preserves the exact run identity without retaining those matrices.
+    """
+
+    dataset: ExperimentDataset
+    fold: Fold
+
+    @property
+    def name(self) -> str:
+        return self.dataset.name
+
+    @property
+    def metadata(self) -> Mapping[str, Any]:
+        return self.dataset.metadata
+
+    @property
+    def natural_observed(self):
+        return self.dataset.natural_observed
+
+    def materialize(self, settings: Settings) -> PreparedFold:
+        return _prepare(self.dataset, self.fold, settings)
+
+
 def slug(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "_", str(value)).strip("_")
 
@@ -72,10 +103,33 @@ def _prepare(dataset, fold, settings):
     for features in (train_features, refit_features):
         if features.X.shape[0] != len(dataset.cell_ids):
             raise ValueError("Feature builders must return all rows in original cell order")
+        if not np.all(np.isfinite(features.X)):
+            raise ValueError("Feature builders must return finite X values")
+        if features.X_nuisance is None:
+            if features.nuisance_names:
+                raise ValueError("nuisance_names requires FeatureSet.X_nuisance")
+        else:
+            nuisance = np.asarray(features.X_nuisance, dtype=float)
+            if (
+                nuisance.ndim != 2
+                or nuisance.shape[0] != len(dataset.cell_ids)
+                or nuisance.shape[1] < 1
+                or not np.all(np.isfinite(nuisance))
+            ):
+                raise ValueError(
+                    "FeatureSet.X_nuisance must be a finite all-row matrix"
+                )
+            if (
+                len(features.nuisance_names) != nuisance.shape[1]
+                or len(set(features.nuisance_names)) != nuisance.shape[1]
+            ):
+                raise ValueError("FeatureSet nuisance schema is invalid")
         if settings.use_target_features and features.Y_target is None:
             raise ValueError("USE_TARGET_FEATURES=True requires aligned target covariates")
         if not settings.use_target_features and features.Y_target is not None:
             raise ValueError("Disabled target features must not enter the learner")
+    if train_features.nuisance_names != refit_features.nuisance_names:
+        raise ValueError("Tuning and refit nuisance schemas must match")
     # Do not serialize the raw gene-count matrix into every worker.
     metadata = {k: v for k, v in dataset.metadata.items() if not isinstance(v, np.ndarray)}
     return PreparedFold(dataset.name, dataset.reference, dataset.measured,
@@ -92,7 +146,18 @@ def _source_context(prepared, repetition):
 
 
 def _scenarios(prepared, settings):
-    if prepared.metadata.get("experiment_context", {}).get("experiment") == "target_block":
+    experiment_context = prepared.metadata.get("experiment_context", {})
+    if experiment_context.get("observation_profile") == "technical_sar_80_sensitivity":
+        if prepared.natural_observed is not None or tuple(settings.loss_rates) != (.8,):
+            raise ValueError(
+                "Technical-SAR 80 overlap sensitivity requires generated observations "
+                "and loss_rates=(0.8,)"
+            )
+        return [{"analysis": "positive_label_loss_sensitivity",
+                 "mechanism": "technical_sar", "loss_rate": .8,
+                 "calibration_fraction": settings.paired_fraction,
+                 "calibration_spec": "correct"}]
+    if experiment_context.get("experiment") == "target_block":
         mechanism = "natural" if prepared.natural_observed is not None else "scar"
         rates = (None,) if mechanism == "natural" else settings.loss_rates
         return [{"analysis": "primary", "mechanism": mechanism, "loss_rate": rate,
@@ -107,7 +172,9 @@ def _bundle(prepared, features, observed):
     return DatasetBundle(X_cell=features.X, S_observed=observed,
                          W_measured=prepared.measured, Y_target=features.Y_target,
                          cell_ids=prepared.cell_ids, target_ids=prepared.target_ids,
-                         groups=prepared.groups, feature_blocks=features.feature_blocks)
+                         groups=prepared.groups, feature_blocks=features.feature_blocks,
+                         X_nuisance=features.X_nuisance,
+                         nuisance_names=features.nuisance_names)
 
 
 def _reference_view(reference, rows):
@@ -205,6 +272,8 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                      "tuning_detector": tuning_detector, "refit_detector": final_detector,
                      "feature_names_tuning": prepared.train_features.feature_names,
                      "feature_names_refit": prepared.refit_features.feature_names,
+                     "nuisance_names_tuning": prepared.train_features.nuisance_names,
+                     "nuisance_names_refit": prepared.refit_features.nuisance_names,
                      "features_tuning": prepared.train_features.metadata,
                      "features_refit": prepared.refit_features.metadata,
                      "fold": fold.metadata}, audit_dir / "audit.json")
@@ -296,8 +365,24 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                                          train, paired_train, "calibrated_pu")
         refit_bundle, refit_e = _compile(prepared, prepared.refit_features, observed, final_e,
                                          development, paired, "calibrated_pu")
-        tuning = settings.tuning_config(min(prepared.train_features.X.shape[1],
-                                           prepared.refit_features.X.shape[1]), nt)
+        available_features = min(
+            prepared.train_features.X.shape[1],
+            prepared.refit_features.X.shape[1],
+        )
+        declared_rank_cap = prepared.metadata.get("tuning_rank_cap")
+        if declared_rank_cap is not None:
+            if (isinstance(declared_rank_cap, bool)
+                    or not isinstance(declared_rank_cap, (int, np.integer))
+                    or int(declared_rank_cap) < 1):
+                raise ValueError(
+                    "tuning_rank_cap must be a positive integer"
+                )
+            # Some direct-only controls (notably the zero-overlap
+            # intersection arm) deliberately have fewer than K columns.  They
+            # do not fit a low-rank candidate, while all comparable union/A
+            # ablation arms are capped at exactly K.
+            available_features = min(available_features, int(declared_rank_cap))
+        tuning = settings.tuning_config(available_features, nt)
         models = settings.models()
         model_allowlist = prepared.metadata.get("model_allowlist")
         if model_allowlist is not None:
@@ -305,6 +390,22 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
             models = tuple(model for model in models if model.name in allowed)
             if not models:
                 raise ValueError("model_allowlist removed every configured model")
+        lowrank_feature_groups = tuple(
+            prepared.metadata.get("model_lowrank_feature_groups", ())
+        )
+        if lowrank_feature_groups:
+            if not any(model.kind == "lowrank" for model in models):
+                raise ValueError(
+                    "model_lowrank_feature_groups requires an allowed lowrank model"
+                )
+            models = tuple(
+                model.with_updates(
+                    lowrank_feature_groups=lowrank_feature_groups
+                )
+                if model.kind == "lowrank"
+                else model
+                for model in models
+            )
         if scenario["analysis"].startswith("calibration"):
             models = tuple(m for m in models if m.pu)
         runner_context = {k: v for k, v in context.items() if k != "analysis"}
@@ -312,6 +413,10 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
         def core_run(chosen_models, tb, te, rb, re, role):
             return run_model_grid(train=tb, validation=safe_validation,
                 test_X=prepared.train_features.X[test], refit_test_X=prepared.refit_features.X[test],
+                test_nuisance=(None if prepared.train_features.X_nuisance is None else
+                               prepared.train_features.X_nuisance[test]),
+                refit_test_nuisance=(None if prepared.refit_features.X_nuisance is None else
+                                     prepared.refit_features.X_nuisance[test]),
                 models=chosen_models, tuning=tuning, fit=settings.fit_config(),
                 train_exposure=te, validation_exposure=tuning_e[validation],
                 test_exposure=final_e[test], refit=rb, refit_exposure=re,
@@ -506,6 +611,8 @@ def _run_checkpointed_fold(prepared, repetition, settings, checkpoint_dir,
                            export_path, fit_version, run_id, key, writer, scenario=None):
     started = time.monotonic()
     writer({"event": "unit_start"})
+    if isinstance(prepared, DeferredPreparedFold):
+        prepared = prepared.materialize(settings)
     tables = _run_fold(prepared, repetition, settings, checkpoint_dir, export_path,
                        fit_version, on_progress=writer, scenario=scenario)
     if not tables["failures"]:
@@ -554,6 +661,7 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
     metadata = []
     input_identities = []
     is_simulation = all(d.metadata.get("independent_unit") == "generated_dataset" for d in datasets)
+    deferred_feature_preparation = False
     for dataset in datasets:
         dataset.validate()
         folds = dataset.split_builder(settings.n_outer_folds, settings.seed)
@@ -566,18 +674,35 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
                 if "experiment_repetition" in dataset.metadata else
                 ([int(dataset.metadata["repetition"])] if is_simulation
                  else range(settings.n_repetitions)))
+        defer_dataset = (
+            dataset.metadata.get("experiment_context", {}).get("experiment")
+            == "gene_overlap"
+        )
+        deferred_feature_preparation |= defer_dataset
         fold_inputs = []
         for fold in folds:
             prepared = _prepare(dataset, fold, settings)
-            contexts.extend((prepared, repetition) for repetition in reps)
             fold_inputs.append({"fold": fold.outer_fold,
                 "train_rows": sha256_array(np.asarray(fold.train_rows)),
                 "validation_rows": sha256_array(np.asarray(fold.validation_rows)),
                 "test_rows": sha256_array(np.asarray(fold.test_rows)),
                 "train_X": sha256_array(prepared.train_features.X),
                 "refit_X": sha256_array(prepared.refit_features.X),
+                "train_nuisance": (None if prepared.train_features.X_nuisance is None else
+                                     sha256_array(prepared.train_features.X_nuisance)),
+                "refit_nuisance": (None if prepared.refit_features.X_nuisance is None else
+                                     sha256_array(prepared.refit_features.X_nuisance)),
+                "nuisance_names": list(prepared.train_features.nuisance_names),
                 "train_Y": None if prepared.train_features.Y_target is None else sha256_array(prepared.train_features.Y_target),
                 "refit_Y": None if prepared.refit_features.Y_target is None else sha256_array(prepared.refit_features.Y_target)})
+            scheduled = (DeferredPreparedFold(dataset, fold)
+                         if defer_dataset else prepared)
+            contexts.extend((scheduled, repetition) for repetition in reps)
+            if defer_dataset:
+                # Release the full-N matrices from the identity pass before
+                # preparing the next view/fold.  Cached units never materialize
+                # them again; pending units build them inside active workers.
+                del prepared
         input_identities.append({"name": dataset.name,
             "repetition": dataset.metadata.get("experiment_repetition", dataset.metadata.get("repetition")),
             "experiment_context": dataset.metadata.get("experiment_context", {}),
@@ -602,6 +727,8 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
                          "metadata": {k: v for k, v in dataset.metadata.items() if not isinstance(v, np.ndarray)}})
     manifest = {"protocol": settings.scientific_dict(), "source_hash": code_hash,
                 "datasets": metadata, "input_identities": input_identities,
+                "feature_preparation": ("worker_lazy_after_hash_pass"
+                                        if deferred_feature_preparation else "eager"),
                 "uncertainty_unit": "generated_dataset" if is_simulation else "descriptive_fold_and_mask_repeat",
                 "software": {"python": platform.python_version(), **{package: importlib.metadata.version(package)
                              for package in ("numpy", "scipy", "pandas", "scikit-learn", "joblib", "threadpoolctl")}}

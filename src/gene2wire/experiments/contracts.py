@@ -36,6 +36,8 @@ class FeatureSet:
     Y_target: np.ndarray | None = None
     feature_names: tuple[str, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    X_nuisance: np.ndarray | None = None
+    nuisance_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

@@ -67,8 +67,9 @@ def test_overlap_figures_are_separated_and_titled_by_rho(tmp_path, monkeypatch):
                         "metric": metric, "actual_overlap": overlap,
                         "difference_vs_100pct_overlap": offset,
                     })
-            for arm, offset in (("intersection", -0.02), ("separate_panel", -0.01),
-                                ("union", 0.0), ("all_gene_oracle", 0.03)):
+            for arm, offset in (("intersection", -0.02),
+                                ("disjoint_coefficient", -0.01),
+                                ("all_gene_oracle", 0.03)):
                 aggregate_rows.append({
                     "dataset": "simulation", "sharing_strength": rho,
                     "panel_design": "crossed", "arm": arm, "model": "PU",

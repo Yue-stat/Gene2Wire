@@ -158,17 +158,11 @@ def full_joint_candidates(base: ModelConfig, tuning: TuningConfig) -> tuple[Mode
             candidates.extend(full_joint_candidates(lowrank, replace(tuning, candidate_budget=None)))
         candidates = [canonical_model_config(config) for config in candidates]
 
-    unique: dict[tuple[Any, ...], ModelConfig] = {}
+    unique: dict[str, ModelConfig] = {}
     for config in candidates:
-        key = (
-            config.kind,
-            config.rank,
-            config.shared_l2,
-            config.residual_l2,
-            config.use_target_features,
-            config.target_l2,
-            config.pu,
-        )
+        # Use the complete statistical identity so future fixed model
+        # coordinates cannot be accidentally omitted from candidate deduping.
+        key = canonical_json(model_identity(config))
         unique[key] = config
     if not unique:
         raise ValueError(f"grid has no valid candidates for model kind {base.kind!r}")
@@ -295,6 +289,8 @@ def _validate_schema_alignment(
         raise ValueError("train and validation Y_target matrices differ or are permuted")
     if base_model.use_target_features and train.Y_target is None:
         raise ValueError("model requires aligned Y_target features")
+    if train.nuisance_names != validation.nuisance_names:
+        raise ValueError("train and validation nuisance schemas differ")
 
 
 def tune_model(
@@ -350,6 +346,11 @@ def tune_model(
     ):
         for key in ("X_cell", "S_observed", "W_measured"):
             hashes[f"{phase}_{key}"] = sha256_array(getattr(bundle, key))
+        if bundle.X_nuisance is not None:
+            hashes[f"{phase}_X_nuisance"] = sha256_array(bundle.X_nuisance)
+        hashes[f"{phase}_nuisance_names"] = sha256_array(
+            np.asarray(bundle.nuisance_names, dtype=str)
+        )
         hashes[f"{phase}_exposure"] = sha256_array(np.asarray(exposure, dtype=float))
         hashes[f"{phase}_cell_ids"] = sha256_array(np.asarray(bundle.cell_ids, dtype=str))
         hashes[f"{phase}_target_ids"] = sha256_array(np.asarray(bundle.target_ids, dtype=str))
@@ -432,7 +433,11 @@ def tune_model(
                 fitted = UnifiedPUModel(config, fit_config, warm_start_cache=warm_start_cache).fit(
                     train_safe, exposure=train_exposure, seed=trial_seed
                 )
-                q_validation = fitted.predict_observed(validation_safe.X_cell, exposure=validation_exposure)
+                q_validation = fitted.predict_observed(
+                    validation_safe.X_cell,
+                    exposure=validation_exposure,
+                    x_nuisance=validation_safe.X_nuisance,
+                )
                 score = masked_log_loss(validation_safe.S_observed, q_validation, validation_safe.W_measured)
                 trial = TrialResult(
                     stage=stage, index=trial_index, config=config,

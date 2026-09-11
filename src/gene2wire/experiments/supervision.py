@@ -116,6 +116,8 @@ def compile_training_bundle(
             "paired_training_entry_count": int(c.sum()),
             "training_entry_count": int(allowed.sum()),
         },
+        X_nuisance=bundle.X_nuisance,
+        nuisance_names=bundle.nuisance_names,
     )
     exposure.setflags(write=False)
     return compiled, exposure

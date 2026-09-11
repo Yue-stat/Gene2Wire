@@ -32,7 +32,7 @@ from .seeds import stable_seed
 from .tuning import TuningResult, tune_model
 
 
-CORE_API_VERSION = "0.3.2"
+CORE_API_VERSION = "0.5.0"
 
 
 @dataclass(frozen=True)
@@ -59,6 +59,16 @@ class ModelRunResult:
             "residual_l2": config.residual_l2,
             "use_target_features": config.use_target_features,
             "target_l2": config.target_l2,
+            "nuisance_l2": config.nuisance_l2,
+            "n_nuisance": self.fitted.nuisance_coeff.shape[0]
+            if self.fitted.nuisance_coeff is not None
+            else 0,
+            "factor_parameterization": (
+                "separate_A"
+                if config.lowrank_feature_groups
+                else ("shared_A" if config.kind in {"lowrank", "joint"} else "none")
+            ),
+            "lowrank_feature_groups": "|".join(config.lowrank_feature_groups),
             "validation_observed_log_loss": self.tuning.best_validation_loss,
             "tuning_trials": len(self.tuning.trials),
             "final_converged": self.fitted.converged,
@@ -102,6 +112,8 @@ def _assert_aligned(left: DatasetBundle, right: DatasetBundle, names: str) -> No
         raise ValueError(f"{names} Y_target matrices differ or are permuted")
     if set(left.groups) != set(right.groups):
         raise ValueError(f"{names} group columns differ")
+    if left.nuisance_names != right.nuisance_names:
+        raise ValueError(f"{names} nuisance schemas differ")
 
 
 def _concatenate_for_refit(train: DatasetBundle, validation: DatasetBundle) -> DatasetBundle:
@@ -123,6 +135,14 @@ def _concatenate_for_refit(train: DatasetBundle, validation: DatasetBundle) -> D
         feature_blocks=train.feature_blocks,
         semantics=train.semantics,
         metadata=train.metadata,
+        X_nuisance=(
+            None
+            if train.X_nuisance is None
+            else np.concatenate(
+                [train.X_nuisance, validation.X_nuisance], axis=0
+            )
+        ),
+        nuisance_names=train.nuisance_names,
     )
 
 
@@ -138,7 +158,10 @@ def _bundle_hash(bundle: DatasetBundle) -> str:
             name: sha256_array(np.asarray(values, dtype=str))
             for name, values in sorted(bundle.groups.items())
         },
+        "nuisance_names": list(bundle.nuisance_names),
     }
+    if bundle.X_nuisance is not None:
+        parts["X_nuisance"] = sha256_array(bundle.X_nuisance)
     if bundle.Y_target is not None:
         parts["Y_target"] = sha256_array(bundle.Y_target)
     return hashlib.sha256(canonical_json(parts).encode("utf-8")).hexdigest()
@@ -173,6 +196,7 @@ def _state_to_checkpoint(fitted: FittedModel) -> tuple[dict[str, Any], dict[str,
         "residual",
         "target_coeff",
         "target_features",
+        "nuisance_coeff",
         "intercept",
     )
     present: list[str] = []
@@ -197,6 +221,7 @@ def _state_from_checkpoint(metadata: Mapping[str, Any], arrays: Mapping[str, np.
         "residual",
         "target_coeff",
         "target_features",
+        "nuisance_coeff",
         "intercept",
     ):
         key = f"fitted__{name}"
@@ -206,11 +231,37 @@ def _state_from_checkpoint(metadata: Mapping[str, Any], arrays: Mapping[str, np.
     return FittedModel.from_state_dict(state)
 
 
+def _prediction_nuisance(
+    value: Any | None,
+    *,
+    n_rows: int,
+    names: tuple[str, ...],
+    label: str,
+) -> np.ndarray | None:
+    """Validate a truth-free nuisance matrix for prediction."""
+
+    if not names:
+        if value is not None:
+            raise ValueError(f"{label} was supplied but the fitted schema has no nuisance terms")
+        return None
+    if value is None:
+        raise ValueError(f"{label} is required by the fitted nuisance schema")
+    result = np.asarray(value, dtype=np.float64)
+    if result.ndim != 2 or result.shape != (n_rows, len(names)):
+        raise ValueError(
+            f"{label} must have shape ({n_rows}, {len(names)})"
+        )
+    if not np.all(np.isfinite(result)):
+        raise ValueError(f"{label} contains non-finite values")
+    return result
+
+
 def run_model_grid(
     *,
     train: DatasetBundle,
     validation: DatasetBundle,
     test_X: Any,
+    test_nuisance: Any | None = None,
     models: Sequence[ModelConfig],
     tuning: TuningConfig | Mapping[str, TuningConfig],
     train_exposure: Any = 1.0,
@@ -220,6 +271,7 @@ def run_model_grid(
     refit: DatasetBundle | None = None,
     refit_exposure: Any | None = None,
     refit_test_X: Any | None = None,
+    refit_test_nuisance: Any | None = None,
     test_cell_ids: Sequence[Any] | None = None,
     checkpoint_dir: str | Path | None = None,
     unit_context: Mapping[str, Any] | None = None,
@@ -265,6 +317,12 @@ def run_model_grid(
         raise ValueError("test_X must be 2-D with the fitted feature count")
     if not np.all(np.isfinite(test_array)):
         raise ValueError("test_X contains non-finite values")
+    test_nuisance_array = _prediction_nuisance(
+        test_nuisance,
+        n_rows=test_array.shape[0],
+        names=train.nuisance_names,
+        label="test_nuisance",
+    )
     test_ids = (
         tuple(f"test_{index}" for index in range(test_array.shape[0]))
         if test_cell_ids is None
@@ -303,6 +361,16 @@ def run_model_grid(
         or not np.all(np.isfinite(final_test_array))
     ):
         raise ValueError("refit_test_X must align with test cells and the refit feature schema")
+    if refit_test_nuisance is not None and refit is None:
+        raise ValueError("refit_test_nuisance requires an explicit refit bundle")
+    final_test_nuisance = _prediction_nuisance(
+        test_nuisance_array
+        if refit_test_nuisance is None
+        else refit_test_nuisance,
+        n_rows=len(test_ids),
+        names=development.nuisance_names,
+        label="refit_test_nuisance",
+    )
 
     context = dict(unit_context or {})
     reserved = {"task", "model", "runner_model"}
@@ -325,6 +393,16 @@ def run_model_grid(
         "refit": _bundle_hash(development),
         "test_X": sha256_array(test_array),
         "refit_test_X": sha256_array(final_test_array),
+        "test_nuisance": (
+            sha256_array(np.empty((len(test_ids), 0), dtype=np.float64))
+            if test_nuisance_array is None
+            else sha256_array(test_nuisance_array)
+        ),
+        "refit_test_nuisance": (
+            sha256_array(np.empty((len(test_ids), 0), dtype=np.float64))
+            if final_test_nuisance is None
+            else sha256_array(final_test_nuisance)
+        ),
         "test_cell_ids": sha256_array(np.asarray(test_ids, dtype=str)),
         "train_exposure": sha256_array(train_e),
         "validation_exposure": sha256_array(validation_e),
@@ -407,7 +485,9 @@ def run_model_grid(
             arrays = cached["arrays"]
             if payload.get("model_name") != base_model.name:
                 raise ValueError("completed checkpoint model name does not match")
-            if payload.get("base_config") != asdict(base_model):
+            if canonical_json(payload.get("base_config")) != canonical_json(
+                asdict(base_model)
+            ):
                 raise ValueError("completed checkpoint base model does not match")
             if tuple(payload.get("test_cell_ids", [])) != test_ids:
                 raise ValueError("completed checkpoint test cell order does not match")
@@ -486,8 +566,14 @@ def run_model_grid(
              objective=fitted_model.objective)
         # Preserve the reporting alias while reusing the exact canonical fit.
         fitted_model = replace(fitted_model, config=tuned.best_config)
-        latent = fitted_model.predict_proba(final_test_array)
-        observed = fitted_model.predict_observed(final_test_array, exposure=test_e)
+        latent = fitted_model.predict_proba(
+            final_test_array, x_nuisance=final_test_nuisance
+        )
+        observed = fitted_model.predict_observed(
+            final_test_array,
+            exposure=test_e,
+            x_nuisance=final_test_nuisance,
+        )
         result = ModelRunResult(
             model_name=base_model.name,
             tuning=tuned,
