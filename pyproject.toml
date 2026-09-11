@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gene2wire"
-version = "0.3.9"
+version = "0.4.0"
 description = "Reproducible positive-unlabeled multitarget projection models and experiment protocols"
 readme = "README.md"
 requires-python = ">=3.10"

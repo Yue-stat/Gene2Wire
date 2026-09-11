@@ -616,6 +616,8 @@ def _panel_dataset(data: BarseqData, panel: str) -> ExperimentDataset:
         cell_ids=tuple(data.cell_ids[i] for i in rows),
         target_ids=tuple(data.target_ids[j] for j in targets),
         feature_builder=features, split_builder=splits,
+        gene_matrix=np.log1p(np.clip(data.X_gene_raw[rows], 0, None)),
+        gene_names=tuple(data.gene_names),
         groups={"animal": data.animal_ids[rows], "slice": data.slice_ids[rows],
                 "panel": data.panel_ids[rows]},
         metadata={

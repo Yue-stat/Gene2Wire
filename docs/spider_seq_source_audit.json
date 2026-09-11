@@ -1,0 +1,86 @@
+{
+  "paper_doi": "10.1093/nsr/nwag004",
+  "pmcid": "PMC12988354",
+  "author_code_revision": "047eb5aaa15087c241570745bd6df07882b0dd78",
+  "hf_revision": "22e37e94bc5a5ecda2185f2af4eae5cf49c6092a",
+  "hf_data_sha256": "5fd40731b5f415e5aa700df3e677b5a71652898a7c681f71ae70878adc5ade10",
+  "hf_data_size": 642142046,
+  "s2_sha256": "3d535880f31c51e065d955e5982e6a5d700c85833a8e6844195fbc7ea968c95d",
+  "FigureS3_sha256": "28c6afa570ef227305e24c1a393dd80747a438e67e0c9a55a0a49d42fa7450a4",
+  "panel_counts": {
+    "Adult1": 12,
+    "Adult2": 14,
+    "Adult3": 16
+  },
+  "thresholds": {
+    "Adult1": {
+      "ACB-C": 3,
+      "ACB-I": 9,
+      "BLA-I": 4,
+      "CP-C": 8,
+      "CP-I": 9,
+      "DR-I": 6,
+      "LHA-I": 5,
+      "MD-I": 3,
+      "RE-I": 5,
+      "SC-I": 4,
+      "VIS-I": 7,
+      "VTA-I": 5
+    },
+    "Adult2": {
+      "ACB-C": 5,
+      "ACB-I": 20,
+      "AId-C": 9,
+      "AId-I": 11,
+      "AUD-I": 11,
+      "BLA-I": 11,
+      "CP-C": 30,
+      "CP-I": 30,
+      "ECT-I": 8,
+      "ENTl-I": 5,
+      "PL-C": 19,
+      "RSP-I": 15,
+      "SSp-I": 10,
+      "VIS-I": 3
+    },
+    "Adult3": {
+      "ACB-C": 7,
+      "ACB-I": 25,
+      "AId-C": 8,
+      "AId-I": 15,
+      "BLA-C": 3,
+      "BLA-I": 11,
+      "CP-C": 18,
+      "CP-I": 30,
+      "ECT-C": 9,
+      "ECT-I": 11,
+      "ENTl-C": 5,
+      "ENTl-I": 3,
+      "RSP-C": 5,
+      "RSP-I": 12,
+      "SSp-I": 14,
+      "VIS-I": 3
+    }
+  },
+  "s2_aliases": {
+    "Re-I": "RE-I",
+    "Ect-I": "ECT-I",
+    "Ect-C": "ECT-C",
+    "Lent-I": "ENTl-I",
+    "Lent-C": "ENTl-C",
+    "Rsp-I": "RSP-I",
+    "Rsp-C": "RSP-C",
+    "BLA -C": "BLA-C"
+  },
+  "geo_mapping": {
+    "Adult1": "GSM8420525",
+    "Adult2": "GSM8420526",
+    "Adult3": "GSM8420527"
+  },
+  "sources": {
+    "paper": "https://doi.org/10.1093/nsr/nwag004",
+    "geo": "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE273066",
+    "author_code": "https://github.com/ZhengTiger/SPIDER-Seq",
+    "processed": "https://huggingface.co/spaces/TigerZheng/SPIDER-web"
+  }
+}

@@ -1,6 +1,8 @@
 # Running the 0908 notebooks on OnDemand
 
-The five root notebooks use one package and one experiment protocol. They contain
+The five positive-label-hiding notebooks under
+[`notebooks/positive_label_hiding/`](../notebooks/positive_label_hiding/) use one
+package and one experiment protocol. They contain
 no Google Drive mount, package installation, notebook-local model patch, or
 standalone plotting-script invocation. Plots display in the notebook and save
 as PDF. The default output root is `/home/yueyue/gene2wire`.
@@ -187,7 +189,7 @@ reference labels, estimated sensitivity, and available ranking/probability score
 Keep these files to recompute later figures without retraining models.
 
 The figure cell displays plots and writes PDF files to
-`/home/yueyue/gene2wire/figures/0908/`. It retains the configured 0–80% curves for
+`/home/yueyue/gene2wire/figures/<notebook_date>/`. It retains the configured 0–80% curves for
 artificial thinning; Projection-TAGs instead displays its natural paired audit
 and model comparisons. Both BARseq panels and all three simulation sharing
 strengths remain represented. No PNG export is requested by these notebooks.
@@ -215,10 +217,11 @@ folds within one generated dataset are not independent Monte Carlo samples.
 
 ## 8. September 9 diagnostics and existing results
 
-All five notebooks retain their `_0908` names. Their updated core includes the
-balanced candidate-selection correction described in `PROTOCOL_0908.md`. Source
-and protocol fingerprints change, so earlier fitted checkpoints are retained
-but are not silently counted as compatible with this corrected search.
+The original `_0908` notebooks remain byte-preserved under
+`archive/notebooks/0908/`. Canonical stable-name notebooks use the updated core
+and the balanced candidate-selection correction described in `PROTOCOL_0908.md`.
+Source and protocol fingerprints change, so earlier fitted checkpoints are
+retained but are not silently counted as compatible with this corrected search.
 
 To display the already completed BARseq runs attached on September 9, set these
 variables in the first configuration cell, restart the kernel, and Run All:
@@ -249,7 +252,7 @@ Unexecuted methods are not invented.
 Historical endpoint-only baselines use disconnected markers. Curve methods show their
 actual solid/dashed line and marker in the legend; endpoint-only methods retain
 marker-only legend entries. Missing intermediate fits are never interpolated. Additional
-PDFs are saved in `figures/0908/all_benchmarks/`; no PNGs are written.
+PDFs are saved in `figures/<notebook_date>/all_benchmarks/`; no PNGs are written.
 
 New primary runs evaluate all 15 retained methods at every configured loss rate
 (default 0%, 20%, 40%, 60%, 80%). `RF-mixed` uses reference labels on the same

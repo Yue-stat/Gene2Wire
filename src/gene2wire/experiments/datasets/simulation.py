@@ -261,6 +261,8 @@ def generate_simulation(
         target_ids=tuple(f"target{t:03d}" for t in range(n_targets)),
         feature_builder=SimulationFeatures(x_gene, x_location, y_target),
         split_builder=SimulationSplits(slices, position, repetition, inner_validation_slices),
+        gene_matrix=x_gene.copy(),
+        gene_names=tuple(f"gene_{j:02d}" for j in range(n_gene_features)),
         groups={"slice": slices}, technical_score=technical_score,
         metadata={
             "generator_version": SIMULATION_GENERATOR_VERSION,

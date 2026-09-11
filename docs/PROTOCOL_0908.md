@@ -26,22 +26,31 @@ All six primary models use the same available features and observation protocol:
 Logistic, MIRT, Joint, PU, PU-MIRT, and PU-Joint. The search support is determined
 by feature and target dimensions; the simulation search does not receive the
 generated true rank. Target intercepts of the projection models are unpenalized.
-The common primary search has a maximum of 32 selectable candidates per method;
-actual, reused, and converged candidate counts must accompany results. A direct
-model with fewer distinct configurations does not repeat fits to exhaust its cap.
+The common primary search uses a native-family budget of 32 candidates. A Joint
+search additionally carries the exact validation winners from the compatible
+direct and low-rank searches as mandatory boundary candidates. Thus a Joint
+selection can compare at most 32 genuine shared-plus-specific configurations
+plus two inherited endpoints; the endpoint fits are reused through the shared
+candidate/refit caches. Actual native, inherited, reused, and converged counts
+must accompany results. A direct model with fewer distinct configurations does
+not repeat fits to exhaust its cap.
 
-The September 9 correction is `0908-v2-balanced`. Within each structural family,
-candidate selection balances the marginal coverage of rank and each penalty,
+The consolidated September 11 protocol is `0911-v4-consolidated`. It retains
+the balanced search and exact-Joint endpoints introduced by
+`0908-v3-exact-joint`, and adds the shared identities needed for nuisance-aware
+gene-panel overlap and assay-only native-panel experiments. Within each
+structural family, candidate selection balances the marginal coverage of rank and each penalty,
 then pairwise level coverage and geometric separation (log distance for positive
 penalties). It replaces evenly spaced indices of a flattened Cartesian product,
 which could alias onto a single residual penalty. The declared rank/penalty
-support and 32-candidate cap are unchanged. With target features disabled, Joint
-still has 6 direct, 13 low-rank and 13 shared-plus-residual candidates. Its 13
-low-rank endpoints do not contain every standalone MIRT candidate; exact
-endpoints therefore do not guarantee inclusion of MIRT's validation winner or
-superior held-out performance. Actual candidate tuples are recorded in tuning exports and are displayed
-before fits when `SHOW_FULL_DIAGNOSTICS=True`. Revised search results require fresh runs and
-must not be relabeled as outputs of the earlier flattened-grid protocol.
+support and native 32-candidate budget are unchanged. Joint no longer splits
+that budget across direct, low-rank, and shared-plus-residual families: it keeps
+32 genuine shared-plus-specific candidates and appends the independently tuned
+direct and low-rank winners when those compatible models are present. Actual
+candidate tuples and endpoint provenance are recorded in tuning exports and are
+displayed before fits when `SHOW_FULL_DIAGNOSTICS=True`. Revised search results
+require fresh runs and must not be relabeled as outputs of the earlier
+flattened-grid protocol.
 
 `N_JOBS` controls hardware concurrency and is excluded from scientific identity.
 Changing it must not change masks, paired IDs, seeds, or which learned fits can

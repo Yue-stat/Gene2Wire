@@ -24,7 +24,7 @@ from ..runner import run_model_grid
 from ..seeds import stable_seed
 from .calibration import (CalibrationNotEstimable, detection_diagnostics,
                           fit_detection_calibrator, sample_paired_rows)
-from .contracts import ExperimentDataset, FeatureSet, Fold
+from .contracts import EvaluationSpec, ExperimentDataset, FeatureSet, Fold
 from .evaluation import evaluate_detection_calibration, evaluate_predictions
 from .io import atomic_json, atomic_npz, jsonable
 from .observation import make_observation_design, thin_reference
@@ -55,6 +55,38 @@ class PreparedFold:
     refit_features: FeatureSet
     fold: Fold
     metadata: dict
+    evaluation: EvaluationSpec | None = None
+
+
+@dataclass(frozen=True)
+class DeferredPreparedFold:
+    """Lightweight fold plan that builds dense features only in its worker.
+
+    Gene-overlap experiments contain many views of the same cells.  Retaining
+    both tuning- and refit-standardized full-N matrices for every view can use
+    tens of GiB on SPIDER before training starts.  This proxy exposes only the
+    metadata needed for scheduling; `_run_checkpointed_fold` materializes one
+    pending fold at execution time.  A separate sequential hash pass below
+    preserves the exact run identity without retaining those matrices.
+    """
+
+    dataset: ExperimentDataset
+    fold: Fold
+
+    @property
+    def name(self) -> str:
+        return self.dataset.name
+
+    @property
+    def metadata(self) -> Mapping[str, Any]:
+        return self.dataset.metadata
+
+    @property
+    def natural_observed(self):
+        return self.dataset.natural_observed
+
+    def materialize(self, settings: Settings) -> PreparedFold:
+        return _prepare(self.dataset, self.fold, settings)
 
 
 def slug(value: str) -> str:
@@ -71,23 +103,80 @@ def _prepare(dataset, fold, settings):
     for features in (train_features, refit_features):
         if features.X.shape[0] != len(dataset.cell_ids):
             raise ValueError("Feature builders must return all rows in original cell order")
+        if not np.all(np.isfinite(features.X)):
+            raise ValueError("Feature builders must return finite X values")
+        if features.X_nuisance is None:
+            if features.nuisance_names:
+                raise ValueError("nuisance_names requires FeatureSet.X_nuisance")
+        else:
+            nuisance = np.asarray(features.X_nuisance, dtype=float)
+            if (
+                nuisance.ndim != 2
+                or nuisance.shape[0] != len(dataset.cell_ids)
+                or nuisance.shape[1] < 1
+                or not np.all(np.isfinite(nuisance))
+            ):
+                raise ValueError(
+                    "FeatureSet.X_nuisance must be a finite all-row matrix"
+                )
+            if (
+                len(features.nuisance_names) != nuisance.shape[1]
+                or len(set(features.nuisance_names)) != nuisance.shape[1]
+            ):
+                raise ValueError("FeatureSet nuisance schema is invalid")
         if settings.use_target_features and features.Y_target is None:
             raise ValueError("USE_TARGET_FEATURES=True requires aligned target covariates")
         if not settings.use_target_features and features.Y_target is not None:
             raise ValueError("Disabled target features must not enter the learner")
+    if train_features.nuisance_names != refit_features.nuisance_names:
+        raise ValueError("Tuning and refit nuisance schemas must match")
     # Do not serialize the raw gene-count matrix into every worker.
     metadata = {k: v for k, v in dataset.metadata.items() if not isinstance(v, np.ndarray)}
     return PreparedFold(dataset.name, dataset.reference, dataset.measured,
                         dataset.cell_ids, dataset.target_ids, dataset.groups,
                         dataset.natural_observed, dataset.platform, dataset.technical_score,
-                        train_features, refit_features, fold, metadata)
+                        train_features, refit_features, fold, metadata, dataset.evaluation)
+
+
+def _source_context(prepared, repetition):
+    return {"dataset": prepared.name, "repetition": repetition,
+            "outer_fold": prepared.fold.outer_fold,
+            "sharing_strength": prepared.metadata.get("sharing_strength"),
+            **prepared.metadata.get("experiment_context", {})}
+
+
+def _scenarios(prepared, settings):
+    experiment_context = prepared.metadata.get("experiment_context", {})
+    if settings.supervision_profile == "assay_only":
+        return scenarios(settings, natural=prepared.natural_observed is not None, simulation=False)
+    if experiment_context.get("observation_profile") == "technical_sar_80_sensitivity":
+        if prepared.natural_observed is not None or tuple(settings.loss_rates) != (.8,):
+            raise ValueError(
+                "Technical-SAR 80 overlap sensitivity requires generated observations "
+                "and loss_rates=(0.8,)"
+            )
+        return [{"analysis": "positive_label_loss_sensitivity",
+                 "mechanism": "technical_sar", "loss_rate": .8,
+                 "calibration_fraction": settings.paired_fraction,
+                 "calibration_spec": "correct"}]
+    if experiment_context.get("experiment") == "target_block":
+        mechanism = "natural" if prepared.natural_observed is not None else "scar"
+        rates = (None,) if mechanism == "natural" else settings.loss_rates
+        return [{"analysis": "primary", "mechanism": mechanism, "loss_rate": rate,
+                 "calibration_fraction": settings.paired_fraction,
+                 "calibration_spec": "correct"} for rate in rates]
+    return scenarios(settings, natural=prepared.natural_observed is not None,
+                     simulation=prepared.metadata.get("independent_unit") == "generated_dataset",
+                     sharing_strength=prepared.metadata.get("sharing_strength"))
 
 
 def _bundle(prepared, features, observed):
     return DatasetBundle(X_cell=features.X, S_observed=observed,
                          W_measured=prepared.measured, Y_target=features.Y_target,
                          cell_ids=prepared.cell_ids, target_ids=prepared.target_ids,
-                         groups=prepared.groups, feature_blocks=features.feature_blocks)
+                         groups=prepared.groups, feature_blocks=features.feature_blocks,
+                         X_nuisance=features.X_nuisance,
+                         nuisance_names=features.nuisance_names)
 
 
 def _reference_view(reference, rows):
@@ -125,7 +214,8 @@ def _detector(prepared, observed, paired, scenario, technical_score):
 def _compile(prepared, features, observed, estimated, rows, paired, mode):
     base = _bundle(prepared, features, observed)
     compiled, exposure = compile_training_bundle(
-        base, rows, paired, _reference_view(prepared.reference, paired), estimated, mode)
+        base, rows, paired, None if mode == "observed" else _reference_view(prepared.reference, paired),
+        estimated, mode)
     return compiled.subset_rows(rows), exposure[rows]
 
 
@@ -135,23 +225,21 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
     train, validation, test = fold.train_rows, fold.validation_rows, fold.test_rows
     development = np.sort(np.r_[train, validation])
     n, nt = prepared.reference.shape
-    rho = prepared.metadata.get("sharing_strength")
-    is_simulation = prepared.metadata.get("independent_unit") == "generated_dataset"
+    assay_only = settings.supervision_profile == "assay_only"
     draw_seed = stable_seed(settings.seed, "observation", prepared.name, repetition)
-    design = make_observation_design(n, nt, seed=draw_seed,
-                                     technical_score=prepared.technical_score)
+    design = (None if assay_only else make_observation_design(
+        n, nt, seed=draw_seed, technical_score=prepared.technical_score))
     tables = {name: [] for name in ("metrics", "per_target", "reliability", "tuning",
                                    "selected", "detection", "detection_per_target",
-                                   "detection_reliability", "thinning_audit", "failures")}
-    groups = next((prepared.groups[k] for k in ("animal", "sample", "animal_id", "sample_id")
-                   if k in prepared.groups), None)
+                                   "detection_reliability", "thinning_audit", "failures", "per_group")}
+    group_key = next((k for k in ("animal", "sample", "animal_id", "sample_id")
+                      if k in prepared.groups), None)
+    groups = None if group_key is None else prepared.groups[group_key]
     paired_seed = stable_seed(settings.seed, "paired", prepared.name, repetition, fold.outer_fold)
-    source_context = {"dataset": prepared.name, "repetition": repetition,
-                      "outer_fold": fold.outer_fold, "sharing_strength": rho}
+    source_context = _source_context(prepared, repetition)
     model_checkpoint = Path(checkpoint_dir) / slug(prepared.name)
 
-    selected_scenarios = (scenarios(settings, natural=prepared.natural_observed is not None,
-                                   simulation=is_simulation, sharing_strength=rho)
+    selected_scenarios = (_scenarios(prepared, settings)
                           if scenario is None else [scenario])
     for scenario in selected_scenarios:
         context = {**source_context, **scenario}
@@ -159,20 +247,29 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
             if on_progress is not None:
                 on_progress({**context, **event})
         emit({"event": "scenario_start"})
-        paired = sample_paired_rows(development, scenario["calibration_fraction"], paired_seed,
-                                    groups=None if groups is None else groups[development])
+        paired = (np.array([], dtype=int) if assay_only else sample_paired_rows(
+            development, scenario["calibration_fraction"], paired_seed,
+            groups=None if groups is None else groups[development]))
         paired_train = np.intersect1d(paired, train)
-        if scenario["mechanism"] == "natural":
+        if assay_only:
+            observed, true_e, gamma = prepared.reference, None, None
+        elif scenario["mechanism"] == "natural":
             observed, true_e, gamma = prepared.natural_observed, None, None
         else:
             generated = thin_reference(prepared.reference, prepared.measured, train,
                                        scenario["loss_rate"], scenario["mechanism"], design)
             observed, true_e, gamma = generated.observed, generated.sensitivity, generated.gamma
         try:
-            tuning_e, tuning_detector = _detector(prepared, observed, paired_train, scenario, design.technical_score)
-            # Separate refit objects never enter the validation score. Their paired
-            # validation references are authorized only for development fitting.
-            final_e, final_detector = _detector(prepared, observed, paired, scenario, design.technical_score)
+            if assay_only:
+                # A single assay has no paired detection calibration. Ones denote
+                # the absence of *additional* corruption, not biological sensitivity.
+                tuning_e = final_e = np.ones_like(observed, dtype=float)
+                tuning_detector = final_detector = None
+            else:
+                tuning_e, tuning_detector = _detector(prepared, observed, paired_train, scenario, design.technical_score)
+                # Separate refit objects never enter the validation score. Their paired
+                # validation references are authorized only for development fitting.
+                final_e, final_detector = _detector(prepared, observed, paired, scenario, design.technical_score)
         except CalibrationNotEstimable as error:
             tables["failures"].append({**context, "stage": "calibration", "error": str(error)})
             emit({"event": "calibration_failed", "error": str(error)})
@@ -189,21 +286,28 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                      "tuning_detector": tuning_detector, "refit_detector": final_detector,
                      "feature_names_tuning": prepared.train_features.feature_names,
                      "feature_names_refit": prepared.refit_features.feature_names,
+                     "nuisance_names_tuning": prepared.train_features.nuisance_names,
+                     "nuisance_names_refit": prepared.refit_features.nuisance_names,
                      "features_tuning": prepared.train_features.metadata,
                      "features_refit": prepared.refit_features.metadata,
-                     "fold": fold.metadata}, audit_dir / "audit.json")
-        diagnostic = detection_diagnostics(observed, prepared.reference, prepared.measured,
-                                            final_e, rows=test, true_sensitivity=true_e)
-        tables["detection"].append({**context, **diagnostic})
-        detection_evaluation = evaluate_detection_calibration(
-            prepared.reference[test], observed[test], prepared.measured[test], final_e[test],
-            true_sensitivity=None if true_e is None else true_e[test], target_ids=prepared.target_ids)
-        tables["detection_per_target"].extend({**context, **row} for row in detection_evaluation["per_target"])
-        tables["detection_reliability"].extend({**context, **row} for row in detection_evaluation["reliability"])
+                     "fold": fold.metadata,
+                     **({"supervision_profile": "assay_only", "reference_interpretation": "observed assay outcome",
+                         "exposure_interpretation": "no additional corruption; biological sensitivity unestimated"}
+                        if assay_only else {})}, audit_dir / "audit.json")
+        if not assay_only:
+            diagnostic = detection_diagnostics(observed, prepared.reference, prepared.measured,
+                                                final_e, rows=test, true_sensitivity=true_e)
+            tables["detection"].append({**context, **diagnostic})
+            detection_evaluation = evaluate_detection_calibration(
+                prepared.reference[test], observed[test], prepared.measured[test], final_e[test],
+                true_sensitivity=None if true_e is None else true_e[test], target_ids=prepared.target_ids)
+            tables["detection_per_target"].extend({**context, **row} for row in detection_evaluation["per_target"])
+            tables["detection_reliability"].extend({**context, **row} for row in detection_evaluation["reliability"])
         atomic_npz(audit_dir / "observation.npz", reference=prepared.reference[test],
                    observed=observed[test], measured=prepared.measured[test],
-                   technical_score=design.technical_score[test],
-                   estimated_sensitivity=final_e[test], target_offsets=design.target_offsets,
+                   **({"additional_retention": final_e[test]} if assay_only else {
+                       "technical_score": design.technical_score[test],
+                       "estimated_sensitivity": final_e[test], "target_offsets": design.target_offsets}),
                    **({} if true_e is None else {"true_sensitivity": true_e[test]}))
         for split_name, rows in (("train", train), ("validation", validation), ("test", test)):
             for target_index, target in enumerate(prepared.target_ids):
@@ -214,34 +318,134 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                     "measured_count": measured_count, "reference_positive_count": positive_count,
                     "detected_positive_count": detected_count,
                     "realized_positive_loss": 1-detected_count/positive_count if positive_count else np.nan})
-        prior = _train_prevalence(prepared.reference, prepared.measured, paired)
+        prior = _train_prevalence(prepared.reference, prepared.measured, development if assay_only else paired)
 
         def record(name, prediction, semantics, extra=None, *, ranking_score=None):
+            prefix = {**context, "model": name, "probability_semantics": semantics,
+                      **(extra or {})}
+            if prepared.evaluation is not None:
+                from .block_evaluation import evaluate_block_predictions
+                spec = prepared.evaluation
+                for fraction, mask in spec.masks.items():
+                    evaluated = evaluate_block_predictions(
+                        spec.reference[test], mask[test], prediction,
+                        target_ids=prepared.target_ids, groups=spec.groups[test],
+                        ranking_score=ranking_score,
+                        train_reference_prevalence=prior)
+                    evaluation_prefix = {**prefix, "evaluation_scope": "blocked",
+                                         "block_fraction": float(fraction)}
+                    tables["metrics"].append({**evaluation_prefix, **evaluated["summary"]})
+                    for key in ("per_target", "reliability", "per_group"):
+                        tables[key].extend({**evaluation_prefix, **row} for row in evaluated[key])
+                atomic_npz(audit_dir / f"{slug(name)}_predictions.npz",
+                           prediction=prediction, reference=spec.reference[test],
+                           training_measured=prepared.measured[test],
+                           source_measured=spec.source_measured[test],
+                           block_fractions=np.asarray(tuple(spec.masks), dtype=float),
+                           evaluation_masks=np.stack([mask[test] for mask in spec.masks.values()]),
+                           block_groups=np.asarray(spec.groups[test], dtype=str),
+                           cell_ids=np.asarray(prepared.cell_ids)[test].astype(str),
+                           target_ids=np.asarray(prepared.target_ids, dtype=str),
+                           **({} if ranking_score is None else {"ranking_score": ranking_score}))
+                return
             evaluated = evaluate_predictions(prepared.reference[test], observed[test],
                 prepared.measured[test], prediction, final_e[test],
                 probability_semantics=semantics, train_reference_prevalence=prior,
                 target_ids=prepared.target_ids, ranking_score=ranking_score)
-            prefix = {**context, "model": name, "probability_semantics": semantics,
-                      **(extra or {})}
+            if assay_only:
+                # The shared evaluator also computes paired-detector diagnostics.
+                # A single assay provides no evidence for those quantities.
+                def assay_fields(row):
+                    return {key: value for key, value in row.items()
+                            if not key.startswith("detection_") and "_detection_" not in key
+                            and "hidden" not in key and key != "n_h_undefined"}
+                evaluated["summary"] = assay_fields(evaluated["summary"])
+                evaluated["per_target"] = [assay_fields(row) for row in evaluated["per_target"]]
+                evaluated["reliability"] = [row for row in evaluated["reliability"]
+                                            if row["scope"] != "detection"]
+                evaluated["scores"].pop("e", None)
             tables["metrics"].append({**prefix, **evaluated["summary"]})
             tables["per_target"].extend({**prefix, **row} for row in evaluated["per_target"])
             tables["reliability"].extend({**prefix, **row} for row in evaluated["reliability"])
+            evaluation_group = prepared.metadata.get("evaluation_group")
+            if evaluation_group is not None:
+                if evaluation_group not in prepared.groups:
+                    raise ValueError(f"Unknown evaluation group {evaluation_group!r}")
+                labels = np.asarray(prepared.groups[evaluation_group])[test]
+                for label in np.unique(labels):
+                    selected_rows = np.flatnonzero(labels == label)
+                    group_evaluated = evaluate_predictions(
+                        prepared.reference[test][selected_rows], observed[test][selected_rows],
+                        prepared.measured[test][selected_rows], prediction[selected_rows],
+                        final_e[test][selected_rows], probability_semantics=semantics,
+                        train_reference_prevalence=prior, target_ids=prepared.target_ids,
+                        ranking_score=None if ranking_score is None else ranking_score[selected_rows])
+                    tables["per_group"].append({**prefix, "group_kind": evaluation_group,
+                                                "group": str(label),
+                                                **group_evaluated["summary"]})
             scores = {key: value for key, value in evaluated["scores"].items()
                       if value is not None and key != "prediction"}
+            if ranking_score is not None:
+                # Keep raw off-panel ranking scores for prediction-only exports;
+                # the evaluator's score arrays intentionally mask W=0 with NaN.
+                scores["ranking_score"] = ranking_score
             atomic_npz(audit_dir / f"{slug(name)}_predictions.npz", prediction=prediction,
                        reference=prepared.reference[test], observed=observed[test],
-                       measured=prepared.measured[test], estimated_sensitivity=final_e[test],
+                       measured=prepared.measured[test],
+                       **({"additional_retention": final_e[test]} if assay_only else {
+                           "estimated_sensitivity": final_e[test]}),
                        cell_ids=np.asarray(prepared.cell_ids)[test].astype(str),
-                       target_ids=np.asarray(prepared.target_ids, dtype=str), **scores)
+                       target_ids=np.asarray(prepared.target_ids, dtype=str),
+                       **({"group_ids": np.asarray(groups)[test].astype(str)}
+                          if assay_only and groups is not None else {}), **scores)
 
         safe_validation = _bundle(prepared, prepared.train_features, observed).subset_rows(validation)
+        training_mode = "observed" if assay_only else "calibrated_pu"
         train_bundle, train_e = _compile(prepared, prepared.train_features, observed, tuning_e,
-                                         train, paired_train, "calibrated_pu")
+                                         train, paired_train, training_mode)
         refit_bundle, refit_e = _compile(prepared, prepared.refit_features, observed, final_e,
-                                         development, paired, "calibrated_pu")
-        tuning = settings.tuning_config(min(prepared.train_features.X.shape[1],
-                                           prepared.refit_features.X.shape[1]), nt)
+                                         development, paired, training_mode)
+        available_features = min(
+            prepared.train_features.X.shape[1],
+            prepared.refit_features.X.shape[1],
+        )
+        declared_rank_cap = prepared.metadata.get("tuning_rank_cap")
+        if declared_rank_cap is not None:
+            if (isinstance(declared_rank_cap, bool)
+                    or not isinstance(declared_rank_cap, (int, np.integer))
+                    or int(declared_rank_cap) < 1):
+                raise ValueError(
+                    "tuning_rank_cap must be a positive integer"
+                )
+            # Some direct-only controls (notably the zero-overlap
+            # intersection arm) deliberately have fewer than K columns.  They
+            # do not fit a low-rank candidate, while all comparable union/A
+            # ablation arms are capped at exactly K.
+            available_features = min(available_features, int(declared_rank_cap))
+        tuning = settings.tuning_config(available_features, nt)
         models = settings.models()
+        model_allowlist = prepared.metadata.get("model_allowlist")
+        if model_allowlist is not None:
+            allowed = set(map(str, model_allowlist))
+            models = tuple(model for model in models if model.name in allowed)
+            if not models:
+                raise ValueError("model_allowlist removed every configured model")
+        lowrank_feature_groups = tuple(
+            prepared.metadata.get("model_lowrank_feature_groups", ())
+        )
+        if lowrank_feature_groups:
+            if not any(model.kind == "lowrank" for model in models):
+                raise ValueError(
+                    "model_lowrank_feature_groups requires an allowed lowrank model"
+                )
+            models = tuple(
+                model.with_updates(
+                    lowrank_feature_groups=lowrank_feature_groups
+                )
+                if model.kind == "lowrank"
+                else model
+                for model in models
+            )
         if scenario["analysis"].startswith("calibration"):
             models = tuple(m for m in models if m.pu)
         runner_context = {k: v for k, v in context.items() if k != "analysis"}
@@ -249,6 +453,10 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
         def core_run(chosen_models, tb, te, rb, re, role):
             return run_model_grid(train=tb, validation=safe_validation,
                 test_X=prepared.train_features.X[test], refit_test_X=prepared.refit_features.X[test],
+                test_nuisance=(None if prepared.train_features.X_nuisance is None else
+                               prepared.train_features.X_nuisance[test]),
+                refit_test_nuisance=(None if prepared.refit_features.X_nuisance is None else
+                                     prepared.refit_features.X_nuisance[test]),
                 models=chosen_models, tuning=tuning, fit=settings.fit_config(),
                 train_exposure=te, validation_exposure=tuning_e[validation],
                 test_exposure=final_e[test], refit=rb, refit_exposure=re,
@@ -257,7 +465,7 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                 seed=stable_seed(settings.seed, prepared.name, repetition, fold.outer_fold),
                 code_version=code_hash, on_progress=emit)
 
-        result = core_run(models, train_bundle, train_e, refit_bundle, refit_e, "calibrated_pu")
+        result = core_run(models, train_bundle, train_e, refit_bundle, refit_e, training_mode)
         for name, model_result in result.models.items():
             semantics = "reference" if model_result.fitted.config.pu else "observed"
             record(name, model_result.latent_probability, semantics)
@@ -268,7 +476,7 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                                      "converged": trial.converged, "iterations": trial.iterations,
                                      "seed": trial.seed} for trial in model_result.tuning.trials)
         primary = scenario["analysis"] == "primary"
-        if primary and settings.run_information_controls:
+        if primary and settings.run_information_controls and not assay_only:
             pu_models = {model.name: model for model in settings.models() if model.pu}
             controls = (
                 ("reference_only", (pu_models["PU"].with_updates(name="Reference-only"),)),
@@ -305,8 +513,7 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
         if primary and settings.run_random_forest:
             from .baselines import fit_baseline
             kind = "random_forest"
-            for semantics, role in (("observed", "observed"), ("reference", "reference_only"),
-                                     ("mixed", "reference_plus_observed")):
+            for semantics, role in _random_forest_roles(settings):
                 if role == "observed":
                     tb, rb = train_bundle, refit_bundle
                 else:
@@ -360,7 +567,10 @@ def _atomic_csv(frame, destination):
 
 
 _GROUP_COLUMNS = ["dataset", "sharing_strength", "analysis", "mechanism", "loss_rate",
-                  "calibration_fraction", "calibration_spec", "model", "probability_semantics"]
+                  "calibration_fraction", "calibration_spec", "model", "probability_semantics",
+                  "experiment", "group_mode", "training_panel", "training_block_fraction",
+                  "evaluation_scope", "block_fraction", "panel_design", "arm",
+                  "requested_overlap", "actual_overlap", "panel_size"]
 
 
 def _summarize(tables, *, simulation):
@@ -392,20 +602,27 @@ def _summarize(tables, *, simulation):
                                             var_name="metric", value_name="value")
 
 
+def _random_forest_roles(settings):
+    roles = (("observed", "observed"), ("reference", "reference_only"),
+             ("mixed", "reference_plus_observed"))
+    return roles[:1] if settings.supervision_profile == "assay_only" else roles
+
+
 def _planned_models(prepared, settings):
     """Model evaluations per fold/repetition, before any outcome is examined."""
     rows = []
-    simulation = prepared.metadata.get("independent_unit") == "generated_dataset"
-    for scenario in scenarios(settings, natural=prepared.natural_observed is not None,
-                              simulation=simulation,
-                              sharing_strength=prepared.metadata.get("sharing_strength")):
+    for scenario in _scenarios(prepared, settings):
+        allowlist = prepared.metadata.get("model_allowlist")
         names = [m.name for m in settings.models()
                  if m.pu or not scenario["analysis"].startswith("calibration")]
+        if allowlist is not None:
+            allowed = set(map(str, allowlist))
+            names = [name for name in names if name in allowed]
         if scenario["analysis"] == "primary":
-            if settings.run_information_controls:
+            if settings.run_information_controls and settings.supervision_profile != "assay_only":
                 names += ["Reference-only", "Reference+PU", "Reference+PU-MIRT", "Reference+PU-Joint"]
             if settings.run_random_forest:
-                names += ["RF-observed", "RF-reference", "RF-mixed"]
+                names += [f"RF-{semantics}" for semantics, _ in _random_forest_roles(settings)]
             if settings.run_qiao:
                 from .qiao import qiao_model_names
                 names += list(qiao_model_names(settings.use_target_features))
@@ -439,16 +656,14 @@ def _run_checkpointed_fold(prepared, repetition, settings, checkpoint_dir,
                            export_path, fit_version, run_id, key, writer, scenario=None):
     started = time.monotonic()
     writer({"event": "unit_start"})
+    if isinstance(prepared, DeferredPreparedFold):
+        prepared = prepared.materialize(settings)
     tables = _run_fold(prepared, repetition, settings, checkpoint_dir, export_path,
                        fit_version, on_progress=writer, scenario=scenario)
     if not tables["failures"]:
-        prefix = {"dataset": prepared.name, "repetition": repetition,
-                  "outer_fold": prepared.fold.outer_fold,
-                  "sharing_strength": prepared.metadata.get("sharing_strength")}
+        prefix = _source_context(prepared, repetition)
         files = []
-        selected_scenarios = (scenarios(settings, natural=prepared.natural_observed is not None,
-                                        simulation=prepared.metadata.get("independent_unit") == "generated_dataset",
-                                        sharing_strength=prepared.metadata.get("sharing_strength"))
+        selected_scenarios = (_scenarios(prepared, settings)
                               if scenario is None else [scenario])
         for scenario in selected_scenarios:
             files.extend((export_path / "units" / fingerprint({**prefix, **scenario})).glob("*"))
@@ -484,12 +699,14 @@ def _run_scenario_group(tasks, settings, checkpoint_dir, export_path, fit_versio
 
 
 def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
-             progress_interval=60., progress_level="summary", worker_status=None):
+             progress_interval=60., progress_level="summary", worker_status=None,
+             export_name=None, supplementary_tables=None, manifest_extra=None):
     code_hash = source_hash()
     contexts = []
     metadata = []
     input_identities = []
     is_simulation = all(d.metadata.get("independent_unit") == "generated_dataset" for d in datasets)
+    deferred_feature_preparation = False
     for dataset in datasets:
         dataset.validate()
         folds = dataset.split_builder(settings.n_outer_folds, settings.seed)
@@ -498,22 +715,48 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
             visits[fold.test_rows] += 1
         if len(folds) != settings.n_outer_folds or not np.all(visits == 1):
             raise ValueError("Requested outer CV must test every cell exactly once")
-        reps = ([int(dataset.metadata["repetition"])] if is_simulation
-                else range(settings.n_repetitions))
+        reps = ([int(dataset.metadata["experiment_repetition"])]
+                if "experiment_repetition" in dataset.metadata else
+                ([int(dataset.metadata["repetition"])] if is_simulation
+                 else range(settings.n_repetitions)))
+        defer_dataset = (
+            dataset.metadata.get("experiment_context", {}).get("experiment")
+            == "gene_overlap"
+        )
+        deferred_feature_preparation |= defer_dataset
         fold_inputs = []
         for fold in folds:
             prepared = _prepare(dataset, fold, settings)
-            contexts.extend((prepared, repetition) for repetition in reps)
             fold_inputs.append({"fold": fold.outer_fold,
                 "train_rows": sha256_array(np.asarray(fold.train_rows)),
                 "validation_rows": sha256_array(np.asarray(fold.validation_rows)),
                 "test_rows": sha256_array(np.asarray(fold.test_rows)),
                 "train_X": sha256_array(prepared.train_features.X),
                 "refit_X": sha256_array(prepared.refit_features.X),
+                "train_nuisance": (None if prepared.train_features.X_nuisance is None else
+                                     sha256_array(prepared.train_features.X_nuisance)),
+                "refit_nuisance": (None if prepared.refit_features.X_nuisance is None else
+                                     sha256_array(prepared.refit_features.X_nuisance)),
+                "nuisance_names": list(prepared.train_features.nuisance_names),
                 "train_Y": None if prepared.train_features.Y_target is None else sha256_array(prepared.train_features.Y_target),
                 "refit_Y": None if prepared.refit_features.Y_target is None else sha256_array(prepared.refit_features.Y_target)})
+            scheduled = (DeferredPreparedFold(dataset, fold)
+                         if defer_dataset else prepared)
+            contexts.extend((scheduled, repetition) for repetition in reps)
+            if defer_dataset:
+                # Release the full-N matrices from the identity pass before
+                # preparing the next view/fold.  Cached units never materialize
+                # them again; pending units build them inside active workers.
+                del prepared
         input_identities.append({"name": dataset.name,
-            "repetition": dataset.metadata.get("repetition"),
+            "repetition": dataset.metadata.get("experiment_repetition", dataset.metadata.get("repetition")),
+            "experiment_context": dataset.metadata.get("experiment_context", {}),
+            "model_allowlist": dataset.metadata.get("model_allowlist"),
+            "evaluation": None if dataset.evaluation is None else {
+                "reference": sha256_array(dataset.evaluation.reference),
+                "source_measured": sha256_array(dataset.evaluation.source_measured),
+                "groups": sha256_array(np.asarray(dataset.evaluation.groups, dtype=str)),
+                "masks": {str(f): sha256_array(m) for f, m in dataset.evaluation.masks.items()}},
             "sharing_strength": dataset.metadata.get("sharing_strength"),
             "reference": sha256_array(dataset.reference), "measured": sha256_array(dataset.measured),
             "cell_ids": sha256_array(np.asarray(dataset.cell_ids, dtype=str)),
@@ -529,6 +772,8 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
                          "metadata": {k: v for k, v in dataset.metadata.items() if not isinstance(v, np.ndarray)}})
     manifest = {"protocol": settings.scientific_dict(), "source_hash": code_hash,
                 "datasets": metadata, "input_identities": input_identities,
+                "feature_preparation": ("worker_lazy_after_hash_pass"
+                                        if deferred_feature_preparation else "eager"),
                 "uncertainty_unit": "generated_dataset" if is_simulation else "descriptive_fold_and_mask_repeat",
                 "software": {"python": platform.python_version(), **{package: importlib.metadata.version(package)
                              for package in ("numpy", "scipy", "pandas", "scikit-learn", "joblib", "threadpoolctl")}}
@@ -536,7 +781,8 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
     run_id = fingerprint({"protocol": settings.scientific_dict(), "source_hash": code_hash,
                           "input_identities": input_identities, "software": manifest["software"]})
     fit_version = code_hash + ":" + fingerprint(manifest["software"])
-    export_path = Path(export_dir) / ("simulation_0908" if is_simulation else slug(datasets[0].name) + "_0908") / run_id
+    export_path = Path(export_dir) / (export_name or ("simulation_0908" if is_simulation else slug(datasets[0].name) + "_0908")) / run_id
+    manifest.update(manifest_extra or {})
     export_path.mkdir(parents=True, exist_ok=True)
     manifest.update(run_id=run_id, requested_n_jobs=settings.n_jobs, completed=False,
                     checkpoint_dir=str(Path(checkpoint_dir).resolve()))
@@ -548,14 +794,9 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
     results, pending, inventory, evaluation_plan = [], [], [], []
     for fold_group, (prepared, repetition) in enumerate(contexts):
         planned_models = _planned_models(prepared, settings)
-        for scenario in scenarios(settings, natural=prepared.natural_observed is not None,
-                                  simulation=prepared.metadata.get("independent_unit") == "generated_dataset",
-                                  sharing_strength=prepared.metadata.get("sharing_strength")):
+        for scenario in _scenarios(prepared, settings):
             index = len(results)
-            unit_context = {"dataset": prepared.name, "repetition": repetition,
-                            "outer_fold": prepared.fold.outer_fold,
-                            "sharing_strength": prepared.metadata.get("sharing_strength"),
-                            **scenario}
+            unit_context = {**_source_context(prepared, repetition), **scenario}
             key = fingerprint({"run_id": run_id, **unit_context})
             cached = _load_unit_result(store, key, run_id, export_path)
             model_count = sum(all(row[name] == value for name, value in scenario.items())
@@ -611,6 +852,7 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
                 results[index] = result
     names = results[0].keys()
     tables = {name: pd.DataFrame([row for result in results for row in result[name]]) for name in names}
+    tables.update(supplementary_tables or {})
     tables["checkpoint_inventory"] = pd.DataFrame(inventory)
     tables["model_evaluation_plan"] = pd.DataFrame(evaluation_plan)
     accounting = [{**row, "accounting": "restored_results"} for row in evaluation_plan

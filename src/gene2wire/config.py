@@ -58,6 +58,8 @@ class ModelConfig:
     use_target_features: bool = False
     target_l2: float = 0.0
     pu: bool = True
+    nuisance_l2: float = 0.0
+    lowrank_feature_groups: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
@@ -68,11 +70,33 @@ class ModelConfig:
             raise ValueError("rank must be a nonnegative integer")
         if self.kind == "lowrank" and self.rank < 1:
             raise ValueError("lowrank requires rank >= 1")
-        penalties = (self.shared_l2, self.residual_l2, self.target_l2)
+        penalties = (
+            self.shared_l2,
+            self.residual_l2,
+            self.target_l2,
+            self.nuisance_l2,
+        )
         if any(not _finite_number(x) or x < 0 for x in penalties):
             raise ValueError("L2 penalties must be finite and nonnegative")
         if not isinstance(self.pu, bool) or not isinstance(self.use_target_features, bool):
             raise ValueError("pu and use_target_features must be booleans")
+        if isinstance(self.lowrank_feature_groups, str):
+            raise TypeError("lowrank_feature_groups must be a sequence of block names")
+        try:
+            groups = tuple(self.lowrank_feature_groups)
+        except TypeError as error:
+            raise TypeError(
+                "lowrank_feature_groups must be a sequence of block names"
+            ) from error
+        if any(not isinstance(name, str) or not name for name in groups):
+            raise ValueError("lowrank_feature_groups must contain nonempty strings")
+        if len(set(groups)) != len(groups):
+            raise ValueError("lowrank_feature_groups must be unique")
+        if groups and len(groups) < 2:
+            raise ValueError("grouped low-rank models require at least two feature groups")
+        if groups and self.kind != "lowrank":
+            raise ValueError("lowrank_feature_groups are supported only for lowrank models")
+        object.__setattr__(self, "lowrank_feature_groups", groups)
         if self.kind == "direct" and self.rank != 0:
             raise ValueError("rank is irrelevant for direct and must be 0")
         if self.kind == "direct" and self.shared_l2 != 0:
@@ -101,6 +125,9 @@ class TuningConfig:
     anchor_residual_l2: float = 1e-3
     anchor_target_l2: float = 1e-3
     metric: str = "observed_log_loss"
+    # The budget counts candidates in the model's native structural family.
+    # For Joint with include_endpoints=True, exact independently tuned direct
+    # and low-rank winners may be appended without consuming this budget.
     candidate_budget: int | None = None
     include_endpoints: bool = False
 

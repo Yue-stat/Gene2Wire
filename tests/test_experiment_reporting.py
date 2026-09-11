@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import json
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from gene2wire.experiments.reporting import (
     compact_summaries, diagnostic_summaries, display_diagnostics, load_existing_exports,
-    load_export_artifacts,
+    load_export_artifacts, notebook_summaries,
 )
 
 
@@ -128,6 +129,7 @@ def test_compact_default_keeps_useful_endpoints_without_dumping_raw_tables(tmp_p
         pd.testing.assert_frame_equal(before[name], result.tables[name])
     output = capsys.readouterr().out
     assert "complete diagnostics" not in output and "older-core" not in output
+    assert "Saved run settings (authoritative for these results): {'n_repetitions': 4}" in output
     assert "Recorded failed units: 0" in output
     assert "SHOW_FULL_DIAGNOSTICS=True" in output
 
@@ -171,3 +173,221 @@ def test_compact_baseline_parameters_and_nonprimary_convergence():
         'Qiao-ID-logit', 'unique_bilinear_penalties'] == 2
     only_control = compact_summaries({'selected': selected.iloc[[-1]]})
     assert only_control['convergence_all_scenarios'].iloc[0]['not_converged'] == 1
+
+
+def test_block_summaries_keep_panel_coordinates_without_hidden_recall():
+    rows, selections = [], []
+    base = {"dataset": "BARseq A1", "analysis": "primary", "model": "PU-Joint",
+            "experiment": "animal_target_blocks", "group_mode": "animal"}
+    for panel, training_fraction in (("masked", .2), ("masked", .8), ("full", .0)):
+        unit = {**base, "training_panel": panel, "training_block_fraction": training_fraction}
+        selections.append({**unit, "rank": 2, "kind": "joint", "final_converged": True,
+                           "converged": True})
+        for evaluation_fraction in (.2, .8):
+            for scope in ("blocked", "observed"):
+                for rate in (.0, .8):
+                    rows.append({**unit, "block_fraction": evaluation_fraction,
+                                 "evaluation_scope": scope, "loss_rate": rate,
+                                 "macro_auprc": .3, "macro_log_loss": .4, "macro_brier": .1})
+    summaries = compact_summaries({"aggregate": pd.DataFrame(rows),
+                                   "selected": pd.DataFrame(selections),
+                                   "tuning": pd.DataFrame(selections)})
+    endpoints = summaries["primary_endpoint_metrics"]
+    assert len(endpoints) == 12
+    assert (endpoints.loss_rate == .8).all()
+    for key in ("experiment", "group_mode", "training_panel", "training_block_fraction",
+                "block_fraction", "evaluation_scope"):
+        assert key in endpoints
+    assert "macro_brier" in endpoints
+    assert not any("hidden" in key for key in endpoints)
+    for name in ("selection_and_convergence_all_primary_rates", "candidate_coverage_all_primary_rates"):
+        frame = summaries[name]
+        assert len(frame) == 3
+        assert {"training_panel", "training_block_fraction", "experiment", "group_mode"} <= set(frame)
+
+
+def test_notebook_fallback_means_folds_then_repetitions_and_preserves_context():
+    # Repetition 0 has three recorded folds and repetition 1 only one. Its
+    # contribution must remain one half, not one quarter, in a displayed mean.
+    rows = []
+    for rho in (0., .5, 1.):
+        for rep, scores in ((0, (.1, .2, .3)), (1, (.8,))):
+            for fold, value in enumerate(scores):
+                rows.append(dict(dataset="simulation", sharing_strength=rho, model="PU",
+                    analysis="primary", loss_rate=.8, repetition=rep, outer_fold=fold,
+                    macro_auprc=value + rho / 10, macro_log_loss=1-value))
+    result = notebook_summaries({"metrics": pd.DataFrame(rows)})["primary_endpoint_metrics"]
+    assert result.sharing_strength.tolist() == [0., .5, 1.]
+    assert result.macro_auprc.tolist() == pytest.approx([.5, .55, .6])
+    assert result.macro_log_loss.tolist() == pytest.approx([.5, .5, .5])
+
+
+def test_notebook_overlap_contrasts_aggregate_repetitions_and_keep_uncertainty():
+    rows = []
+    for repetition, value in ((0, .02), (1, .06)):
+        rows.append(dict(dataset="simulation", sharing_strength=.5,
+            panel_design="crossed", arm="union", model="PU-Joint",
+            metric="macro_auprc", actual_overlap=.5, repetition=repetition,
+            joint_or_mirt_minus_pu=value + .1,
+            difference_vs_100pct_overlap=value))
+    result = notebook_summaries({"overlap_contrasts": pd.DataFrame(rows)})[
+        "overlap_contrasts"]
+    assert len(result) == 1
+    assert "repetition" not in result
+    assert result.loc[0, "mean_advantage_vs_PU"] == pytest.approx(.14)
+    assert result.loc[0, "mean_R_vs_100pct"] == pytest.approx(.04)
+    assert result.loc[0, "sd_R_vs_100pct"] == pytest.approx(np.sqrt(.0008))
+    assert result.loc[0, "n_repetitions"] == 2
+
+
+def test_notebook_endpoint_includes_aggregated_worst_panel_metrics():
+    aggregate = pd.DataFrame([dict(dataset="A1", analysis="primary",
+        panel_design="crossed", arm="union", requested_overlap=.5,
+        actual_overlap=6/11, panel_size=11, model="PU-Joint",
+        macro_auprc=.4, macro_log_loss=.5, macro_brier=.2)])
+    worst = pd.DataFrame([
+        dict(dataset="A1", analysis="primary", panel_design="crossed",
+             arm="union", requested_overlap=.5, actual_overlap=6/11,
+             panel_size=11, model="PU-Joint", repetition=repetition,
+             outer_fold=fold, worst_panel_macro_auprc=value,
+             worst_panel_macro_log_loss=1-value,
+             worst_panel_macro_brier=.3-value/10)
+        for repetition, fold, value in ((0, 0, .2), (0, 1, .4), (1, 0, .8))
+    ])
+    result = notebook_summaries({"aggregate": aggregate, "worst_panel": worst})[
+        "primary_endpoint_metrics"]
+    assert len(result) == 1
+    # Rep 0 contributes mean(.2, .4)=.3 and rep 1 contributes .8.
+    assert result.loc[0, "worst_panel_macro_auprc"] == pytest.approx(.55)
+    assert result.loc[0, "worst_panel_macro_log_loss"] == pytest.approx(.45)
+
+
+def test_notebook_block_endpoints_and_configurations_keep_actual_rep_choices():
+    metrics, selected = [], []
+    for fraction in (.2, .8):
+        for rate in (0., .8):
+            for rep in (0, 1):
+                context = dict(dataset="simulation", sharing_strength=.5, analysis="primary",
+                    training_panel="masked", training_block_fraction=fraction,
+                    mechanism="scar", loss_rate=rate, repetition=rep, outer_fold=0,
+                    model="PU-Joint")
+                metrics.append({**context, "evaluation_scope": "blocked", "block_fraction": fraction,
+                    "macro_auprc": fraction, "macro_brier": .1, "macro_hidden_recall_at_h": .9})
+                selected.append({**context, "rank": 2+2*rep, "kind": "joint",
+                                 "shared_l2": .01, "residual_l2": .1, "final_converged": True})
+    summaries = notebook_summaries({"metrics": pd.DataFrame(metrics), "selected": pd.DataFrame(selected)})
+    endpoint = summaries["primary_endpoint_metrics"]
+    assert endpoint.macro_auprc.tolist() == [.8]
+    assert endpoint.attrs["fixed_coordinates"]["block_fraction"] == .8
+    assert endpoint.attrs["fixed_coordinates"]["loss_rate"] == .8
+    assert "macro_hidden_recall_at_h" not in endpoint
+    curves = summaries["pu_curves"]
+    assert curves.block_fraction.tolist() == [.2, .8]
+    assert "macro_hidden_recall_at_h" not in curves
+    configs = summaries["selected_hyperparameters_by_repetition"]
+    assert configs.repetition.tolist() == [0, 1]
+    assert "K=2" in configs.iloc[0].fold_configurations
+    assert "K=4" in configs.iloc[1].fold_configurations
+    assert configs.attrs["fixed_coordinates"]["training_block_fraction"] == .8
+
+
+def test_block_control_uses_matched_fold_differences_then_equal_rep_mean():
+    rows = []
+    for rep, folds in ((0, (0, 1, 2)), (1, (0,))):
+        for fold in folds:
+            for fraction in (.2, .8):
+                # Independent PU loses .1 in rep 0 and .3 in rep 1;
+                # Joint loses .02 in each. Extra sharing = mean(.08,.28)=.18.
+                for model, drop in (("PU", .1 if rep == 0 else .3), ("PU-Joint", .02)):
+                    for panel in ("masked", "full"):
+                        rows.append(dict(dataset="A1", analysis="primary", model=model,
+                            repetition=rep, outer_fold=fold, loss_rate=0.,
+                            training_panel=panel, training_block_fraction=fraction if panel == "masked" else 0.,
+                            block_fraction=fraction, evaluation_scope="blocked",
+                            macro_auprc=.6-(drop if panel == "masked" else 0),
+                            macro_log_loss=.3+(drop if panel == "masked" else 0),
+                            macro_brier=.1+(drop/10 if panel == "masked" else 0)))
+    # Unmatched masked fold must not affect a paired difference.
+    unmatched = {**rows[0], "outer_fold": 99, "macro_auprc": -100.}
+    result = notebook_summaries({"metrics": pd.DataFrame(rows + [unmatched])})["matched_full_panel_control"]
+    joint = result.loc[result.model.eq("PU-Joint")]
+    assert joint.block_fraction.tolist() == [.2, .8]
+    assert joint.masking_loss_auprc.tolist() == pytest.approx([.02, .02])
+    assert joint.extra_sharing_gain_auprc.tolist() == pytest.approx([.18, .18])
+    assert joint.extra_sharing_gain_log_loss.tolist() == pytest.approx([.18, .18])
+    assert joint.extra_sharing_gain_brier.tolist() == pytest.approx([.018, .018])
+    assert not any("hidden" in name for name in result)
+
+
+def test_compact_output_hard_bounds_all_rhos_and_text(tmp_path, capsys):
+    from gene2wire.experiments.pipeline import Artifacts
+    rows, choices, detection = [], [], []
+    for rho in (0., .5, 1.):
+        for calibration in (.1, .2, .3, .4):
+            for model in ("PU", "PU-MIRT", "PU-Joint", "Reference+PU", "Reference+PU-Joint", "RF-mixed"):
+                for rep in range(20):
+                    context = dict(dataset="simulation", sharing_strength=rho, calibration_fraction=calibration,
+                        analysis="primary", model=model, loss_rate=.8, repetition=rep, outer_fold=0)
+                    rows.append({**context, "macro_auprc": .3, "macro_log_loss": .4, "macro_brier": .1})
+                    choices.append({**context, "kind": "joint", "rank": rep % 4 + 1,
+                        "shared_l2": .01, "residual_l2": .1, "final_converged": True,
+                        "converged": True, "validation_loss": .4,
+                        "validation_observed_log_loss": .4, "selected_structure": "joint"})
+                    detection.append({**{k: v for k, v in context.items() if k != "model"},
+                                      "detection_brier": .1, "sensitivity_rmse": .05})
+    failures = pd.DataFrame([dict(dataset="simulation", sharing_strength=rho, stage="fit", error="x"*10000)
+                             for rho in (0., .5, 1.) for _ in range(100)])
+    tables = {"metrics": pd.DataFrame(rows), "selected": pd.DataFrame(choices),
+              "tuning": pd.DataFrame(choices), "detection": pd.DataFrame(detection), "failures": failures}
+    shown = []
+    display_diagnostics(Artifacts(tables, tmp_path, {}), display_fn=shown.append)
+    assert len(shown) <= 8
+    assert sum(map(len, shown)) <= 300
+    assert all(len(frame) <= 60 and len(frame.columns) <= 14 for frame in shown)
+    for frame in shown:
+        if "sharing_strength" in frame:
+            assert set(frame.sharing_strength) == {0., .5, 1.}
+        for column in frame.select_dtypes(include="object"):
+            assert frame[column].map(lambda value: not isinstance(value, str) or len(value) <= 500).all()
+    output = capsys.readouterr().out
+    assert "context-balanced preview" in output
+    assert "rows omitted" in output
+    assert "Recorded failed units: 300" in output
+    assert "complete values remain in the CSV exports" in output
+
+
+def test_recorded_search_boundary_uses_same_unit_and_family():
+    selections = pd.DataFrame([
+        dict(model="PU-Joint", repetition=0, outer_fold=0, kind="direct", rank=0, residual_l2=.1),
+        dict(model="PU-Joint", repetition=1, outer_fold=0, kind="lowrank", rank=4, shared_l2=.1)])
+    tuning = pd.DataFrame([
+        dict(model="PU-Joint", repetition=0, outer_fold=0, kind="direct", rank=0, residual_l2=x)
+        for x in (.01, .1)] + [
+        dict(model="PU-Joint", repetition=1, outer_fold=0, kind="lowrank", rank=rank, shared_l2=x)
+        for rank in (2, 4) for x in (.01, .1)] + [
+        dict(model="PU-Joint", repetition=0, outer_fold=0, kind="joint", rank=16, shared_l2=1.)])
+    health = notebook_summaries({"selected": selections, "tuning": tuning})["selection_and_convergence"]
+    flags = health.iloc[0].recorded_boundary_hits
+    assert "K max: 1" in flags and "shared max: 1" in flags and "residual max: 1" in flags
+
+
+def test_compact_recovery_matches_plotted_pooled_metric_without_conflating_macro():
+    row = dict(dataset="BARseq M1", analysis="primary", model="PU-Joint", loss_rate=.8,
+               macro_auprc=.3, macro_log_loss=.4, macro_brier=.1,
+               hidden_recall_at_h=.27, macro_hidden_recall_at_h=.19)
+    summaries = notebook_summaries({"aggregate": pd.DataFrame([row])})
+    endpoint = summaries["primary_endpoint_metrics"]
+    assert endpoint.hidden_recall_at_h.tolist() == [.27]
+    assert endpoint.macro_hidden_recall_at_h.tolist() == [.19]
+    curves = summaries["pu_curves"]
+    assert curves.hidden_recall_at_h.tolist() == [.27]
+    assert "macro_hidden_recall_at_h" not in curves
+    older = {name: value for name, value in row.items() if name != "hidden_recall_at_h"}
+    historical = notebook_summaries({"aggregate": pd.DataFrame([older])})["pu_curves"]
+    assert historical.macro_hidden_recall_at_h.tolist() == [.19]
+    assert "hidden_recall_at_h" not in historical
+    blocked = {**row, "training_panel": "masked", "training_block_fraction": .8,
+               "block_fraction": .8, "evaluation_scope": "blocked"}
+    block_summaries = notebook_summaries({"aggregate": pd.DataFrame([blocked])})
+    for name in ("primary_endpoint_metrics", "pu_curves"):
+        assert not any("hidden_recall" in column for column in block_summaries[name])

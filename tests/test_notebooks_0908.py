@@ -12,12 +12,19 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+NOTEBOOK_DIR = ROOT / "notebooks" / "positive_label_hiding"
 NAMES = ("simulation", "SPIDER", "MERGE_seq", "Projection_TAGs", "BARseq")
-RELEASE_DATE = "0909"
+NOTEBOOK_FILENAMES = {
+    "simulation": "simulation.ipynb",
+    "SPIDER": "spider_spatial.ipynb",
+    "MERGE_seq": "merge_seq.ipynb",
+    "Projection_TAGs": "projection_tags.ipynb",
+    "BARseq": "barseq.ipynb",
+}
 
 
 def load(name):
-    return json.loads((ROOT / f"{name}_{RELEASE_DATE}.ipynb").read_text())
+    return json.loads((NOTEBOOK_DIR / NOTEBOOK_FILENAMES[name]).read_text())
 
 
 def text(cell):
@@ -51,7 +58,7 @@ def test_clean_valid_python_and_shared_defaults(name):
         "RUN_INFORMATION_CONTROLS": True, "RUN_RANDOM_FOREST": True,
         "RUN_MECHANISM_CONTROLS": True, "RUN_CALIBRATION_CONTROLS": True,
         "RUN_QIAO": True, "PAIRED_FRACTION": .2,
-        "SHOW_FULL_DIAGNOSTICS": True,
+        "SHOW_FULL_DIAGNOSTICS": False,
     }.items():
         assert assignments[key] == expected
     joined = "\n".join(all_code)
@@ -60,6 +67,7 @@ def test_clean_valid_python_and_shared_defaults(name):
     assert "pip install" not in joined
     assert "paper_figure_exports" in joined
     assert "raw_data" in joined and "checkpoints" in joined
+    assert "GENE2WIRE_PROJECT_DIR" in joined
     assert "plot_results(artifacts, output_dir=FIGURE_DIR)" in joined
 
 
@@ -76,7 +84,10 @@ def test_location_switch_controls_simulation_truth_and_fitted_features():
 
 
 def builder():
-    spec = importlib.util.spec_from_file_location("notebook_diagnostics_builder", ROOT / "scripts" / "build_notebooks_0908.py")
+    spec = importlib.util.spec_from_file_location(
+        "notebook_diagnostics_builder",
+        ROOT / "scripts" / "notebooks" / "build_positive_label_hiding.py",
+    )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -100,7 +111,7 @@ def test_generated_results_only_skips_all_raw_and_fit_cells(name):
     assert "load_existing_exports(" in all_code
     assert "configure_full_display()" in all_code
     assert "display_diagnostics(artifacts, label=label, full=SHOW_FULL_DIAGNOSTICS)" in all_code
-    assert "SHOW_FULL_DIAGNOSTICS = True" in all_code
+    assert "SHOW_FULL_DIAGNOSTICS = False" in all_code
     assert "plot_detection_only_benchmark_results(" in all_code
     assert "plot_information_budget_results(" in all_code
     assert "RUN_QIAO = True" in all_code
@@ -127,7 +138,7 @@ def test_generated_results_only_skips_all_raw_and_fit_cells(name):
 
 
 def test_generator_reproduces_checked_in_notebooks(tmp_path):
-    path = ROOT / "scripts" / "build_notebooks_0908.py"
+    path = ROOT / "scripts" / "notebooks" / "build_positive_label_hiding.py"
     spec = importlib.util.spec_from_file_location("notebook_builder", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -135,7 +146,7 @@ def test_generator_reproduces_checked_in_notebooks(tmp_path):
     generated = module.build(manifest["core_commit"], manifest["source_hash"], tmp_path,
                              date_suffix=manifest["notebook_date"])
     for output in generated:
-        assert output.read_bytes() == (ROOT / output.name).read_bytes()
+        assert output.read_bytes() == (NOTEBOOK_DIR / output.name).read_bytes()
 
 
 def test_bootstrap_reuses_verified_local_sources_without_network(tmp_path):
@@ -188,7 +199,7 @@ def test_every_code_cell_has_a_visible_section_in_the_toc(name):
 
 def test_simulation_exposes_primary_budget_and_optional_size_sweep():
     module = builder()
-    namespace = {"__file__": str(ROOT / "simulation_0908.ipynb")}
+    namespace = {"__file__": str(NOTEBOOK_DIR / "simulation.ipynb")}
     source = module.CONFIG.replace("__CORE_COMMIT_0908__", "a" * 40).replace(
         "__SOURCE_HASH_0908__", "b" * 64).replace("__EXISTING_EXPORT_DIRS_0908__", "{}")
     exec(source, namespace)
@@ -202,16 +213,17 @@ def test_simulation_exposes_primary_budget_and_optional_size_sweep():
     assert "calibration_fractions=CALIBRATION_FRACTIONS" in code
 
 
-def test_dated_releases_preserve_previous_files_and_replace_same_date(tmp_path):
+def test_stable_filenames_replace_previous_release_in_place(tmp_path):
     module = builder()
     previous = module.build("a" * 40, "b" * 64, tmp_path, date_suffix="0908")
     previous_bytes = {p.name: p.read_bytes() for p in previous}
     current = module.build("c" * 40, "d" * 64, tmp_path, date_suffix="0909")
+    assert {p.name for p in previous} == set(NOTEBOOK_FILENAMES.values())
+    assert current == previous
+    assert any(path.read_bytes() != previous_bytes[path.name] for path in current)
     replaced = module.build("e" * 40, "f" * 64, tmp_path, date_suffix="0909")
     assert current == replaced
-    assert len(list(tmp_path.glob("*.ipynb"))) == 10
-    for path in previous:
-        assert path.read_bytes() == previous_bytes[path.name]
+    assert len(list(tmp_path.glob("*.ipynb"))) == len(NOTEBOOK_FILENAMES)
     for path in replaced:
         nb = json.loads(path.read_text())
         assert nb["metadata"]["gene2wire"]["core_commit"] == "e" * 40

@@ -34,6 +34,7 @@ GEO_SAMPLE_FILES = {
 }
 TARGETS = ("AI_valid", "DMS_valid", "MD_valid", "BLA_valid", "LH_valid")
 SAMPLES = tuple(GEO_SAMPLE_FILES)
+ASSAY_DERIVED_GENE_PREFIXES = ("barcode",)
 
 
 def _read_gzip_lines(path):
@@ -192,14 +193,13 @@ def _make_dataset(*, normalized_expression, gene_names, meta, metadata,
     return dataset
 
 
-def load_merge_seq(cache_dir, *, n_gene_features=128, location_features_csv=None,
-                   target_features_csv=None, raw_paths: Mapping[str, str | Path] | None = None):
-    """Load audited metadata + 12 cached GEO files without repeated downloads.
+def _load_merge_seq_arrays(
+    cache_dir,
+    *,
+    raw_paths: Mapping[str, str | Path] | None = None,
+):
+    """Return aligned metadata and normalized expression from the verified cache."""
 
-    ``raw_paths`` accepts ``metadata`` and ``geo_dir``. Existing environment
-    variables MERGESEQ_METADATA_PATH/MERGESEQ_GEO_MATRIX_DIR remain supported.
-    Overrides are still validated. Download manifests pin each raw file's bytes.
-    """
     from ..io import atomic_json, cached_download, file_hash
 
     cache = Path(cache_dir).expanduser()
@@ -251,6 +251,294 @@ def load_merge_seq(cache_dir, *, n_gene_features=128, location_features_csv=None
     audit = {"source_sha256": hashes, "raw_input_cells": raw_cells,
              "expression_normalization": "per_cell_library_1e4_log1p",
              "feature_selection": "training_only_variance_with_detection_filter"}
+    return expression, genes, meta, audit
+
+
+def _deterministic_unassayed_design_rows(meta, measured, *, fraction, seed):
+    """Reserve a fixed fraction of label-free design cells within every sample.
+
+    The candidates must be both explicitly ``Non-barcoded`` and all-W=0. Cell
+    IDs are sorted before seeded sampling so the result does not depend on the
+    input row order. These rows are used only to choose a fixed source-gene
+    panel and are removed from the returned analysis cohort.
+    """
+
+    fraction = float(fraction)
+    if not np.isfinite(fraction) or not 0 < fraction < 1:
+        raise ValueError("panel_design_fraction must lie strictly between zero and one")
+    w = np.asarray(measured, dtype=bool)
+    if w.shape != (len(meta), len(TARGETS)):
+        raise ValueError("MERGE-seq measurement mask is not aligned to metadata")
+    status = meta["barcoded"].astype(str).str.strip().to_numpy()
+    candidate = (status == "Non-barcoded") & ~w.any(axis=1)
+    ids = meta.index.astype(str).to_numpy()
+    samples = meta["sample"].astype(str).to_numpy()
+    selected = []
+    counts = {}
+    for sample in SAMPLES:
+        rows = np.flatnonzero(candidate & (samples == sample))
+        if len(rows) < 2:
+            raise ValueError(
+                f"MERGE-seq sample {sample!r} has only {len(rows)} all-W=0 "
+                "non-barcoded cells; at least two are required"
+            )
+        sample_count = max(1, int(np.floor(len(rows) * fraction + .5)))
+        if sample_count >= len(rows):
+            raise ValueError(
+                f"panel_design_fraction={fraction:g} would reserve every all-W=0 "
+                f"non-barcoded cell in MERGE-seq sample {sample!r}"
+            )
+        rows = rows[np.argsort(ids[rows], kind="stable")]
+        payload = f"{int(seed)}|MERGE-seq-overlap-design|{sample}".encode("utf-8")
+        sample_seed = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+        chosen = rows[np.random.default_rng(sample_seed).permutation(len(rows))[:sample_count]]
+        selected.extend(map(int, chosen))
+        counts[sample] = int(len(chosen))
+    result = np.asarray(sorted(selected), dtype=int)
+    if len(result) != sum(counts.values()) or len(np.unique(result)) != len(result):
+        raise RuntimeError("MERGE-seq design rows were not selected one-to-one")
+    if np.any(w[result]) or np.any(status[result] != "Non-barcoded"):
+        raise RuntimeError("MERGE-seq source-gene design rows must be label-free")
+    return result, counts
+
+
+def _assay_derived_gene(name: str) -> bool:
+    value = str(name).strip().casefold()
+    return any(value.startswith(prefix) for prefix in ASSAY_DERIVED_GENE_PREFIXES)
+
+
+def _renormalize_without_assay_features(expression, genes):
+    """Remove assay-derived rows from the log-normalization denominator.
+
+    The shared processed cache stores ``log1p(1e4 * count / all-count total)``.
+    Exponentiating recovers the normalized linear proportions, so a second
+    row normalization after zeroing ``barcode*`` columns is algebraically the
+    same as normalizing the biological-gene counts without those columns.  The
+    ordinary MERGE adapter deliberately retains its historical normalization;
+    this stricter transformation is overlap-only.
+    """
+
+    matrix = sparse.csr_matrix(expression, dtype=np.float64).copy()
+    if matrix.shape[1] != len(genes):
+        raise ValueError("MERGE-seq expression and genes are not aligned")
+    assay_derived = np.asarray(
+        [_assay_derived_gene(name) for name in genes], dtype=bool
+    )
+    matrix.data = np.expm1(matrix.data)
+    if assay_derived.any():
+        matrix = matrix.multiply((~assay_derived).astype(float)).tocsr()
+        matrix.eliminate_zeros()
+    totals = np.asarray(matrix.sum(axis=1)).ravel()
+    if not np.isfinite(totals).all() or np.any(totals <= 0):
+        raise ValueError(
+            "MERGE-seq cells need positive non-assay expression library size"
+        )
+    matrix = (sparse.diags(1e4 / totals) @ matrix).tocsr()
+    matrix.data = np.log1p(matrix.data)
+    matrix.eliminate_zeros()
+    return matrix.astype(np.float32), assay_derived
+
+
+def _select_overlap_source_genes(expression, genes, design_rows, *, n_source_genes):
+    """Choose fixed high-variance genes using reserved design expression only."""
+
+    if isinstance(n_source_genes, bool) or int(n_source_genes) != n_source_genes:
+        raise TypeError("n_source_genes must be an integer")
+    n_source_genes = int(n_source_genes)
+    if n_source_genes < 2:
+        raise ValueError("n_source_genes must be at least two")
+    design = np.asarray(design_rows, dtype=int)
+    if design.ndim != 1 or not len(design) or len(np.unique(design)) != len(design):
+        raise ValueError("design_rows must be a nonempty unique integer vector")
+    fitted = sparse.csr_matrix(expression)[design]
+    mean = np.asarray(fitted.mean(axis=0)).ravel().astype(float)
+    variance = np.maximum(
+        np.asarray(fitted.multiply(fitted).mean(axis=0)).ravel() - mean**2,
+        0,
+    )
+    detected = np.asarray(fitted.getnnz(axis=0)).ravel()
+    minimum_detected = max(2, int(math.ceil(.01 * len(design))))
+    assay_derived = np.asarray([_assay_derived_gene(name) for name in genes], dtype=bool)
+    eligible = np.flatnonzero(
+        (detected >= minimum_detected) & np.isfinite(variance) & ~assay_derived
+    )
+    if len(eligible) < n_source_genes:
+        raise ValueError(
+            f"Only {len(eligible)} genes meet the reserved-design detection filter; "
+            f"requested n_source_genes={n_source_genes}"
+        )
+    selected = eligible[np.lexsort((eligible, -variance[eligible]))[:n_source_genes]]
+    return np.asarray(selected, dtype=int), minimum_detected, tuple(
+        str(genes[index]) for index in np.flatnonzero(assay_derived)
+    )
+
+
+def _make_overlap_dataset(
+    *,
+    normalized_expression,
+    gene_names,
+    meta,
+    metadata,
+    source_gene_count=128,
+    panel_design_fraction=.20,
+    seed=20260910,
+):
+    """Build the opt-in MERGE-seq source panel for gene-overlap experiments.
+
+    Unlike the ordinary adapter's fold-specific variable-gene selection, this
+    adapter needs one fixed source panel so all overlap levels and folds refer
+    to the same gene coordinates. It chooses that panel using only a reserved
+    subset of structurally unassayed cells and then removes those cells.
+    """
+
+    expression = sparse.csr_matrix(normalized_expression, dtype=np.float32)
+    genes = tuple(map(str, gene_names))
+    if expression.shape != (len(meta), len(genes)) or len(set(genes)) != len(genes):
+        raise ValueError("MERGE-seq expression and unique genes must align to metadata")
+    if not np.isfinite(expression.data).all() or np.any(expression.data < 0):
+        raise ValueError("MERGE-seq normalized expression is invalid")
+    # Prevent an excluded barcode-capture feature from leaking back indirectly
+    # through the library-size denominator used by the shared processed cache.
+    expression, assay_derived = _renormalize_without_assay_features(expression, genes)
+    reference, measured = _labels_from_metadata(meta)
+    design_rows, design_counts = _deterministic_unassayed_design_rows(
+        meta, measured, fraction=panel_design_fraction, seed=seed
+    )
+    selected, minimum_detected, excluded_assay_genes = _select_overlap_source_genes(
+        expression, genes, design_rows, n_source_genes=source_gene_count
+    )
+    keep = np.ones(len(meta), dtype=bool)
+    keep[design_rows] = False
+    analysis_rows = np.flatnonzero(keep)
+    analysis_meta = meta.iloc[analysis_rows].copy()
+    source_matrix = expression[analysis_rows][:, selected].toarray().astype(np.float32)
+    analysis_reference = reference[analysis_rows]
+    analysis_measured = measured[analysis_rows]
+    ids = tuple(analysis_meta.index.astype(str))
+    samples = analysis_meta["sample"].astype(str).to_numpy()
+    assay_status = np.where(analysis_measured.any(axis=1), "assayed", "unassayed")
+
+    def features(train_rows, use_location=False, use_target_features=False):
+        train = _training_rows(train_rows, len(ids))
+        if use_location:
+            raise ValueError(
+                "MERGE-seq has no native physical cell coordinates; pseudotime is not location"
+            )
+        if use_target_features:
+            raise ValueError(
+                "MERGE-seq has no native target expression descriptors; "
+                "the overlap adapter requires USE_TARGET_FEATURES=False"
+            )
+        x = StandardScaler().fit(source_matrix[train]).transform(source_matrix)
+        return FeatureSet(
+            x,
+            {"gene": tuple(range(len(selected)))},
+            None,
+            tuple(genes[index] for index in selected),
+            {
+                "preprocessing_fit_rows": train.tolist(),
+                "source_gene_selection": "reserved_all-W-zero_non-barcoded_top_variance_v1",
+                "source_gene_selection_reads_analysis_expression": False,
+            },
+        )
+
+    def splits(n_outer_folds=3, seed=0):
+        return _group_folds(samples, n_outer_folds, seed)
+
+    audit = dict(metadata)
+    audit.update({
+        "retained_cells": len(ids),
+        "barcoded_cells": int(analysis_measured.any(axis=1).sum()),
+        "unassayed_cells": int((~analysis_measured.any(axis=1)).sum()),
+        "reference_positives": int(analysis_reference.sum()),
+        "sample_counts": {sample: int(np.sum(samples == sample)) for sample in SAMPLES},
+        "location_available": False,
+        "native_target_features_available": False,
+        "reference_kind": "pre_thinning_assay",
+        "cohort_version": "authors_validated_excitatory_v1_overlap_reserved_design_v1",
+        "overlap_source_gene_count": int(len(selected)),
+        "overlap_source_gene_indices": selected.tolist(),
+        "overlap_source_gene_names": [genes[index] for index in selected],
+        "overlap_source_selection": "reserved_all-W-zero_non-barcoded_top_variance_v1",
+        "overlap_expression_normalization":
+            "per_cell_library_1e4_log1p_excluding_assay_derived_features",
+        "overlap_normalization_reads_analysis_labels": False,
+        "overlap_source_minimum_detected_design_cells": int(minimum_detected),
+        "overlap_design_seed": int(seed),
+        "overlap_panel_design_fraction": float(panel_design_fraction),
+        "overlap_design_counts": design_counts,
+        "overlap_design_cell_ids": meta.index.astype(str).to_numpy()[design_rows].tolist(),
+        "overlap_design_rows_removed": True,
+        "overlap_selection_reads_analysis_expression": False,
+        "excluded_assay_derived_genes": list(excluded_assay_genes),
+        "excluded_assay_derived_gene_count": int(assay_derived.sum()),
+    })
+    dataset = ExperimentDataset(
+        "MERGE-seq",
+        analysis_reference,
+        analysis_measured,
+        ids,
+        TARGETS,
+        features,
+        splits,
+        {"sample": samples, "assay_status": assay_status},
+        metadata=audit,
+        gene_matrix=source_matrix,
+        gene_names=tuple(genes[index] for index in selected),
+    )
+    dataset.validate()
+    if not np.array_equal(dataset.measured, np.repeat(
+        dataset.measured[:, :1], len(TARGETS), axis=1
+    )):
+        raise ValueError("MERGE-seq overlap targets do not share one assay mask")
+    return dataset
+
+
+def load_merge_seq(cache_dir, *, n_gene_features=128, location_features_csv=None,
+                   target_features_csv=None, raw_paths: Mapping[str, str | Path] | None = None):
+    """Load audited metadata + 12 cached GEO files without repeated downloads.
+
+    ``raw_paths`` accepts ``metadata`` and ``geo_dir``. Existing environment
+    variables MERGESEQ_METADATA_PATH/MERGESEQ_GEO_MATRIX_DIR remain supported.
+    Overrides are still validated. Download manifests pin each raw file's bytes.
+    """
+
+    expression, genes, meta, audit = _load_merge_seq_arrays(
+        cache_dir, raw_paths=raw_paths
+    )
     return _make_dataset(normalized_expression=expression, gene_names=genes, meta=meta,
                          metadata=audit, n_gene_features=n_gene_features,
                          location_features_csv=location_features_csv, target_features_csv=target_features_csv)
+
+
+def load_merge_seq_overlap(
+    cache_dir,
+    *,
+    source_gene_count=128,
+    panel_design_fraction=.20,
+    seed=20260910,
+    raw_paths: Mapping[str, str | Path] | None = None,
+):
+    """Load the opt-in, leak-isolated MERGE-seq gene-overlap adapter.
+
+    A deterministic fraction of all-W=0 non-barcoded cells within each sample
+    defines a fixed top-variance source panel. Those design cells are
+    removed before splitting, calibration, fitting, and evaluation. Projection
+    targets and the remaining cells' reference/measurement arrays are unchanged.
+    The ordinary :func:`load_merge_seq` adapter retains its fold-local feature
+    selection and is not altered by this opt-in workflow.
+    """
+
+    expression, genes, meta, audit = _load_merge_seq_arrays(
+        cache_dir, raw_paths=raw_paths
+    )
+    return _make_overlap_dataset(
+        normalized_expression=expression,
+        gene_names=genes,
+        meta=meta,
+        metadata={**audit, "feature_selection":
+                  "reserved_all-W-zero_non-barcoded_top_variance_then_train_only_scaling"},
+        source_gene_count=source_gene_count,
+        panel_design_fraction=panel_design_fraction,
+        seed=seed,
+    )

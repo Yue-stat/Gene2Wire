@@ -8,4 +8,11 @@ dist/
 .venv/
 venv/
 checkpoints/
-results/
+raw_data/
+paper_figure_exports/
+figures/
+code/
+/results/*
+!/results/README.md
+!/results/notebook_snapshots/
+!/results/notebook_snapshots/**

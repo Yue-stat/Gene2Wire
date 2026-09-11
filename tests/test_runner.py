@@ -7,6 +7,8 @@ import pytest
 
 from gene2wire import DatasetBundle, FitConfig, ModelConfig, TuningConfig, run_model_grid
 from gene2wire.checkpoint import AtomicArrayCheckpointStore, unit_key
+from gene2wire.models import model_identity
+from gene2wire.runner import _compatible_joint_endpoint
 
 
 def partitions(seed: int = 11):
@@ -147,3 +149,52 @@ def test_runner_shares_warm_starts_across_model_families(tmp_path: Path):
     # initializer for tuning and one for the distinct development/refit data.
     manifests = list((tmp_path / "checkpoints" / "warm_starts").glob("*.json"))
     assert len(manifests) == 2
+
+
+def test_runner_carries_standalone_winners_into_joint_independent_of_input_order():
+    train, validation, test_x, exposure = partitions()
+    tuning = TuningConfig(
+        ranks=(1,), shared_l2=(.1,), residual_l2=(.1,), target_l2=(.1,),
+        candidate_budget=1, include_endpoints=True,
+    )
+    models = (
+        ModelConfig(name="Joint", kind="joint", rank=1, pu=False),
+        ModelConfig(name="MIRT", kind="lowrank", rank=1, pu=False),
+        ModelConfig(name="Logistic", kind="direct", pu=False),
+    )
+    result = run_model_grid(
+        train=train, validation=validation, test_X=test_x,
+        train_exposure=exposure[:36], validation_exposure=exposure[36:54],
+        test_exposure=exposure[54:],
+        test_cell_ids=[f"cell_{index}" for index in range(54, 72)],
+        models=models, tuning=tuning,
+        fit=FitConfig(maxiter=30, retry_maxiter=40, tolerance=1e-5),
+        seed=93, code_version="joint-endpoint-test",
+    )
+    assert tuple(result.models) == tuple(model.name for model in models)
+    joint_trials = result.models["Joint"].tuning.trials
+    assert len(joint_trials) == 3
+    assert sum(trial.config.kind == "joint" for trial in joint_trials) == 1
+    assert sum(trial.stage == "inherited_endpoint" for trial in joint_trials) == 2
+    expected = {
+        str(model_identity(result.models["Logistic"].tuning.best_config)),
+        str(model_identity(result.models["MIRT"].tuning.best_config)),
+    }
+    assert expected.issubset({str(model_identity(trial.config)) for trial in joint_trials})
+
+
+def test_joint_endpoint_compatibility_excludes_nuisance_and_separate_a_models():
+    joint = ModelConfig(name="Joint", kind="joint", rank=1, nuisance_l2=.1)
+    assert _compatible_joint_endpoint(
+        ModelConfig(name="Logistic", kind="direct", nuisance_l2=.1), joint
+    )
+    assert not _compatible_joint_endpoint(
+        ModelConfig(name="Logistic-other", kind="direct", nuisance_l2=.2), joint
+    )
+    assert not _compatible_joint_endpoint(
+        ModelConfig(
+            name="Separate-A", kind="lowrank", rank=1, nuisance_l2=.1,
+            lowrank_feature_groups=("panel_A_gene", "panel_B_gene"),
+        ),
+        joint,
+    )

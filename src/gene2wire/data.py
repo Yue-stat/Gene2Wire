@@ -64,6 +64,11 @@ class DatasetBundle:
         Optional target-level covariates, shape ``(n_targets, n_covariates)``.
         Models configured with ``use_target_features=True`` add the fixed-target
         term ``(X D) Y_target.T``.
+    X_nuisance/nuisance_names:
+        Optional explicit cell-level nuisance design, shape
+        ``(n_cells, n_nuisance)``. Every model kind adds unrestricted
+        target-specific coefficients for these columns outside its structured
+        gene term. These values are not part of ``X_cell`` or feature blocks.
     Z_reference/reference_mask:
         Optional evaluation-only reference truth and its availability mask.
         These arrays must not be passed into model tuning.
@@ -81,6 +86,8 @@ class DatasetBundle:
     feature_blocks: Mapping[str, Sequence[int]] = field(default_factory=dict)
     semantics: Mapping[str, Any] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    X_nuisance: Any | None = None
+    nuisance_names: Sequence[Any] | None = None
 
     def __post_init__(self) -> None:
         x = _readonly_float(self.X_cell)
@@ -100,6 +107,30 @@ class DatasetBundle:
             raise ValueError("W_measured contains no measured entries")
 
         n_cells, n_targets = s.shape
+        x_nuisance = None
+        nuisance_names: tuple[str, ...] = ()
+        if self.X_nuisance is None:
+            if self.nuisance_names is not None and len(self.nuisance_names) != 0:
+                raise ValueError("nuisance_names requires X_nuisance")
+        else:
+            x_nuisance = _readonly_float(self.X_nuisance)
+            if (
+                x_nuisance.ndim != 2
+                or x_nuisance.shape[0] != n_cells
+                or x_nuisance.shape[1] < 1
+            ):
+                raise ValueError(
+                    "X_nuisance must have shape (n_cells, n_nuisance) with "
+                    "at least one nuisance column"
+                )
+            if not np.all(np.isfinite(x_nuisance)):
+                raise ValueError("X_nuisance contains non-finite values")
+            nuisance_names = _ids(
+                "nuisance_names",
+                self.nuisance_names,
+                x_nuisance.shape[1],
+                "nuisance_",
+            )
         y_target = None
         if self.Y_target is not None:
             y_target = _readonly_float(self.Y_target)
@@ -161,6 +192,8 @@ class DatasetBundle:
         object.__setattr__(self, "feature_blocks", MappingProxyType(feature_blocks))
         object.__setattr__(self, "semantics", MappingProxyType(deepcopy(dict(self.semantics))))
         object.__setattr__(self, "metadata", MappingProxyType(deepcopy(dict(self.metadata))))
+        object.__setattr__(self, "X_nuisance", x_nuisance)
+        object.__setattr__(self, "nuisance_names", nuisance_names)
 
     @property
     def n_cells(self) -> int:
@@ -173,6 +206,10 @@ class DatasetBundle:
     @property
     def n_targets(self) -> int:
         return int(self.S_observed.shape[1])
+
+    @property
+    def n_nuisance(self) -> int:
+        return 0 if self.X_nuisance is None else int(self.X_nuisance.shape[1])
 
     def subset_rows(self, rows: Sequence[int] | NDArray[np.bool_]) -> "DatasetBundle":
         """Return a row subset while preserving target-level metadata."""
@@ -191,6 +228,10 @@ class DatasetBundle:
             feature_blocks=self.feature_blocks,
             semantics=self.semantics,
             metadata=self.metadata,
+            X_nuisance=(
+                None if self.X_nuisance is None else self.X_nuisance[idx]
+            ),
+            nuisance_names=self.nuisance_names,
         )
 
     def without_reference(self) -> "DatasetBundle":
@@ -207,4 +248,6 @@ class DatasetBundle:
             feature_blocks=self.feature_blocks,
             semantics=self.semantics,
             metadata=self.metadata,
+            X_nuisance=self.X_nuisance,
+            nuisance_names=self.nuisance_names,
         )

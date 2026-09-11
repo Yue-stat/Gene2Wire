@@ -290,7 +290,9 @@ def _make_dataset(*, gene_counts, library_size, meta, standard, reference, measu
                   "gene_features": list(GENE_FEATURES), "location_available": True,
                   "native_target_features_available": False})
     dataset = ExperimentDataset("Projection-TAGs", np.asarray(reference, bool), np.asarray(measured, bool),
-                                ids, TARGETS, features, splits, {"animal": animals},
+                                ids, TARGETS, features, splits,
+                                gene_matrix=gene_log, gene_names=tuple(GENE_FEATURES),
+                                groups={"animal": animals},
                                 natural_observed=np.asarray(standard, bool), platform=platforms,
                                 metadata=audit)
     dataset.validate()

@@ -3,16 +3,25 @@
 Gene2Wire predicts neuronal projection outcomes from measured cellular features
 under incomplete detection. The repository contains one shared implementation
 of independent logistic, low-rank MIRT, and shared-plus-specific Joint models,
-with matched ordinary and positive-unlabeled (PU) likelihoods. The 0908 release
-also includes shared dataset adapters, experiment controls, checkpointing,
-evaluation, and OnDemand notebooks.
+with matched ordinary and positive-unlabeled (PU) likelihoods. Shared dataset
+adapters, experiment controls, checkpointing, evaluation, and OnDemand entry
+points live in the same versioned repository.
 
-**The 0908 notebooks define a new harmonized protocol. Earlier paper numbers do
-not become 0908 results without rerunning.** Tests and small execution checks
-validate implementation; they do not replace the full experiments or establish
-that one method outperforms another.
+Canonical, output-cleared notebooks are organized by scientific question under
+[`notebooks/`](notebooks/README.md). Historical notebooks retain their original
+source pins under `archive/notebooks/`, while selected executed runs are stored
+separately under `results/notebook_snapshots/`. Do not combine numerical results
+across different immutable core pins without rerunning the corresponding study.
 
 ## Paper experiment entry points
+
+The latest [SPIDER-Seq native-panel notebook](notebooks/native_target_panels/spider_seq.ipynb)
+uses the scRNA-seq Adult1/2/3 panels with native missing targets and no artificial
+masking. It compares shared core assay-outcome predictors and exports unvalidated
+forecasts for truly unassayed entries. Its feature stage reports progress and
+normalizes the sparse count matrix once before split-specific HVG/PCA fitting.
+This is distinct from the spatial SPIDER notebooks below. See the
+[data audit and protocol](docs/SPIDER_SEQ_NATIVE_PANELS.md).
 
 Open one of these notebooks in an OnDemand Python kernel and run its cells from
 top to bottom. Figures display in the notebook and save as PDF; raw data,
@@ -20,23 +29,42 @@ checkpoints, full metric tables, and predictions persist on disk.
 
 | Notebook | Experiment |
 |---|---|
-| [simulation_0909.ipynb](simulation_0909.ipynb) | Sharing strengths 0, 0.5, 1; 0–80% loss curves and declared mechanism/calibration controls |
-| [Projection_TAGs_0909.ipynb](Projection_TAGs_0909.ipynb) | Natural paired standard versus standard-or-amplified reference; no artificial loss curve |
-| [SPIDER_0909.ipynb](SPIDER_0909.ipynb) | Spatial holdout and controlled 0–80% positive thinning |
-| [MERGE_seq_0909.ipynb](MERGE_seq_0909.ipynb) | Whole-sample holdout and controlled 0–80% positive thinning |
-| [BARseq_0909.ipynb](BARseq_0909.ipynb) | A1 and M1 fitted and reported separately; within-animal depth holdout |
+| [simulation](notebooks/positive_label_hiding/simulation.ipynb) | Sharing strengths 0, 0.5, 1; 0–80% loss curves and declared mechanism/calibration controls |
+| [Projection-TAGs](notebooks/positive_label_hiding/projection_tags.ipynb) | Natural paired standard versus standard-or-amplified reference; no artificial loss curve |
+| [SPIDER spatial](notebooks/positive_label_hiding/spider_spatial.ipynb) | Spatial holdout and controlled 0–80% positive thinning |
+| [MERGE-seq](notebooks/positive_label_hiding/merge_seq.ipynb) | Whole-sample holdout and controlled 0–80% positive thinning |
+| [BARseq](notebooks/positive_label_hiding/barseq.ipynb) | A1 and M1 fitted and reported separately; within-animal depth holdout |
 
 The 0909 notebooks add a benchmark plot excluding direct reference-label training
-and default to full diagnostics. Earlier dated notebooks, including 0908, remain
+and default to bounded essential diagnostics. Earlier dated notebooks, including 0908, remain
 available with their original code pins. See [the 0909 update](docs/ONDEMAND_0909.md)
 for replotting existing exports without training. The scientific protocol and
 model selection rules are unchanged by this display update.
 
-Legacy notebooks under `archive/legacy/` document previous implementations. They
+Legacy notebooks under `archive/notebooks/legacy/` document previous implementations. They
 are not alternative entry points for this protocol and must not supply numbers
 to the new result exports.
 
-Every notebook starts with the same defaults:
+The independent [group × target block experiment](docs/BLOCK_MASKING_0909.md)
+keeps all input gene features and evaluates artificially unassayed target blocks
+on held-out cells within represented groups:
+
+| Notebook | Groups |
+|---|---|
+| [BARseq A1](notebooks/target_block_masking/barseq_a1.ipynb) | A1's two biological animals |
+| [BARseq M1](notebooks/target_block_masking/barseq_m1.ipynb) | Two artificial groups within M1's single animal |
+| [MERGE-seq](notebooks/target_block_masking/merge_seq.ipynb) | Four recorded experimental samples |
+| [Projection-TAGs](notebooks/target_block_masking/projection_tags.ipynb) | Recorded animals, preserving native assay coverage |
+| [simulation](notebooks/target_block_masking/simulation.ipynb) | Two artificial groups, sharing strengths 0/0.5/1 |
+| [SPIDER spatial](notebooks/target_block_masking/spider_spatial.ipynb) | Two artificial groups; the current adapter has no verified animal IDs |
+| [SPIDER-Seq](notebooks/target_block_masking/spider_seq.ipynb) | Adult1/2/3 native animal panels; targets measured in at least two animals |
+
+These notebooks include a matched full-training-panel control and use separate
+checkpoints and result families. Default additional positive loss is zero;
+Projection-TAGs keeps natural detections. Block fractions refer to selected
+target columns, not positive loss. The primary notebooks above remain unchanged.
+
+The positive-label and target-block notebooks start with these shared defaults:
 
 ```python
 N_OUTER_FOLDS = 3
@@ -45,14 +73,17 @@ USE_TARGET_FEATURES = False
 N_JOBS = 32
 N_REPETITIONS = 5
 STRATEGY = 'full_joint'
-SHOW_FULL_DIAGNOSTICS = True
+SHOW_FULL_DIAGNOSTICS = False
 ```
 
 `full_joint` searches simultaneous rank/penalty combinations from a deterministic
-bounded Cartesian grid. The common profile caps selectable configurations at
-32 per method and includes exact direct and residual-off candidates in Joint's
-budget. It does not imply exhaustive evaluation of an arbitrarily large grid.
-Actual candidates and selected configurations are exported.
+bounded Cartesian grid. The common profile gives each model family a native
+budget of 32 genuine candidates. Joint additionally evaluates the exact selected
+direct and low-rank winners when compatible standalone models are present, so its
+selection set can contain up to 34 rows; those endpoint fits are reused from the
+standalone candidate/refit caches. It does not imply exhaustive evaluation of an
+arbitrarily large grid. Actual candidates, endpoint provenance and selected
+configurations are exported.
 
 In simulation, the default `truth_uses_location = USE_LOCATION` controls the
 generated projection signal as well as predictor inputs. Gene-only simulation
@@ -87,6 +118,10 @@ otherwise the exact commit is downloaded once to the code cache. Later runs
 verify local bytes. A previously imported package with a different path or
 checksum requires a kernel restart.
 
+The distribution version (`0.4.0`) and `CORE_API_VERSION` (`0.6.0`) serve
+different purposes. The latter is the checkpoint/model-identity schema epoch;
+it changes only when persisted execution semantics become incompatible.
+
 Dependency version ranges describe supported installation requirements; they
 are not an exact environment lock. Each result manifest records the numerical
 library versions used for that run. Preserve the environment alongside the
@@ -102,7 +137,7 @@ The default base directory is `/home/yueyue/gene2wire`:
 | `code/<CORE_COMMIT>/` | Verified immutable source checkout, when a matching local checkout is unavailable |
 | `checkpoints/0908/` | Atomic compatible tuning/model checkpoints |
 | `paper_figure_exports/<dataset>_0908/<run_id>/` | Manifest, complete CSV tables, per-unit audits, saved test predictions and masks |
-| `figures/0909/` | PDF figures for this notebook release; also displayed in the notebook |
+| `figures/<notebook_date>/` | PDF figures for the embedded notebook release date; also displayed in the notebook |
 
 There is no Google Drive dependency. The first uncached run needs internet
 access to obtain code and raw sources. Validated files are reused offline on
@@ -177,12 +212,12 @@ dashed lines indicate neither. Reference + PU logistic and both RF arms using
 paired references therefore have solid curves. Historical unrun rates remain
 gaps when loading old exports; new intermediate fits require a training run.
 Horizontal model dot panels are omitted by default; Projection-TAGs retains
-its paired-label audit, with model metrics in tables. Information-budget plots
+its paired-label audit and natural-condition horizontal model bars. Information-budget plots
 compare Reference + PU logistic, RF (observed + paired references), and
 Reference + PU-Joint in three metric panels. All use the same paired cells;
 RF learns mixed labels without detection correction. Recovery uses PU posterior
-scores for the PU models and RF scores for RF. Unrun/single-condition
-comparisons are skipped.
+scores for the PU models and RF scores for RF. Synthetic unrun/single-condition
+comparisons are skipped; natural paired comparisons do not invent a loss axis.
 
 Qiao bilinear comparisons are enabled by default on every dataset's primary
 conditions. With target features disabled, `Qiao-ID-squared` and `Qiao-ID-logit`
@@ -202,20 +237,39 @@ refit cache hit alone cannot classify the entire model as reused. Incomplete
 telemetry is explicitly unknown. `model_evaluation_plan.csv` lists the exact
 denominator and `model_cache_accounting.csv` records the completed-unit breakdown.
 Duplicate calibration fractions are rejected before scheduling.
-A separate notebook cell displays occupied/available worker slots in one live
-output, refreshed once per progress interval. Requested workers, scheduled pool
-size and detectable CPU allowance are distinct. Occupancy includes fitting,
-cache access and output writing; it is not machine-wide CPU utilization.
-Notebook reports display full diagnostics by default, including tuning and target
-tables. Set `SHOW_FULL_DIAGNOSTICS=False` for compact endpoint, information-budget
-and convergence summaries. Complete CSV/NPZ exports remain available in either mode.
+A separate notebook cell reports CPU capacity from the machine, process affinity,
+cgroup quotas and scheduler allocation metadata, refreshed once per progress
+interval. It reports this experiment's active workers separately. Allocation is
+not globally idle capacity; the notebook cannot count other jobs' unused CPUs.
+Notebook reports default to `SHOW_FULL_DIAGNOSTICS=False`: bounded aggregate
+metrics, important-model settings by repetition, convergence, calibration and
+matched block/control diagnostics. Omitted rows are explicitly counted. Set the
+switch to `True` only to display every raw table; that output can be large.
+Complete CSV/NPZ exports remain available in either mode.
 New exports include `joint_selection_diagnostics.csv`: per-unit candidate counts
 and best converged validation scores for direct, lowrank and joint candidates,
 plus the recorded selected family and its validation margin versus direct.
 This audits the recorded Joint search, not an inferred full MIRT grid. Full
 diagnostics derive the same table from older saved trials without refitting.
 
+The separate partial gene-panel overlap workflow is documented in
+[`docs/GENE_OVERLAP_0910.md`](docs/GENE_OVERLAP_0910.md). Its five generated notebooks keep projection
+targets fixed, expose an editable `OVERLAP_GRID`, mask only input expression,
+and disable random forest by default. The MERGE-seq notebook uses crossed
+panels within `(sample, assay_status)`, retains its five targets and whole-sample
+cross-validation, and therefore serves as a robustness analysis rather than a
+general low-rank mechanism test. Its all-`P` oracle means all fixed 128 candidate
+genes chosen from reserved `W=0` design cells—not the whole transcriptome—and
+does not add sample nuisance effects. Its overlap-only expression normalization
+also excludes `barcode*` assay-derived features from the library-size
+denominator. The MERGE entry point is
+[`notebooks/gene_panel_overlap/merge_seq.ipynb`](notebooks/gene_panel_overlap/merge_seq.ipynb).
+
 ## Tests and development
+
+The repository uses one long-lived branch, `main`. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for the directory map, notebook regeneration
+contract, versioning rules, and the pre-review checklist.
 
 From a user-owned development environment:
 
@@ -231,11 +285,11 @@ scoring, and clean notebook generation. They use small local fixtures and do not
 download full research datasets or execute the formal paper training matrix.
 
 The reusable model API remains in `src/gene2wire/`; shared experiment code is in
-`src/gene2wire/experiments/`. The five notebooks are generated by
-`scripts/build_notebooks_0908.py` and contain configuration, dataset calls, plots,
-and reporting. The builder defaults to today's UTC `MMDD` suffix (or accepts
-`--date MMDD`): it replaces that date's files and preserves other dates. The
-protocol seed and checkpoint directory do not follow the notebook date.
+`src/gene2wire/experiments/`. Notebook builders live in `scripts/notebooks/` and
+write stable filenames into the corresponding `notebooks/<experiment>/`
+directory. Release dates and immutable core identifiers belong in notebook
+metadata and Git tags rather than canonical filenames. The protocol seed and
+checkpoint directory do not follow the notebook release date.
 Source changes require new pins and corresponding reruns before their outputs
 can be treated as one experiment version. To add plots to old completed runs,
 use `RESULTS_ONLY=True`; the current conservative checksum includes plotting

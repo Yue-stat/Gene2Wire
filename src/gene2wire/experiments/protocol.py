@@ -1,4 +1,4 @@
-"""The single scientific profile used by every 0908 paper notebook."""
+"""Shared scientific settings and identities for canonical experiments."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
@@ -10,7 +10,7 @@ import numpy as np
 
 from ..config import FitConfig, ModelConfig, TuningConfig
 
-PROTOCOL_VERSION = "0908-v2-balanced"
+PROTOCOL_VERSION = "0911-v4-consolidated"
 MODEL_ORDER = ("Logistic", "MIRT", "Joint", "PU", "PU-MIRT", "PU-Joint")
 
 
@@ -32,6 +32,10 @@ class Settings:
     retry_maxiter: int = 1000
     tolerance: float = 1e-8
     init_direct_maxiter: int = 120
+    # Fixed (never tuned) stabilization for explicit target-specific nuisance
+    # coefficients.  Ordinary experiments have no nuisance design and retain
+    # the exact historical value zero; gene-overlap notebooks set 1e-4.
+    nuisance_l2: float = 0.0
     run_information_controls: bool = True
     run_random_forest: bool = True
     run_mechanism_controls: bool = True
@@ -39,6 +43,7 @@ class Settings:
     run_qiao: bool = True
     calibration_fractions: tuple[float, ...] = (.2,)
     protocol_version: str = PROTOCOL_VERSION
+    supervision_profile: str = "paired_reference"
 
     def __post_init__(self):
         for field in ("n_outer_folds", "n_jobs", "n_repetitions", "candidate_budget",
@@ -52,13 +57,20 @@ class Settings:
             raise ValueError("Unknown tuning strategy")
         if self.parallel_unit not in {"scenario", "fold"}:
             raise ValueError("parallel_unit must be 'scenario' or 'fold'")
-        if not 0 < self.paired_fraction < 1:
-            raise ValueError("paired_fraction must lie strictly between zero and one")
+        if self.supervision_profile not in {"paired_reference", "assay_only"}:
+            raise ValueError("supervision_profile must be 'paired_reference' or 'assay_only'")
+        minimum_ok = (self.paired_fraction >= 0 if self.supervision_profile == "assay_only"
+                      else self.paired_fraction > 0)
+        if not minimum_ok or not self.paired_fraction < 1:
+            raise ValueError("paired_fraction must lie strictly between zero and one (zero is allowed for assay_only)")
         if (not self.loss_rates or len(set(self.loss_rates)) != len(self.loss_rates)
                 or any(not 0 <= r < 1 for r in self.loss_rates)):
             raise ValueError("loss_rates must be unique probabilities below one")
         if not self.penalties or any(not np.isfinite(x) or x <= 0 for x in self.penalties):
             raise ValueError("Penalties must be positive and finite")
+        if (isinstance(self.nuisance_l2, bool)
+                or not np.isfinite(self.nuisance_l2) or self.nuisance_l2 < 0):
+            raise ValueError("nuisance_l2 must be finite and nonnegative")
         if any(not 0 < f < 1 for f in self.calibration_fractions):
             raise ValueError("Calibration fractions must lie between zero and one")
         if len(set(self.calibration_fractions)) != len(self.calibration_fractions):
@@ -85,12 +97,16 @@ class Settings:
                             candidate_budget=self.candidate_budget, include_endpoints=True)
 
     def models(self):
-        return tuple(ModelConfig(name=name, kind=kind, rank=rank, pu=pu,
-                                 use_target_features=self.use_target_features)
+        models = tuple(ModelConfig(name=name, kind=kind, rank=rank, pu=pu,
+                                 use_target_features=self.use_target_features,
+                                 nuisance_l2=self.nuisance_l2)
                      for name, kind, rank, pu in (
                          ("Logistic", "direct", 0, False), ("MIRT", "lowrank", 1, False),
                          ("Joint", "joint", 1, False), ("PU", "direct", 0, True),
                          ("PU-MIRT", "lowrank", 1, True), ("PU-Joint", "joint", 1, True)))
+        if self.supervision_profile == "assay_only":
+            return tuple(model for model in models if not model.pu)
+        return models
 
 
 def source_hash() -> str:
@@ -110,6 +126,11 @@ def fingerprint(value) -> str:
 
 def scenarios(settings: Settings, *, natural: bool, simulation: bool, sharing_strength=None):
     """Predeclared controls; no dataset outcome can change this matrix."""
+    if settings.supervision_profile == "assay_only":
+        if natural:
+            raise ValueError("assay_only requires one assay outcome, not paired natural observations")
+        return [{"analysis": "primary", "mechanism": "assay_only", "loss_rate": 0.,
+                 "calibration_fraction": 0., "calibration_spec": "not_available"}]
     if natural:
         return [{"analysis": "primary", "mechanism": "natural", "loss_rate": None,
                  "calibration_fraction": settings.paired_fraction, "calibration_spec": "correct"}]

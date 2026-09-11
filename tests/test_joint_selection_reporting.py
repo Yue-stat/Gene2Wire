@@ -114,3 +114,44 @@ def test_joint_diagnostics_natural_nan_context_and_missing_selection_fields():
     assert row.selection_evidence_status == "selection fields missing"
     assert row.selected_family is None and np.isnan(row.selected_validation_loss)
     assert row.direct_minimum_validation_loss == .2
+
+
+def test_joint_diagnostics_do_not_merge_block_fits_or_other_experiments():
+    base = {**_unit(), "experiment": "animal_target_blocks", "group_mode": "animal",
+            "training_panel": "masked", "training_block_fraction": .2}
+    # Same fold/rate/model is a distinct search for every training panel.
+    units = [base,
+             {**base, "training_block_fraction": .8},
+             {**base, "training_panel": "full", "training_block_fraction": 0.},
+             {**base, "group_mode": "artificial"},
+             {**base, "experiment": "another_block_protocol"}]
+    tuning, selected = [], []
+    for index, unit in enumerate(units):
+        direct_loss = .5 + .02 * index
+        selected_loss = direct_loss - .05
+        tuning.extend([dict(**unit, kind="direct", validation_loss=direct_loss, converged=True),
+                       dict(**unit, kind="joint", validation_loss=selected_loss, converged=True)])
+        selected.append(dict(**unit, kind="joint", validation_observed_log_loss=selected_loss))
+    tables = {"tuning": pd.DataFrame(tuning), "selected": pd.DataFrame(selected)}
+    diagnostics = diagnostic_summaries(tables)
+    result = diagnostics["joint_selection_diagnostics"]
+    assert len(result) == len(units)
+    assert (result.recorded_candidates == 2).all()
+    assert (result.selection_evidence_status == "recorded").all()
+    np.testing.assert_allclose(result.direct_minus_selected_validation_loss, .05)
+    for key in ("experiment", "group_mode", "training_panel", "training_block_fraction"):
+        assert key in result
+    for name, count in (("selected_configuration_frequency", 5),
+                        ("final_fit_convergence", 5),
+                        ("candidate_fit_convergence", 5),
+                        ("recorded_candidate_coverage", 10)):
+        assert len(diagnostics[name]) == count
+
+
+def test_joint_diagnostics_refuse_selection_missing_block_identity():
+    unit = {**_unit(), "training_panel": "masked", "training_block_fraction": .2}
+    tuning = pd.DataFrame([dict(**unit, kind="direct", validation_loss=.2, converged=True)])
+    selected = pd.DataFrame([dict(**_unit(), kind="direct", validation_observed_log_loss=.2)])
+    row = joint_selection_diagnostics({"tuning": tuning, "selected": selected}).iloc[0]
+    assert row.selection_evidence_status == "selection unit metadata missing"
+    assert np.isnan(row.selected_validation_loss)

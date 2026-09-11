@@ -17,7 +17,8 @@ REQUIRED_NPZ_KEYS = {"X_cell", "S_observed", "W_measured"}
 def load_npz_bundle(path: str | Path) -> DatasetBundle:
     """Load the canonical, pickle-free ``.npz`` interchange format.
 
-    Optional keys are ``Y_target``, ``Z_reference``, ``reference_mask``,
+    Optional keys are ``Y_target``, ``X_nuisance``, ``nuisance_names``,
+    ``Z_reference``, ``reference_mask``,
     ``cell_ids``, ``target_ids``, ``semantics_json``, ``metadata_json``, plus
     keys prefixed with ``group__`` and ``feature_block__``.
     """
@@ -63,6 +64,12 @@ def load_npz_bundle(path: str | Path) -> DatasetBundle:
         feature_blocks=feature_blocks,
         semantics=json_value("semantics_json"),
         metadata=json_value("metadata_json"),
+        X_nuisance=values.get("X_nuisance"),
+        nuisance_names=(
+            None
+            if "nuisance_names" not in values
+            else values["nuisance_names"].tolist()
+        ),
     )
 
 
@@ -81,6 +88,9 @@ def save_npz_bundle(data: DatasetBundle, path: str | Path) -> Path:
     }
     if data.Y_target is not None:
         arrays["Y_target"] = data.Y_target
+    if data.X_nuisance is not None:
+        arrays["X_nuisance"] = data.X_nuisance
+        arrays["nuisance_names"] = np.asarray(data.nuisance_names, dtype=str)
     if data.Z_reference is not None:
         arrays["Z_reference"] = data.Z_reference.astype(np.uint8)
         arrays["reference_mask"] = data.reference_mask.astype(np.uint8)
