@@ -10,7 +10,7 @@ import numpy as np
 
 from ..config import FitConfig, ModelConfig, TuningConfig
 
-PROTOCOL_VERSION = "0911-v4-consolidated"
+PROTOCOL_VERSION = "0912-v5-measurement-degradation"
 MODEL_ORDER = ("Logistic", "MIRT", "Joint", "PU", "PU-MIRT", "PU-Joint")
 
 
@@ -41,6 +41,10 @@ class Settings:
     run_mechanism_controls: bool = True
     run_calibration_controls: bool = True
     run_qiao: bool = True
+    # Opt-in because these three literature comparators add substantial work.
+    # The measurement-degradation notebooks enable them; legacy experiments
+    # preserve their historical 15 fitted methods by default.
+    run_pu_comparators: bool = False
     calibration_fractions: tuple[float, ...] = (.2,)
     protocol_version: str = PROTOCOL_VERSION
     supervision_profile: str = "paired_reference"
@@ -75,6 +79,11 @@ class Settings:
             raise ValueError("Calibration fractions must lie between zero and one")
         if len(set(self.calibration_fractions)) != len(self.calibration_fractions):
             raise ValueError("calibration_fractions must be unique")
+        for field in ("run_information_controls", "run_random_forest",
+                      "run_mechanism_controls", "run_calibration_controls",
+                      "run_qiao", "run_pu_comparators"):
+            if not isinstance(getattr(self, field), bool):
+                raise TypeError(f"{field} must be boolean")
 
     def scientific_dict(self):
         result = asdict(self)

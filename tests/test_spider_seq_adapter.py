@@ -152,6 +152,80 @@ def test_dataset_normalizes_sparse_counts_once_across_split_feature_fits(monkeyp
     assert calls == [data.X_gene_raw.shape]
 
 
+def test_measurement_gene_pool_is_exact_id_only_and_column_order_invariant():
+    genes = tuple(f"gene_{index:04d}" for index in range(2400))
+    selected = seq.select_spider_seq_measurement_gene_pool(genes)
+    selected_names = tuple(genes[index] for index in selected)
+    assert len(selected) == seq.SPIDER_SEQ_MEASUREMENT_GENE_POOL_SIZE == 2000
+    assert len(set(selected_names)) == 2000
+
+    permutation = np.random.default_rng(91).permutation(len(genes))
+    reordered = tuple(np.asarray(genes)[permutation])
+    other = seq.select_spider_seq_measurement_gene_pool(reordered)
+    assert tuple(reordered[index] for index in other) == selected_names
+
+    with pytest.raises(ValueError, match="unique nonempty IDs"):
+        seq.select_spider_seq_measurement_gene_pool(("gene", "gene"), 1)
+    with pytest.raises(ValueError, match="pool_size"):
+        seq.select_spider_seq_measurement_gene_pool(genes, 0)
+
+
+def test_measurement_adapter_exposes_fixed_post_normalization_pool_without_outcome_use():
+    data = _data()
+    dataset = seq.spider_seq_measurement_dataset(
+        data, gene_pool_size=8, n_gene_components=3
+    )
+    selected = seq.select_spider_seq_measurement_gene_pool(data.gene_names, 8)
+    expected = seq._normalize_rna_counts(data.X_gene_raw)[
+        :, np.asarray(selected, dtype=int)
+    ].toarray()
+
+    assert dataset.gene_names == tuple(data.gene_names[index] for index in selected)
+    assert dataset.gene_matrix.shape == (len(data.cell_ids), 8)
+    assert dataset.gene_matrix.dtype == np.float32
+    np.testing.assert_allclose(dataset.gene_matrix, expected)
+    np.testing.assert_array_equal(dataset.reference, data.Z_reference)
+    np.testing.assert_array_equal(dataset.measured, data.W_measured)
+    np.testing.assert_array_equal(dataset.groups["animal"], data.animal_ids)
+    assert dataset.metadata["measurement_gene_pool_selection"].startswith(
+        "versioned SHA256 rank of exact gene IDs"
+    )
+    assert dataset.metadata["gene_matrix_cross_cell_fit"] is False
+    assert "pre train-fitted scaling" in dataset.metadata["gene_matrix_stage"]
+
+    ordinary = seq.spider_seq_dataset(data, n_hvg=8, n_gene_components=3)
+    for measurement_fold, ordinary_fold in zip(
+        dataset.split_builder(3, 73), ordinary.split_builder(3, 73)
+    ):
+        np.testing.assert_array_equal(
+            measurement_fold.train_rows, ordinary_fold.train_rows
+        )
+        np.testing.assert_array_equal(
+            measurement_fold.validation_rows, ordinary_fold.validation_rows
+        )
+        np.testing.assert_array_equal(
+            measurement_fold.test_rows, ordinary_fold.test_rows
+        )
+
+    altered = data.Z_reference.copy()
+    altered[data.W_measured] = ~altered[data.W_measured]
+    outcome_changed = seq.spider_seq_measurement_dataset(
+        replace(data, Z_reference=altered),
+        gene_pool_size=8,
+        n_gene_components=3,
+    )
+    assert outcome_changed.gene_names == dataset.gene_names
+    np.testing.assert_array_equal(outcome_changed.gene_matrix, dataset.gene_matrix)
+    np.testing.assert_array_equal(outcome_changed.measured, dataset.measured)
+
+    fold = dataset.split_builder(3, 73)[0]
+    features = dataset.feature_builder(fold.train_rows, False, False)
+    assert features.X.shape == (len(data.cell_ids), 3)
+    assert features.metadata["source_gene_pool_sha256"] == dataset.metadata[
+        "measurement_gene_pool_sha256"
+    ]
+
+
 def test_within_animal_folds_are_seeded_and_cover_test_once():
     data = _data()
     dataset = seq.spider_seq_dataset(data)

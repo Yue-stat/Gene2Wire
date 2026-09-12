@@ -24,7 +24,8 @@ from ..runner import run_model_grid
 from ..seeds import stable_seed
 from .calibration import (CalibrationNotEstimable, detection_diagnostics,
                           fit_detection_calibrator, sample_paired_rows)
-from .contracts import EvaluationSpec, ExperimentDataset, FeatureSet, Fold
+from .contracts import (EvaluationSpec, ExperimentDataset, FeatureSet, Fold,
+                        MeasurementEvaluationSpec)
 from .evaluation import evaluate_detection_calibration, evaluate_predictions
 from .io import atomic_json, atomic_npz, jsonable
 from .observation import make_observation_design, thin_reference
@@ -56,6 +57,10 @@ class PreparedFold:
     fold: Fold
     metadata: dict
     evaluation: EvaluationSpec | None = None
+    training_measured: np.ndarray | None = None
+    virtual_assays: np.ndarray | None = None
+    observation_plan: Any | None = None
+    measurement_evaluation: MeasurementEvaluationSpec | None = None
 
 
 @dataclass(frozen=True)
@@ -132,10 +137,27 @@ def _prepare(dataset, fold, settings):
         raise ValueError("Tuning and refit nuisance schemas must match")
     # Do not serialize the raw gene-count matrix into every worker.
     metadata = {k: v for k, v in dataset.metadata.items() if not isinstance(v, np.ndarray)}
-    return PreparedFold(dataset.name, dataset.reference, dataset.measured,
-                        dataset.cell_ids, dataset.target_ids, dataset.groups,
-                        dataset.natural_observed, dataset.platform, dataset.technical_score,
-                        train_features, refit_features, fold, metadata, dataset.evaluation)
+    return PreparedFold(
+        name=dataset.name,
+        reference=dataset.reference,
+        measured=dataset.measured,
+        cell_ids=dataset.cell_ids,
+        target_ids=dataset.target_ids,
+        groups=dataset.groups,
+        natural_observed=dataset.natural_observed,
+        platform=dataset.platform,
+        technical_score=dataset.technical_score,
+        train_features=train_features,
+        refit_features=refit_features,
+        fold=fold,
+        metadata=metadata,
+        evaluation=dataset.evaluation,
+        training_measured=(dataset.measured if dataset.training_measured is None
+                           else dataset.training_measured),
+        virtual_assays=dataset.virtual_assays,
+        observation_plan=dataset.observation_plan,
+        measurement_evaluation=dataset.measurement_evaluation,
+    )
 
 
 def _source_context(prepared, repetition):
@@ -145,8 +167,48 @@ def _source_context(prepared, repetition):
             **prepared.metadata.get("experiment_context", {})}
 
 
+def _model_seed_coordinate(prepared, repetition):
+    """Separate model initialization from a measurement-panel replicate."""
+    return int(prepared.metadata.get("model_seed", repetition))
+
+
+def _paired_sampling_groups(prepared):
+    """Return outcome-blind strata for the authorized paired-reference budget."""
+    group_key = next((
+        key for key in ("animal", "sample", "animal_id", "sample_id")
+        if key in prepared.groups
+    ), None)
+    biological = None if group_key is None else np.asarray(
+        prepared.groups[group_key]).astype(str)
+    if prepared.virtual_assays is None:
+        return biological, group_key or "none"
+    if biological is None:
+        biological = np.repeat("all", len(prepared.cell_ids))
+    assays = np.asarray(prepared.virtual_assays).astype(str)
+    combined = np.asarray([
+        f"{bio}\0{assay}" for bio, assay in zip(biological, assays)
+    ], dtype=str)
+    return combined, f"{group_key or 'all_cells'} x virtual_assay"
+
+
 def _scenarios(prepared, settings):
     experiment_context = prepared.metadata.get("experiment_context", {})
+    if experiment_context.get("experiment") == "measurement_degradation":
+        declared = prepared.metadata.get("measurement_scenarios")
+        if not declared:
+            raise ValueError("Measurement-degradation views require declared scenarios")
+        required = {"analysis", "mechanism", "loss_rate", "positive_retention",
+                    "calibration_fraction", "calibration_spec", "condition_roles"}
+        result = []
+        for scenario in declared:
+            scenario = dict(scenario)
+            missing = required.difference(scenario)
+            if missing:
+                raise ValueError(f"Measurement scenario is missing {sorted(missing)}")
+            if scenario["mechanism"] not in {"assay_target_sar", "scar", "natural"}:
+                raise ValueError("Unknown measurement-degradation observation mechanism")
+            result.append(scenario)
+        return result
     if settings.supervision_profile == "assay_only":
         return scenarios(settings, natural=prepared.natural_observed is not None, simulation=False)
     if experiment_context.get("observation_profile") == "technical_sar_80_sensitivity":
@@ -170,9 +232,15 @@ def _scenarios(prepared, settings):
                      sharing_strength=prepared.metadata.get("sharing_strength"))
 
 
+def _fit_measured(prepared):
+    """Learner-visible support, with a fallback for historical test fixtures."""
+    value = getattr(prepared, "training_measured", None)
+    return np.asarray(prepared.measured if value is None else value, dtype=bool)
+
+
 def _bundle(prepared, features, observed):
     return DatasetBundle(X_cell=features.X, S_observed=observed,
-                         W_measured=prepared.measured, Y_target=features.Y_target,
+                         W_measured=_fit_measured(prepared), Y_target=features.Y_target,
                          cell_ids=prepared.cell_ids, target_ids=prepared.target_ids,
                          groups=prepared.groups, feature_blocks=features.feature_blocks,
                          X_nuisance=features.X_nuisance,
@@ -199,15 +267,19 @@ def _detector(prepared, observed, paired, scenario, technical_score):
     use_technical = (scenario["mechanism"] == "technical_sar"
                      and scenario["calibration_spec"] != "omit_technical")
     fitted = fit_detection_calibrator(
-        observed, _reference_view(prepared.reference, paired), prepared.measured, paired,
+        observed, _reference_view(prepared.reference, paired), _fit_measured(prepared), paired,
         technical_score=technical_score if use_technical else None,
-        platform=prepared.platform if scenario["mechanism"] == "natural" else None,
+        platform=(prepared.virtual_assays if scenario["mechanism"] == "assay_target_sar"
+                  else prepared.platform if scenario["mechanism"] == "natural" else None),
         use_technical=use_technical,
         use_target_effects=(scenario["mechanism"] != "scar"
                             and scenario["calibration_spec"] != "pooled_target"))
     estimated = fitted.predict(n_cells=len(prepared.cell_ids),
                                technical_score=technical_score if use_technical else None,
-                               platform=prepared.platform if scenario["mechanism"] == "natural" else None)
+                               platform=(prepared.virtual_assays
+                                         if scenario["mechanism"] == "assay_target_sar"
+                                         else prepared.platform
+                                         if scenario["mechanism"] == "natural" else None))
     return estimated, fitted.to_dict()
 
 
@@ -227,15 +299,23 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
     n, nt = prepared.reference.shape
     assay_only = settings.supervision_profile == "assay_only"
     draw_seed = stable_seed(settings.seed, "observation", prepared.name, repetition)
-    design = (None if assay_only else make_observation_design(
+    measurement_plan = getattr(prepared, "observation_plan", None)
+    design = (None if assay_only or measurement_plan is not None else make_observation_design(
         n, nt, seed=draw_seed, technical_score=prepared.technical_score))
     tables = {name: [] for name in ("metrics", "per_target", "reliability", "tuning",
                                    "selected", "detection", "detection_per_target",
-                                   "detection_reliability", "thinning_audit", "failures", "per_group")}
-    group_key = next((k for k in ("animal", "sample", "animal_id", "sample_id")
-                      if k in prepared.groups), None)
+                                   "detection_reliability", "thinning_audit",
+                                   "observation_diagnostics", "failures", "per_group")}
+    group_key = next((
+        key for key in ("animal", "sample", "animal_id", "sample_id")
+        if key in prepared.groups
+    ), None)
     groups = None if group_key is None else prepared.groups[group_key]
-    paired_seed = stable_seed(settings.seed, "paired", prepared.name, repetition, fold.outer_fold)
+    paired_groups, paired_stratification = _paired_sampling_groups(prepared)
+    paired_seed = stable_seed(
+        settings.seed, "paired", prepared.name,
+        _model_seed_coordinate(prepared, repetition), fold.outer_fold,
+    )
     source_context = _source_context(prepared, repetition)
     model_checkpoint = Path(checkpoint_dir) / slug(prepared.name)
 
@@ -249,14 +329,30 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
         emit({"event": "scenario_start"})
         paired = (np.array([], dtype=int) if assay_only else sample_paired_rows(
             development, scenario["calibration_fraction"], paired_seed,
-            groups=None if groups is None else groups[development]))
+            groups=(None if paired_groups is None
+                    else paired_groups[development])))
         paired_train = np.intersect1d(paired, train)
         if assay_only:
             observed, true_e, gamma = prepared.reference, None, None
         elif scenario["mechanism"] == "natural":
-            observed, true_e, gamma = prepared.natural_observed, None, None
+            observed = np.where(_fit_measured(prepared), prepared.natural_observed, 0)
+            true_e, gamma = None, None
+        elif measurement_plan is not None:
+            if scenario["mechanism"] == "scar":
+                _, generated = measurement_plan.generate_pair(
+                    prepared.reference, _fit_measured(prepared), train,
+                    retention=float(scenario["positive_retention"]),
+                )
+            else:
+                generated = measurement_plan.generate(
+                    prepared.reference, _fit_measured(prepared), train,
+                    retention=float(scenario["positive_retention"]),
+                    mechanism="heterogeneous",
+                )
+            observed, true_e = generated.observed, generated.sensitivity
+            gamma = dict(generated.diagnostics)
         else:
-            generated = thin_reference(prepared.reference, prepared.measured, train,
+            generated = thin_reference(prepared.reference, _fit_measured(prepared), train,
                                        scenario["loss_rate"], scenario["mechanism"], design)
             observed, true_e, gamma = generated.observed, generated.sensitivity, generated.gamma
         try:
@@ -266,14 +362,29 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                 tuning_e = final_e = np.ones_like(observed, dtype=float)
                 tuning_detector = final_detector = None
             else:
-                tuning_e, tuning_detector = _detector(prepared, observed, paired_train, scenario, design.technical_score)
+                technical = None if design is None else design.technical_score
+                tuning_e, tuning_detector = _detector(prepared, observed, paired_train, scenario, technical)
                 # Separate refit objects never enter the validation score. Their paired
                 # validation references are authorized only for development fitting.
-                final_e, final_detector = _detector(prepared, observed, paired, scenario, design.technical_score)
+                final_e, final_detector = _detector(prepared, observed, paired, scenario, technical)
         except CalibrationNotEstimable as error:
             tables["failures"].append({**context, "stage": "calibration", "error": str(error)})
             emit({"event": "calibration_failed", "error": str(error)})
             continue
+        if gamma is not None:
+            visible_e = (None if true_e is None else
+                         np.asarray(true_e, dtype=float)[_fit_measured(prepared)])
+            generator_diagnostics = (dict(gamma) if isinstance(gamma, Mapping)
+                                     else {"generator_gamma": gamma})
+            tables["observation_diagnostics"].append({
+                **context, **generator_diagnostics,
+                "true_sensitivity_min": (np.nan if visible_e is None or not len(visible_e)
+                                         else float(np.min(visible_e))),
+                "true_sensitivity_mean": (np.nan if visible_e is None or not len(visible_e)
+                                          else float(np.mean(visible_e))),
+                "true_sensitivity_max": (np.nan if visible_e is None or not len(visible_e)
+                                         else float(np.max(visible_e))),
+            })
         unit_id = fingerprint(context)
         audit_dir = Path(export_dir) / "units" / unit_id
         audit_dir.mkdir(parents=True, exist_ok=True)
@@ -283,6 +394,7 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                      "test_cell_ids": np.asarray(prepared.cell_ids)[test],
                      "paired_train_cell_ids": np.asarray(prepared.cell_ids)[paired_train],
                      "paired_development_cell_ids": np.asarray(prepared.cell_ids)[paired],
+                     "paired_stratification": paired_stratification,
                      "tuning_detector": tuning_detector, "refit_detector": final_detector,
                      "feature_names_tuning": prepared.train_features.feature_names,
                      "feature_names_refit": prepared.refit_features.feature_names,
@@ -295,34 +407,92 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                          "exposure_interpretation": "no additional corruption; biological sensitivity unestimated"}
                         if assay_only else {})}, audit_dir / "audit.json")
         if not assay_only:
-            diagnostic = detection_diagnostics(observed, prepared.reference, prepared.measured,
+            diagnostic = detection_diagnostics(observed, prepared.reference, _fit_measured(prepared),
                                                 final_e, rows=test, true_sensitivity=true_e)
             tables["detection"].append({**context, **diagnostic})
             detection_evaluation = evaluate_detection_calibration(
-                prepared.reference[test], observed[test], prepared.measured[test], final_e[test],
+                prepared.reference[test], observed[test], _fit_measured(prepared)[test], final_e[test],
                 true_sensitivity=None if true_e is None else true_e[test], target_ids=prepared.target_ids)
             tables["detection_per_target"].extend({**context, **row} for row in detection_evaluation["per_target"])
             tables["detection_reliability"].extend({**context, **row} for row in detection_evaluation["reliability"])
-        atomic_npz(audit_dir / "observation.npz", reference=prepared.reference[test],
-                   observed=observed[test], measured=prepared.measured[test],
-                   **({"additional_retention": final_e[test]} if assay_only else {
-                       "technical_score": design.technical_score[test],
-                       "estimated_sensitivity": final_e[test], "target_offsets": design.target_offsets}),
-                   **({} if true_e is None else {"true_sensitivity": true_e[test]}))
+        observation_arrays = {
+            "reference": prepared.reference[test], "observed": observed[test],
+            "training_measured": _fit_measured(prepared)[test],
+            "source_measured": prepared.measured[test],
+            "estimated_sensitivity": final_e[test],
+        }
+        if design is not None:
+            observation_arrays.update(
+                technical_score=design.technical_score[test],
+                target_offsets=design.target_offsets,
+            )
+        if prepared.virtual_assays is not None:
+            observation_arrays["virtual_assay"] = np.asarray(prepared.virtual_assays)[test].astype(str)
+        if true_e is not None:
+            observation_arrays["true_sensitivity"] = true_e[test]
+        atomic_npz(audit_dir / "observation.npz", **observation_arrays)
         for split_name, rows in (("train", train), ("validation", validation), ("test", test)):
             for target_index, target in enumerate(prepared.target_ids):
-                measured_count = int(prepared.measured[rows, target_index].sum())
-                positive_count = int((prepared.reference[rows, target_index] * prepared.measured[rows, target_index]).sum())
+                measured_count = int(_fit_measured(prepared)[rows, target_index].sum())
+                positive_count = int((prepared.reference[rows, target_index]
+                                      * _fit_measured(prepared)[rows, target_index]).sum())
                 detected_count = int(observed[rows, target_index].sum())
                 tables["thinning_audit"].append({**context, "split": split_name, "target": target,
                     "measured_count": measured_count, "reference_positive_count": positive_count,
                     "detected_positive_count": detected_count,
                     "realized_positive_loss": 1-detected_count/positive_count if positive_count else np.nan})
-        prior = _train_prevalence(prepared.reference, prepared.measured, development if assay_only else paired)
+        prior = _train_prevalence(prepared.reference, _fit_measured(prepared),
+                                  development if assay_only else paired)
 
-        def record(name, prediction, semantics, extra=None, *, ranking_score=None):
+        def record(name, prediction, semantics, extra=None, *, ranking_score=None,
+                   estimated_sensitivity=None):
             prefix = {**context, "model": name, "probability_semantics": semantics,
                       **(extra or {})}
+            evaluation_e = final_e if estimated_sensitivity is None else np.asarray(
+                estimated_sensitivity, dtype=float)
+            if evaluation_e.shape == observed.shape:
+                test_e = evaluation_e[test]
+            elif evaluation_e.shape == prediction.shape:
+                test_e = evaluation_e
+            else:
+                raise ValueError(
+                    "Model-specific sensitivity must match all outcomes or test predictions")
+            if prepared.measurement_evaluation is not None:
+                from .block_evaluation import evaluate_block_predictions
+                spec = prepared.measurement_evaluation
+                fit_w = _fit_measured(prepared)
+                scopes = {
+                    "native_reference": np.asarray(spec.source_measured[test], dtype=bool),
+                    "on_panel": np.asarray(fit_w[test], dtype=bool),
+                    "off_panel": np.asarray(spec.source_measured[test], dtype=bool)
+                                 & ~np.asarray(fit_w[test], dtype=bool),
+                    "hidden_candidate": np.asarray(fit_w[test], dtype=bool)
+                                        & (np.asarray(observed[test]) == 0),
+                }
+                for scope, mask in scopes.items():
+                    evaluated = evaluate_block_predictions(
+                        spec.reference[test], mask, prediction,
+                        target_ids=prepared.target_ids, groups=spec.assays[test],
+                        ranking_score=ranking_score,
+                        train_reference_prevalence=prior)
+                    evaluation_prefix = {**prefix, "evaluation_scope": scope}
+                    tables["metrics"].append({**evaluation_prefix, **evaluated["summary"]})
+                    for key in ("per_target", "reliability", "per_group"):
+                        tables[key].extend({**evaluation_prefix, **row}
+                                           for row in evaluated[key])
+                atomic_npz(
+                    audit_dir / f"{slug(name)}_predictions.npz",
+                    prediction=prediction,
+                    reference=spec.reference[test], observed=observed[test],
+                    training_measured=fit_w[test],
+                    source_measured=spec.source_measured[test],
+                    estimated_sensitivity=test_e,
+                    virtual_assay=np.asarray(spec.assays[test], dtype=str),
+                    cell_ids=np.asarray(prepared.cell_ids)[test].astype(str),
+                    target_ids=np.asarray(prepared.target_ids, dtype=str),
+                    **({} if ranking_score is None else {"ranking_score": ranking_score}),
+                )
+                return
             if prepared.evaluation is not None:
                 from .block_evaluation import evaluate_block_predictions
                 spec = prepared.evaluation
@@ -349,7 +519,7 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                            **({} if ranking_score is None else {"ranking_score": ranking_score}))
                 return
             evaluated = evaluate_predictions(prepared.reference[test], observed[test],
-                prepared.measured[test], prediction, final_e[test],
+                prepared.measured[test], prediction, test_e,
                 probability_semantics=semantics, train_reference_prevalence=prior,
                 target_ids=prepared.target_ids, ranking_score=ranking_score)
             if assay_only:
@@ -377,7 +547,7 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                     group_evaluated = evaluate_predictions(
                         prepared.reference[test][selected_rows], observed[test][selected_rows],
                         prepared.measured[test][selected_rows], prediction[selected_rows],
-                        final_e[test][selected_rows], probability_semantics=semantics,
+                        test_e[selected_rows], probability_semantics=semantics,
                         train_reference_prevalence=prior, target_ids=prepared.target_ids,
                         ranking_score=None if ranking_score is None else ranking_score[selected_rows])
                     tables["per_group"].append({**prefix, "group_kind": evaluation_group,
@@ -393,7 +563,7 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                        reference=prepared.reference[test], observed=observed[test],
                        measured=prepared.measured[test],
                        **({"additional_retention": final_e[test]} if assay_only else {
-                           "estimated_sensitivity": final_e[test]}),
+                           "estimated_sensitivity": test_e}),
                        cell_ids=np.asarray(prepared.cell_ids)[test].astype(str),
                        target_ids=np.asarray(prepared.target_ids, dtype=str),
                        **({"group_ids": np.asarray(groups)[test].astype(str)}
@@ -462,7 +632,9 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                 test_exposure=final_e[test], refit=rb, refit_exposure=re,
                 test_cell_ids=np.asarray(prepared.cell_ids)[test],
                 checkpoint_dir=model_checkpoint, unit_context={**runner_context, "supervision": role},
-                seed=stable_seed(settings.seed, prepared.name, repetition, fold.outer_fold),
+                seed=stable_seed(settings.seed, prepared.name,
+                                 _model_seed_coordinate(prepared, repetition),
+                                 fold.outer_fold),
                 code_version=code_hash, on_progress=emit)
 
         result = core_run(models, train_bundle, train_e, refit_bundle, refit_e, training_mode)
@@ -529,7 +701,9 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                     tuning_e[validation], prepared.refit_features.X[test], final_e[test],
                     kind=kind, probability_semantics=semantics,
                     candidate_budget=settings.candidate_budget,
-                    seed=stable_seed(settings.seed, repetition, fold.outer_fold, kind),
+                    seed=stable_seed(settings.seed,
+                                     _model_seed_coordinate(prepared, repetition),
+                                     fold.outer_fold, kind),
                     # Fit keys include actual X/labels/masks/prediction X, seed,
                     # configuration and source. Share predictions across rates;
                     # selection still recomputes loss using this scenario's D/e.
@@ -550,6 +724,12 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
         if settings.run_qiao and scenario["analysis"] == "primary":
             _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
                                record, tables, model_checkpoint, on_progress=emit)
+        if settings.run_pu_comparators and scenario["analysis"] == "primary":
+            _run_pu_comparators(
+                prepared, observed, tuning_e, final_e, settings, context,
+                record, tables, checkpoint_dir=model_checkpoint,
+                on_progress=emit,
+            )
     return tables
 
 
@@ -570,14 +750,19 @@ _GROUP_COLUMNS = ["dataset", "sharing_strength", "analysis", "mechanism", "loss_
                   "calibration_fraction", "calibration_spec", "model", "probability_semantics",
                   "experiment", "group_mode", "training_panel", "training_block_fraction",
                   "evaluation_scope", "block_fraction", "panel_design", "arm",
-                  "requested_overlap", "actual_overlap", "panel_size"]
+                  "requested_overlap", "actual_overlap", "panel_size",
+                  "gene_requested_coverage", "gene_coverage",
+                  "gene_overlap", "target_requested_coverage", "target_coverage",
+                  "target_overlap", "positive_retention", "condition_roles"]
 
 
 def _summarize(tables, *, simulation):
     metrics = tables["metrics"]
     if metrics.empty:
         return
-    excluded = set(_GROUP_COLUMNS + ["outer_fold", "repetition"])
+    excluded = set(_GROUP_COLUMNS + [
+        "outer_fold", "repetition", "panel_seed", "data_repetition",
+    ])
     value_cols = [c for c in metrics.select_dtypes(include="number") if c not in excluded]
     groups = [c for c in _GROUP_COLUMNS if c in metrics]
     # Equal fold weights within repetition; the independent simulation unit is
@@ -626,6 +811,8 @@ def _planned_models(prepared, settings):
             if settings.run_qiao:
                 from .qiao import qiao_model_names
                 names += list(qiao_model_names(settings.use_target_features))
+            if settings.run_pu_comparators:
+                names += ["GenEML-adapted", "Inductive-PU-MC", "SAR-PU"]
         rows.extend({**scenario, "model": name} for name in names)
     return rows
 
@@ -719,10 +906,8 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
                 if "experiment_repetition" in dataset.metadata else
                 ([int(dataset.metadata["repetition"])] if is_simulation
                  else range(settings.n_repetitions)))
-        defer_dataset = (
-            dataset.metadata.get("experiment_context", {}).get("experiment")
-            == "gene_overlap"
-        )
+        defer_dataset = dataset.metadata.get("experiment_context", {}).get(
+            "experiment") in {"gene_overlap", "measurement_degradation"}
         deferred_feature_preparation |= defer_dataset
         fold_inputs = []
         for fold in folds:
@@ -751,12 +936,24 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
         input_identities.append({"name": dataset.name,
             "repetition": dataset.metadata.get("experiment_repetition", dataset.metadata.get("repetition")),
             "experiment_context": dataset.metadata.get("experiment_context", {}),
+            "model_seed": dataset.metadata.get("model_seed"),
             "model_allowlist": dataset.metadata.get("model_allowlist"),
             "evaluation": None if dataset.evaluation is None else {
                 "reference": sha256_array(dataset.evaluation.reference),
                 "source_measured": sha256_array(dataset.evaluation.source_measured),
                 "groups": sha256_array(np.asarray(dataset.evaluation.groups, dtype=str)),
                 "masks": {str(f): sha256_array(m) for f, m in dataset.evaluation.masks.items()}},
+            "measurement_evaluation": None if dataset.measurement_evaluation is None else {
+                "reference": sha256_array(dataset.measurement_evaluation.reference),
+                "source_measured": sha256_array(dataset.measurement_evaluation.source_measured),
+                "assays": sha256_array(np.asarray(dataset.measurement_evaluation.assays, dtype=str)),
+            },
+            "training_measured": (None if dataset.training_measured is None
+                                  else sha256_array(dataset.training_measured)),
+            "virtual_assays": (None if dataset.virtual_assays is None else
+                               sha256_array(np.asarray(dataset.virtual_assays, dtype=str))),
+            "observation_plan": (None if dataset.observation_plan is None else
+                                 dataset.observation_plan.identity()),
             "sharing_strength": dataset.metadata.get("sharing_strength"),
             "reference": sha256_array(dataset.reference), "measured": sha256_array(dataset.measured),
             "cell_ids": sha256_array(np.asarray(dataset.cell_ids, dtype=str)),
@@ -769,6 +966,8 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
                          "n_targets": len(dataset.target_ids),
                          "reference_hash": sha256_array(dataset.reference),
                          "measured_hash": sha256_array(dataset.measured),
+                         "training_measured_hash": (None if dataset.training_measured is None else
+                                                    sha256_array(dataset.training_measured)),
                          "metadata": {k: v for k, v in dataset.metadata.items() if not isinstance(v, np.ndarray)}})
     manifest = {"protocol": settings.scientific_dict(), "source_hash": code_hash,
                 "datasets": metadata, "input_identities": input_identities,
@@ -953,7 +1152,8 @@ def _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
         len(prepared.target_ids), use_target_features=settings.use_target_features)
     train_features = replace(prepared.train_features, Y_target=y)
     refit_features = replace(prepared.refit_features, Y_target=yr)
-    if not prepared.measured[validation].any():
+    fit_measured = _fit_measured(prepared)
+    if not fit_measured[validation].any():
         raise ValueError("Qiao validation requires measured entries")
     candidates = qiao_candidate_grid(train_features.X.shape[1], refit_features.X.shape[1],
                                      y, yr, penalties=settings.penalties,
@@ -964,18 +1164,19 @@ def _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
     code_hash = source_hash()
     cell_ids = np.asarray(prepared.cell_ids, dtype=str)
     target_ids = np.asarray(prepared.target_ids, dtype=str)
-    validation_mask = np.asarray(prepared.measured[validation], dtype=bool)
+    validation_mask = np.asarray(fit_measured[validation], dtype=bool)
     validation_d = np.asarray(observed[validation], dtype=float)[validation_mask]
     if not np.all(np.isin(validation_d, [0, 1])):
         raise ValueError("Qiao validation detections must be binary on measured entries")
 
     def cached_fit(phase, features, rows, prediction_rows, config):
         x, target = features.X[rows], features.Y_target
-        w = np.asarray(prepared.measured[rows], dtype=bool)
+        w = np.asarray(fit_measured[rows], dtype=bool)
         d = np.where(w, observed[rows], 0.0)
         prediction_x = features.X[prediction_rows]
         seed = stable_seed(settings.seed, "qiao", prepared.name,
-                           context.get("repetition"), context.get("outer_fold"),
+                           _model_seed_coordinate(prepared, context.get("repetition")),
+                           context.get("outer_fold"),
                            phase, config["objective"], config["rank"], config["l2"])
         inputs = {name: sha256_array(value) for name, value in (
             ("X", x), ("Y", target), ("D_authorized", d), ("W", w),
@@ -1098,3 +1299,583 @@ def _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
                          "elapsed_seconds": time.monotonic()-model_started,
                          "cache_status": "checkpoint" if diagnostics["resumed"] else "fitted",
                          "summary": {**best[1], "final_converged": diagnostics["converged"]}})
+
+
+def _run_pu_comparators(prepared, observed, tuning_e, final_e, settings, context,
+                        record, tables, checkpoint_dir=None, on_progress=None):
+    """Tune/refit the three predeclared PU comparators on identical inputs.
+
+    GenEML and SAR-EM estimate contextual exposure from observed PU labels and
+    outcome-independent assay/target design.  Inductive-PU-MC receives the same
+    paired-calibration exposure as the Gene2Wire PU models.  Completed fits are
+    independently checkpointed; evaluation reference values are never inputs
+    to either the fit or its checkpoint identity.
+    """
+    from dataclasses import fields as dataclass_fields
+
+    from ..candidate_design import select_balanced_candidates
+    from ..checkpoint import AtomicArrayCheckpointStore, unit_key
+    from ..config import ModelConfig
+    from .pu_comparators import (
+        AssayTargetPropensityEncoder,
+        GenEMLFit,
+        SAREMFit,
+        ShiftIMCFit,
+        fit_geneml_adapted,
+        fit_sar_em,
+        fit_shift_imc_adapted,
+    )
+
+    train = np.asarray(prepared.fold.train_rows, dtype=int)
+    validation = np.asarray(prepared.fold.validation_rows, dtype=int)
+    test = np.asarray(prepared.fold.test_rows, dtype=int)
+    development = np.sort(np.r_[train, validation])
+    fit_w = _fit_measured(prepared)
+    labels = np.asarray(
+        prepared.virtual_assays if prepared.virtual_assays is not None
+        else prepared.platform if prepared.platform is not None
+        else np.repeat("assay", len(prepared.cell_ids)),
+        dtype=str,
+    )
+    target_ids = tuple(map(str, prepared.target_ids))
+
+    def propensity(rows, encoder):
+        return encoder.transform(labels[rows], target_ids)
+
+    train_encoder = AssayTargetPropensityEncoder.fit(labels[train], target_ids)
+    refit_encoder = AssayTargetPropensityEncoder.fit(labels[development], target_ids)
+    train_phi = propensity(train, train_encoder)
+    validation_phi = propensity(validation, train_encoder)
+    development_phi = propensity(development, refit_encoder)
+    test_phi = propensity(test, refit_encoder)
+
+    train_x = np.asarray(prepared.train_features.X[train], dtype=float)
+    validation_x = np.asarray(prepared.train_features.X[validation], dtype=float)
+    development_x = np.asarray(prepared.refit_features.X[development], dtype=float)
+    test_x = np.asarray(prepared.refit_features.X[test], dtype=float)
+    train_s, validation_s = np.asarray(observed[train]), np.asarray(observed[validation])
+    development_s = np.asarray(observed[development])
+    train_w, validation_w = np.asarray(fit_w[train]), np.asarray(fit_w[validation])
+    development_w = np.asarray(fit_w[development])
+    train_target = (prepared.train_features.Y_target
+                    if settings.use_target_features else None)
+    refit_target = (prepared.refit_features.Y_target
+                    if settings.use_target_features else None)
+
+    if settings.use_target_features:
+        if train_target is None or refit_target is None:
+            raise ValueError("Comparator target-feature mode requires train/refit target designs")
+        train_target = np.asarray(train_target, dtype=float)
+        refit_target = np.asarray(refit_target, dtype=float)
+        expected_rows = len(target_ids)
+        if (train_target.ndim != 2 or refit_target.ndim != 2
+                or train_target.shape[0] != expected_rows
+                or refit_target.shape[0] != expected_rows
+                or train_target.shape[1] == 0 or refit_target.shape[1] == 0
+                or not np.all(np.isfinite(train_target))
+                or not np.all(np.isfinite(refit_target))):
+            raise ValueError("Comparator target designs must align with the known target panel")
+
+    penalties = tuple(sorted(set(float(value) for value in settings.penalties)))
+    ranks = tuple(rank for rank in settings.tuning_config(
+        min(train_x.shape[1], development_x.shape[1]), len(target_ids)).ranks
+                  if rank > 0)
+    if not ranks:
+        ranks = (1,)
+    budget = min(int(settings.candidate_budget), 32)
+
+    def balanced(rows, model_configs):
+        rows, model_configs = tuple(rows), tuple(model_configs)
+        if not rows or len(rows) != len(model_configs):
+            raise ValueError("Comparator candidate grid is empty or internally inconsistent")
+        selected = select_balanced_candidates(
+            model_configs, min(budget, len(model_configs)))
+        return tuple(rows[model_configs.index(candidate)] for candidate in selected)
+
+    geneml_rows = [
+        {"rank": rank, "l2_u": penalty, "l2_v": penalty,
+         "l2_map": penalty, "l2_exposure": penalty}
+        for rank in ranks
+        if rank <= min(train_x.shape[1] + 1, development_x.shape[1] + 1,
+                       len(target_ids))
+        for penalty in penalties
+    ]
+    geneml_candidates = balanced(geneml_rows, [
+        ModelConfig(name="GenEML-grid", kind="lowrank", rank=row["rank"],
+                    shared_l2=row["l2_u"])
+        for row in geneml_rows
+    ])
+
+    shift_rank_cap = min(
+        train_x.shape[1] + 1, development_x.shape[1] + 1, len(target_ids))
+    if train_target is not None:
+        shift_rank_cap = min(
+            shift_rank_cap, train_target.shape[1] + 1, refit_target.shape[1] + 1)
+    shift_rows = [
+        {"rank": rank, "l2": penalty}
+        for rank in ranks if rank <= shift_rank_cap
+        for penalty in penalties
+    ]
+    shift_candidates = balanced(shift_rows, [
+        ModelConfig(name="ShiftIMC-grid", kind="lowrank", rank=row["rank"],
+                    shared_l2=row["l2"])
+        for row in shift_rows
+    ])
+
+    sar_rows = [
+        {"l2_classifier": classifier, "l2_propensity": propensity_penalty}
+        for classifier in penalties for propensity_penalty in penalties
+    ]
+    sar_candidates = balanced(sar_rows, [
+        ModelConfig(name="SAR-grid", kind="joint", rank=1,
+                    shared_l2=row["l2_classifier"],
+                    residual_l2=row["l2_propensity"])
+        for row in sar_rows
+    ])
+    specifications = (
+        ("GenEML-adapted", geneml_candidates),
+        ("Inductive-PU-MC", shift_candidates),
+        ("SAR-PU", sar_candidates),
+    )
+
+    base_seed = stable_seed(
+        settings.seed, "pu_comparators", prepared.name,
+        _model_seed_coordinate(prepared, context.get("repetition")),
+        context.get("outer_fold"),
+    )
+    store = (None if checkpoint_dir is None else AtomicArrayCheckpointStore(
+        Path(checkpoint_dir) / "pu_comparators"))
+    versions = {
+        package: importlib.metadata.version(package)
+        for package in ("numpy", "scipy")
+    }
+    code_hash = source_hash()
+    cell_ids = np.asarray(prepared.cell_ids, dtype=str)
+    target_id_array = np.asarray(target_ids, dtype=str)
+    fit_classes = {
+        "GenEMLFit": GenEMLFit,
+        "ShiftIMCFit": ShiftIMCFit,
+        "SAREMFit": SAREMFit,
+    }
+
+    def checkpoint_coordinates(name, phase, config, seed, options, inputs):
+        identity = fingerprint({
+            "model": name, "phase": phase, "config": dict(config),
+            "seed": int(seed), "options": dict(options),
+            "inputs": {key: sha256_array(value)
+                       for key, value in sorted(inputs.items())},
+            "source": code_hash, "versions": versions,
+        })
+        key = unit_key(task="pu_comparator_fit", model=name,
+                       phase=phase, identity=identity)
+        return key, identity
+
+    def restore_fit(cached):
+        payload = dict(cached["payload"])
+        class_name = payload.pop("fit_class", None)
+        if class_name not in fit_classes:
+            raise ValueError(f"Unknown comparator fit class in checkpoint: {class_name!r}")
+        values = {**payload, **cached["arrays"]}
+        expected = {field.name for field in dataclass_fields(fit_classes[class_name])}
+        if set(values) != expected:
+            raise ValueError("Comparator checkpoint fields do not match the fitted API")
+        return fit_classes[class_name](**values)
+
+    def cached_fit(name, phase, config, seed, options, inputs, fitter):
+        key, identity = checkpoint_coordinates(
+            name, phase, config, seed, options, inputs)
+        if store is not None:
+            cached = store.load(key, identity)
+            if cached is not None:
+                return restore_fit(cached), True, identity
+        fitted = fitter()
+        if store is not None:
+            payload, arrays = {"fit_class": type(fitted).__name__}, {}
+            for field in dataclass_fields(fitted):
+                value = getattr(fitted, field.name)
+                if isinstance(value, np.ndarray):
+                    arrays[field.name] = value
+                else:
+                    payload[field.name] = value
+            store.save_complete(key, identity, payload, arrays)
+        return fitted, False, identity
+
+    def checkpoint_available(name, phase, config, seed, options, inputs):
+        if store is None:
+            return False
+        key, identity = checkpoint_coordinates(
+            name, phase, config, seed, options, inputs)
+        try:
+            return store.is_complete(key, identity)
+        except (OSError, ValueError):
+            # The actual fit call will surface and retain a corrupt-checkpoint
+            # failure as a candidate row rather than hiding it in inventory.
+            return False
+
+    def observed_loss(probability):
+        q = np.asarray(probability, dtype=float)
+        if q.shape != validation_s.shape:
+            raise ValueError("Comparator validation probability has the wrong shape")
+        mask = validation_w.astype(bool)
+        if not np.any(mask):
+            raise ValueError("Comparator validation requires measured entries")
+        values = q[mask]
+        if (not np.all(np.isfinite(values))
+                or np.any(values < 0) or np.any(values > 1)):
+            raise ValueError("Comparator validation probabilities must lie in [0, 1]")
+        values = np.clip(values, 1e-9, 1 - 1e-9)
+        labels_on_mask = np.asarray(validation_s[mask], dtype=float)
+        return float(np.mean(
+            -labels_on_mask * np.log(values)
+            - (1 - labels_on_mask) * np.log1p(-values)))
+
+    common_candidate_inputs = {
+        "X": train_x,
+        "S_authorized": np.where(train_w, train_s, 0),
+        "W": train_w,
+        "training_ids": cell_ids[train],
+        "target_ids": target_id_array,
+        "feature_names": np.asarray(prepared.train_features.feature_names, dtype=str),
+    }
+    common_refit_inputs = {
+        "X": development_x,
+        "S_authorized": np.where(development_w, development_s, 0),
+        "W": development_w,
+        "training_ids": cell_ids[development],
+        "target_ids": target_id_array,
+        "feature_names": np.asarray(prepared.refit_features.feature_names, dtype=str),
+    }
+
+    for name, candidates in specifications:
+        started = time.monotonic()
+        if on_progress is not None:
+            on_progress({"event": "model_start", "model": name})
+
+        if name == "GenEML-adapted":
+            tolerance = max(settings.tolerance, 1e-5)
+            candidate_options = {"maxiter": settings.maxiter, "tolerance": tolerance}
+            refit_options = {"maxiter": settings.retry_maxiter, "tolerance": tolerance}
+            candidate_inputs = {
+                **common_candidate_inputs, "propensity_design": train_phi,
+                "propensity_feature_names": np.asarray(
+                    train_encoder.feature_names, dtype=str),
+            }
+            refit_inputs = {
+                **common_refit_inputs, "propensity_design": development_phi,
+                "propensity_feature_names": np.asarray(
+                    refit_encoder.feature_names, dtype=str),
+            }
+
+            def fit_candidate(config, seed):
+                return fit_geneml_adapted(
+                    train_x, train_s, train_w, train_phi, **config,
+                    **candidate_options, seed=seed)
+
+            def candidate_probability(fitted):
+                return fitted.predict_observed(validation_x, validation_phi)
+
+            def fit_refit(config, seed):
+                return fit_geneml_adapted(
+                    development_x, development_s, development_w,
+                    development_phi, **config, **refit_options, seed=seed)
+
+            def final_probabilities(fitted):
+                return (fitted.predict_reference(test_x),
+                        fitted.predict_exposure(test_x, test_phi))
+
+            metadata = {
+                "comparator_source": "Jain-Modhe-Rai-2017",
+                "adapted": True, "underlying_method": "GenEML",
+                "adaptation_note": "known-W contextual-exposure Python3 point-EM",
+                "target_input_kind": "known_target_identity",
+                "information_access": "observed labels; assay-target propensity design",
+            }
+        elif name == "Inductive-PU-MC":
+            candidate_options = {
+                "maxiter": settings.maxiter, "tolerance": settings.tolerance}
+            refit_options = {
+                "maxiter": settings.retry_maxiter, "tolerance": settings.tolerance}
+            candidate_inputs = {
+                **common_candidate_inputs, "exposure": tuning_e[train],
+                **({} if train_target is None else {"target_design": train_target}),
+            }
+            refit_inputs = {
+                **common_refit_inputs, "exposure": final_e[development],
+                **({} if refit_target is None else {"target_design": refit_target}),
+            }
+
+            def fit_candidate(config, seed):
+                return fit_shift_imc_adapted(
+                    train_x, train_s, train_w, tuning_e[train], train_target,
+                    **config, **candidate_options, seed=seed)
+
+            def candidate_probability(fitted):
+                return fitted.predict_observed(
+                    validation_x, tuning_e[validation], train_target)
+
+            def fit_refit(config, seed):
+                return fit_shift_imc_adapted(
+                    development_x, development_s, development_w,
+                    final_e[development], refit_target, **config,
+                    **refit_options, seed=seed)
+
+            def final_probabilities(fitted):
+                return (fitted.predict_reference(test_x, refit_target),
+                        np.asarray(final_e[test], dtype=float))
+
+            metadata = {
+                "comparator_source": "Hsieh-Natarajan-Dhillon-2015",
+                "adapted": True, "underlying_method": "ShiftIMC-adapted",
+                "adaptation_note": "known-W entry-specific-e sigmoid factorization",
+                "target_input_kind": (
+                    "target_features" if train_target is not None
+                    else "known_target_identity"),
+                "information_access": (
+                    "observed labels; estimated paired-calibration exposure"),
+            }
+        else:
+            window = max(2, min(10, settings.maxiter))
+            candidate_options = {
+                "maxiter": max(window, settings.maxiter),
+                "tolerance": max(settings.tolerance, 1e-4),
+                "convergence_window": window,
+                "inner_maxiter": max(20, min(200, settings.maxiter)),
+            }
+            refit_options = {
+                "maxiter": max(window, settings.retry_maxiter),
+                "tolerance": max(settings.tolerance, 1e-4),
+                "convergence_window": window,
+                "inner_maxiter": max(20, min(200, settings.retry_maxiter)),
+            }
+            candidate_inputs = {
+                **common_candidate_inputs, "propensity_design": train_phi,
+                "propensity_feature_names": np.asarray(
+                    train_encoder.feature_names, dtype=str),
+            }
+            refit_inputs = {
+                **common_refit_inputs, "propensity_design": development_phi,
+                "propensity_feature_names": np.asarray(
+                    refit_encoder.feature_names, dtype=str),
+            }
+
+            def fit_candidate(config, seed):
+                return fit_sar_em(
+                    train_x, train_s, train_w, train_phi, **config,
+                    **candidate_options, seed=seed)
+
+            def candidate_probability(fitted):
+                return fitted.predict_observed(validation_x, validation_phi)
+
+            def fit_refit(config, seed):
+                return fit_sar_em(
+                    development_x, development_s, development_w,
+                    development_phi, **config, **refit_options, seed=seed)
+
+            def final_probabilities(fitted):
+                return (fitted.predict_reference(test_x),
+                        fitted.predict_exposure(test_x, test_phi))
+
+            metadata = {
+                "comparator_source": "Bekker-Davis-2018",
+                "adapted": False, "underlying_method": "SAR-EM",
+                "adaptation_note": "faithful SAR-EM over measured cell-target dyads",
+                "target_input_kind": "known_target_identity",
+                "information_access": (
+                    "observed labels only; assay-target propensity design"),
+            }
+
+        candidate_seeds = [
+            stable_seed(base_seed, name, "candidate", fingerprint(config))
+            for config in candidates
+        ]
+        cached_candidates = [
+            checkpoint_available(
+                name, "candidate", config, seed, candidate_options,
+                candidate_inputs)
+            for config, seed in zip(candidates, candidate_seeds)
+        ]
+        if on_progress is not None:
+            cached_count = sum(cached_candidates)
+            on_progress({
+                "event": "candidate_inventory", "model": name,
+                "stage": "tuning", "total": len(candidates),
+                "cached": cached_count, "memory_cached": 0,
+                "checkpoint_cached": cached_count,
+                "pending": len(candidates) - cached_count,
+            })
+
+        valid_trials = []
+        for index, (config, seed) in enumerate(
+                zip(candidates, candidate_seeds)):
+            candidate_started = time.monotonic()
+            if on_progress is not None:
+                on_progress({
+                    "event": "candidate_start", "model": name,
+                    "stage": "tuning", "index": index + 1,
+                    "total": len(candidates), "config": dict(config),
+                    "cache_status": (
+                        "checkpoint" if cached_candidates[index] else "pending"),
+                    "elapsed_seconds": 0.0,
+                })
+            try:
+                fitted, resumed, identity = cached_fit(
+                    name, "candidate", config, seed, candidate_options,
+                    candidate_inputs,
+                    lambda config=config, seed=seed: fit_candidate(config, seed),
+                )
+                loss = observed_loss(candidate_probability(fitted))
+                elapsed = time.monotonic() - candidate_started
+                row = {
+                    **context, **metadata, **dict(config), "model": name,
+                    "index": index, "seed": seed,
+                    "validation_loss": loss,
+                    "selection_metric": "observed_log_loss",
+                    "stage": "comparator_candidate", "status": "complete",
+                    "converged": bool(fitted.converged),
+                    "iterations": int(fitted.iterations),
+                    "objective_value": float(fitted.objective_value),
+                    "elapsed_seconds": elapsed, "resumed": resumed,
+                    "checkpoint_status": "checkpoint" if resumed else (
+                        "saved" if store is not None else "disabled"),
+                    "checkpoint_identity": identity,
+                }
+                tables["tuning"].append(row)
+                valid_trials.append({
+                    "index": index, "config": dict(config), "fit": fitted,
+                    "loss": loss, "row": row,
+                })
+                progress_status = "checkpoint" if resumed else "fitted"
+                progress_extra = {"validation_observed_log_loss": loss}
+            except Exception as error:
+                elapsed = time.monotonic() - candidate_started
+                message = f"{type(error).__name__}: {error}"
+                tables["tuning"].append({
+                    **context, **metadata, **dict(config), "model": name,
+                    "index": index, "seed": seed, "validation_loss": None,
+                    "selection_metric": "observed_log_loss",
+                    "stage": "comparator_candidate", "status": "failed",
+                    "converged": False, "iterations": 0,
+                    "objective_value": None, "elapsed_seconds": elapsed,
+                    "resumed": False, "checkpoint_status": "failed",
+                    "error": message,
+                })
+                tables["failures"].append({
+                    **context, **metadata, **dict(config),
+                    "stage": "pu_comparator_candidate", "model": name,
+                    "candidate_index": index, "error": message,
+                })
+                progress_status = "failed"
+                progress_extra = {"error": message}
+            if on_progress is not None:
+                on_progress({
+                    "event": "candidate_complete", "model": name,
+                    "stage": "tuning", "index": index + 1,
+                    "total": len(candidates), "config": dict(config),
+                    "cache_status": progress_status,
+                    "elapsed_seconds": elapsed, **progress_extra,
+                })
+
+        if not valid_trials:
+            message = "No comparator candidate completed successfully"
+            tables["failures"].append({
+                **context, **metadata, "stage": "pu_comparator",
+                "model": name, "error": message,
+            })
+            if on_progress is not None:
+                on_progress({
+                    "event": "model_complete", "model": name,
+                    "elapsed_seconds": time.monotonic() - started,
+                    "cache_status": "failed", "summary": {"failed": True},
+                })
+            continue
+
+        selected = min(
+            valid_trials,
+            key=lambda trial: (
+                not bool(trial["fit"].converged), trial["loss"],
+                int(trial["config"].get("rank", 0)),
+                -float(trial["config"].get(
+                    "l2", trial["config"].get(
+                        "l2_classifier", trial["config"].get("l2_u", 0.0)))),
+                trial["index"],
+            ),
+        )
+        selected_config = dict(selected["config"])
+        refit_seed = stable_seed(base_seed, name, "refit")
+        refit_cached = checkpoint_available(
+            name, "refit", selected_config, refit_seed,
+            refit_options, refit_inputs)
+        if on_progress is not None:
+            on_progress({
+                "event": "refit_start", "model": name, "stage": "refit",
+                "config": selected_config,
+                "cache_status": "checkpoint" if refit_cached else "pending",
+                "elapsed_seconds": 0.0,
+            })
+        refit_started = time.monotonic()
+        try:
+            final, final_resumed, final_identity = cached_fit(
+                name, "refit", selected_config, refit_seed,
+                refit_options, refit_inputs,
+                lambda: fit_refit(selected_config, refit_seed),
+            )
+            prediction, model_e = final_probabilities(final)
+            refit_elapsed = time.monotonic() - refit_started
+        except Exception as error:
+            refit_elapsed = time.monotonic() - refit_started
+            message = f"{type(error).__name__}: {error}"
+            tables["failures"].append({
+                **context, **metadata, **selected_config,
+                "stage": "pu_comparator_refit", "model": name,
+                "error": message,
+            })
+            if on_progress is not None:
+                on_progress({
+                    "event": "refit_complete", "model": name,
+                    "stage": "refit", "config": selected_config,
+                    "cache_status": "failed", "elapsed_seconds": refit_elapsed,
+                    "error": message,
+                })
+                on_progress({
+                    "event": "model_complete", "model": name,
+                    "elapsed_seconds": time.monotonic() - started,
+                    "cache_status": "failed", "summary": {"failed": True},
+                })
+            continue
+
+        if on_progress is not None:
+            on_progress({
+                "event": "refit_complete", "model": name, "stage": "refit",
+                "config": selected_config,
+                "cache_status": "checkpoint" if final_resumed else "fitted",
+                "elapsed_seconds": refit_elapsed,
+            })
+        diagnostics = final.diagnostics()
+        record(name, prediction, "reference", metadata,
+               estimated_sensitivity=model_e)
+        model_elapsed = time.monotonic() - started
+        tables["selected"].append({
+            **context, **metadata, **selected_config, **diagnostics,
+            "model": name, "validation_loss": selected["loss"],
+            "selection_metric": "observed_log_loss",
+            "tuning_trials": len(candidates),
+            "valid_tuning_trials": len(valid_trials),
+            "candidate_budget": budget,
+            "selected_candidate_index": selected["index"],
+            "refit_seed": refit_seed,
+            "elapsed_seconds": model_elapsed,
+            "refit_elapsed_seconds": refit_elapsed,
+            "resumed": final_resumed,
+            "final_fit_resumed": final_resumed,
+            "checkpoint_status": "checkpoint" if final_resumed else (
+                "saved" if store is not None else "disabled"),
+            "checkpoint_identity": final_identity,
+            "final_fit_attempts": 1, "final_fit_retried": False,
+        })
+        if on_progress is not None:
+            on_progress({
+                "event": "model_complete", "model": name,
+                "elapsed_seconds": model_elapsed,
+                "cache_status": "checkpoint" if final_resumed else "fitted",
+                "summary": diagnostics,
+            })

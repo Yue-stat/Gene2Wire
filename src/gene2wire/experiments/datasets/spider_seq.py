@@ -45,6 +45,11 @@ SPIDER_SEQ_PANELS = {
 }
 SPIDER_SEQ_TARGETS = tuple(sorted(set().union(*map(set, SPIDER_SEQ_PANELS.values()))))
 CACHE_SCHEMA_VERSION = 1
+SPIDER_SEQ_MEASUREMENT_GENE_POOL_SIZE = 2000
+SPIDER_SEQ_MEASUREMENT_GENE_POOL_VERSION = "gene-id-sha256-v1"
+_SPIDER_SEQ_MEASUREMENT_GENE_POOL_SALT = (
+    "Gene2Wire::SPIDER-Seq::measurement-gene-pool::v1"
+)
 
 
 def panel_manifest_hash(panels: Mapping[str, Sequence[str]] = SPIDER_SEQ_PANELS) -> str:
@@ -261,6 +266,36 @@ def _positive_integer(value, name):
     return int(value)
 
 
+def select_spider_seq_measurement_gene_pool(
+    gene_names: Sequence[str],
+    pool_size: int = SPIDER_SEQ_MEASUREMENT_GENE_POOL_SIZE,
+) -> tuple[int, ...]:
+    """Select a fixed source-gene pool using gene IDs alone.
+
+    Genes are ranked by a versioned SHA256 hash of the exact gene ID and a
+    public fixed salt.  The rule is invariant to source-column order and never
+    inspects expression, projection outcomes, assay availability, animals, or
+    train/validation/test membership.  If fewer than ``pool_size`` genes are
+    available, every gene is retained in the same deterministic hash order.
+
+    The returned indices follow that hash order, which makes both membership
+    and output column order reproducible from the declared gene IDs.
+    """
+    size = _positive_integer(pool_size, "pool_size")
+    names = tuple(map(str, gene_names))
+    if not names or len(set(names)) != len(names) or any(not name for name in names):
+        raise ValueError("gene_names must be a nonempty sequence of unique nonempty IDs")
+
+    def key(index: int):
+        payload = (
+            f"{_SPIDER_SEQ_MEASUREMENT_GENE_POOL_SALT}\0{names[index]}"
+        ).encode("utf-8")
+        return hashlib.sha256(payload).digest(), names[index]
+
+    ranked = sorted(range(len(names)), key=key)
+    return tuple(ranked[:min(size, len(ranked))])
+
+
 def _normalize_rna_counts(counts):
     """Apply the cell-local library-size transform once for all CV splits."""
     x = counts.copy().astype(np.float32)
@@ -409,6 +444,192 @@ def spider_seq_dataset(data: SpiderSeqData, *, n_hvg=2000, n_gene_components=50,
     return result
 
 
+def spider_seq_measurement_dataset(
+    data: SpiderSeqData,
+    *,
+    gene_pool_size: int = SPIDER_SEQ_MEASUREMENT_GENE_POOL_SIZE,
+    n_gene_components=50,
+    location_features_csv=None,
+    target_features_csv=None,
+) -> ExperimentDataset:
+    """Expose a fixed, outcome-blind source pool for panel-degradation studies.
+
+    This adapter deliberately differs from :func:`spider_seq_dataset`.  The
+    ordinary adapter chooses fold-specific highly variable genes from the full
+    transcriptome.  A panel experiment instead needs one immutable source pool
+    so that every overlap/coverage condition refers to the same named genes.
+    Membership and order of this pool are determined only from exact gene IDs
+    by :func:`select_spider_seq_measurement_gene_pool`.
+
+    ``gene_matrix`` is dense float32 on the cell-local
+    ``counts / library_size * 10000 -> log1p`` scale.  The denominator uses the
+    original full RNA library and does not fit any cross-cell statistic.  No
+    centering, scaling, HVG selection, or PCA has been fitted in this matrix.
+    A downstream measurement wrapper must first apply its gene-observation
+    panel to ``gene_matrix`` and only then fit any train-only scaling or PCA.
+    The feature builder here represents the unmasked full-pool control.
+
+    Native target availability, target outcomes, animal groups, and within-
+    animal folds are copied without modification.
+    """
+    size = _positive_integer(gene_pool_size, "gene_pool_size")
+    if n_gene_components is not None:
+        n_gene_components = _positive_integer(
+            n_gene_components, "n_gene_components"
+        )
+    selected = select_spider_seq_measurement_gene_pool(data.gene_names, size)
+    selected_names = tuple(data.gene_names[index] for index in selected)
+    location = (
+        None
+        if location_features_csv is None
+        else _aligned_numeric_csv(
+            location_features_csv, data.cell_ids, "Cell location"
+        )
+    )
+    target = (
+        None
+        if target_features_csv is None
+        else _aligned_numeric_csv(
+            target_features_csv, data.target_ids, "Target feature"
+        )
+    )
+
+    # Library normalization is cell-local and therefore safe to compute once.
+    # Restrict to the declared source pool before any train-fitted operation.
+    normalized = _normalize_rna_counts(data.X_gene_raw)
+    source_sparse = normalized[:, np.asarray(selected, dtype=int)].tocsr()
+    source_matrix = source_sparse.toarray().astype(np.float32, copy=False)
+    animal_ids = np.asarray(data.animal_ids, dtype=str)
+    pool_manifest = {
+        "version": SPIDER_SEQ_MEASUREMENT_GENE_POOL_VERSION,
+        "requested_size": size,
+        "source_gene_count": len(data.gene_names),
+        "gene_ids": selected_names,
+    }
+    pool_hash = hashlib.sha256(
+        json.dumps(pool_manifest, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+    def features(train_rows, use_location=False, use_target_features=False):
+        if not isinstance(use_location, bool) or not isinstance(
+            use_target_features, bool
+        ):
+            raise TypeError("Feature switches must be booleans")
+        if use_location and location is None:
+            raise ValueError(
+                "SPIDER-Seq has no bundled spatial coordinates; supply "
+                "location_features_csv or use USE_LOCATION=False"
+            )
+        if use_target_features and target is None:
+            raise ValueError(
+                "Supply independent target_features_csv descriptors or use "
+                "USE_TARGET_FEATURES=False"
+            )
+        base = _prepare_normalized_spider_seq_features(
+            source_sparse,
+            selected_names,
+            train_rows,
+            n_hvg=len(selected_names),
+            n_gene_components=n_gene_components,
+        )
+        x, blocks, names = base.X, dict(base.feature_blocks), base.feature_names
+        if use_location:
+            train = np.asarray(train_rows, dtype=int)
+            loc = StandardScaler().fit(location[0][train]).transform(location[0])
+            blocks["location"] = tuple(
+                range(x.shape[1], x.shape[1] + loc.shape[1])
+            )
+            x = np.column_stack((x, loc))
+            names += tuple(f"location::{name}" for name in location[1])
+        return FeatureSet(
+            x,
+            blocks,
+            target[0].copy() if use_target_features else None,
+            names,
+            {
+                **dict(base.metadata),
+                "source_gene_pool_sha256": pool_hash,
+                "source_gene_pool_size": len(selected_names),
+                "source_gene_pool_selection": SPIDER_SEQ_MEASUREMENT_GENE_POOL_VERSION,
+                "source_gene_matrix_scale": (
+                    "full-library per-cell counts/total*10000; log1p; "
+                    "no cross-cell fit"
+                ),
+                "feature_role": "unmasked full measurement-gene-pool control",
+                "location_feature_names": location[1] if use_location else (),
+                "target_feature_names": target[1] if use_target_features else (),
+            },
+        )
+
+    def splits(n_outer_folds=3, seed=0):
+        return make_block_folds(animal_ids, n_outer_folds, seed)
+
+    result = ExperimentDataset(
+        name="SPIDER-Seq",
+        reference=data.Z_reference,
+        measured=data.W_measured,
+        cell_ids=data.cell_ids,
+        target_ids=data.target_ids,
+        feature_builder=features,
+        split_builder=splits,
+        groups={"animal": animal_ids},
+        gene_matrix=source_matrix,
+        gene_names=selected_names,
+        metadata={
+            **dict(data.metadata),
+            "source_url": SPIDER_SEQ_URL,
+            "source_sha256": data.source_sha256,
+            "source_revision": SPIDER_SEQ_REVISION,
+            "source_code_commit": SPIDER_SEQ_SOURCE_COMMIT,
+            "supplementary_table_s2_sha256": SPIDER_SEQ_S2_SHA256,
+            "reference": "author-processed assay calls; not anatomical truth",
+            "native_fragmented_panels": True,
+            "measurement_gene_pool_version": SPIDER_SEQ_MEASUREMENT_GENE_POOL_VERSION,
+            "measurement_gene_pool_requested_size": size,
+            "measurement_gene_pool_size": len(selected_names),
+            "measurement_gene_pool_source_gene_count": len(data.gene_names),
+            "measurement_gene_pool_indices": list(selected),
+            "measurement_gene_pool_names": list(selected_names),
+            "measurement_gene_pool_sha256": pool_hash,
+            "measurement_gene_pool_selection": (
+                "versioned SHA256 rank of exact gene IDs; expression, outcomes, "
+                "assay availability, animals, and split roles are not read"
+            ),
+            "gene_matrix_stage": (
+                "post cell-local full-library normalization/log1p; pre "
+                "train-fitted scaling, HVG selection, and PCA"
+            ),
+            "gene_matrix_scale": "counts/total_RNA_library*10000 then log1p",
+            "gene_matrix_cross_cell_fit": False,
+            "measurement_wrapper_contract": (
+                "apply the gene-observation panel to gene_matrix before every "
+                "train-only scaling or PCA fit"
+            ),
+            "n_gene_components": n_gene_components,
+            "location_feature_source": (
+                str(location_features_csv) if location else None
+            ),
+            "target_feature_source": (
+                str(target_features_csv) if target else None
+            ),
+            "location_feature_sha256": (
+                file_hash(Path(location_features_csv).expanduser())
+                if location
+                else None
+            ),
+            "target_feature_sha256": (
+                file_hash(Path(target_features_csv).expanduser())
+                if target
+                else None
+            ),
+            "target_features_available": target is not None,
+            "split": "within-animal held-out cells; not unseen-animal evaluation",
+        },
+    )
+    result.validate()
+    return result
+
+
 def load_spider_seq(cache_dir, *, n_hvg=2000, n_gene_components=50,
                     location_features_csv=None, target_features_csv=None,
                     raw_path=None) -> ExperimentDataset:
@@ -416,3 +637,22 @@ def load_spider_seq(cache_dir, *, n_hvg=2000, n_gene_components=50,
                               n_hvg=n_hvg, n_gene_components=n_gene_components,
                               location_features_csv=location_features_csv,
                               target_features_csv=target_features_csv)
+
+
+def load_spider_seq_measurement(
+    cache_dir,
+    *,
+    gene_pool_size: int = SPIDER_SEQ_MEASUREMENT_GENE_POOL_SIZE,
+    n_gene_components=50,
+    location_features_csv=None,
+    target_features_csv=None,
+    raw_path=None,
+) -> ExperimentDataset:
+    """Load SPIDER-Seq with the fixed measurement-degradation gene pool."""
+    return spider_seq_measurement_dataset(
+        load_spider_seq_data(cache_dir, raw_path=raw_path),
+        gene_pool_size=gene_pool_size,
+        n_gene_components=n_gene_components,
+        location_features_csv=location_features_csv,
+        target_features_csv=target_features_csv,
+    )

@@ -20,7 +20,7 @@ import textwrap
 REPO_ROOT = Path(__file__).resolve().parents[2]
 OUTPUT_DIR = REPO_ROOT / "notebooks" / "positive_label_hiding"
 NOTEBOOK_NAMES = ("simulation", "SPIDER", "MERGE_seq", "Projection_TAGs", "BARseq")
-PROTOCOL_VERSION = "0911-v4-consolidated"
+PROTOCOL_VERSION = "0912-v5-measurement-degradation"
 NOTEBOOK_FILENAMES = {
     "simulation": "simulation.ipynb",
     "SPIDER": "spider_spatial.ipynb",

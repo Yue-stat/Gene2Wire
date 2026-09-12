@@ -69,6 +69,34 @@ class EvaluationSpec:
                 raise ValueError("Blocked evaluation cannot include naturally unassayed entries")
 
 
+@dataclass(frozen=True)
+class MeasurementEvaluationSpec:
+    """Fixed reference scope for artificial measurement-degradation studies.
+
+    ``source_measured`` is the native assay support used for the headline test
+    score.  It is deliberately separate from ``training_measured`` on
+    :class:`ExperimentDataset`: hiding a target panel changes the learner's
+    information, never the test reference population.
+    """
+
+    reference: np.ndarray
+    source_measured: np.ndarray
+    assays: np.ndarray
+
+    def validate(self, shape: tuple[int, int]) -> None:
+        z = np.asarray(self.reference)
+        w = np.asarray(self.source_measured)
+        assays = np.asarray(self.assays)
+        if z.shape != shape or w.shape != shape:
+            raise ValueError("Measurement evaluation arrays must match the outcome shape")
+        if not np.all(np.isin(z, [0, 1])) or not np.all(np.isin(w, [0, 1])):
+            raise ValueError("Measurement evaluation reference/support must be binary")
+        if np.any(z.astype(bool) & ~w.astype(bool)):
+            raise ValueError("Evaluation positives cannot occur outside native assay support")
+        if assays.shape != (shape[0],) or any(str(value) == "" for value in assays):
+            raise ValueError("Measurement evaluation assays must be aligned non-empty labels")
+
+
 @dataclass
 class ExperimentDataset:
     name: str
@@ -91,6 +119,14 @@ class ExperimentDataset:
     # (for example log1p counts). It is never passed directly to a learner.
     gene_matrix: np.ndarray | None = None
     gene_names: tuple[str, ...] = ()
+    # Measurement-degradation experiments retain the native ``measured`` mask
+    # for fixed-scope evaluation while learners see this stricter mask.
+    training_measured: np.ndarray | None = None
+    virtual_assays: np.ndarray | None = None
+    # A fold-local, outcome-isolated generator.  The concrete immutable plan is
+    # defined in experiments.measurement_design to avoid a circular import.
+    observation_plan: Any | None = None
+    measurement_evaluation: MeasurementEvaluationSpec | None = None
 
     def validate(self) -> None:
         z, w = np.asarray(self.reference), np.asarray(self.measured)
@@ -100,6 +136,16 @@ class ExperimentDataset:
             raise ValueError("reference and measured must be binary")
         if np.any(z.astype(bool) & ~w.astype(bool)):
             raise ValueError("Reference positives cannot occur off-panel")
+        if self.training_measured is not None:
+            fit_w = np.asarray(self.training_measured)
+            if fit_w.shape != z.shape or not np.all(np.isin(fit_w, [0, 1])):
+                raise ValueError("training_measured must be an aligned binary matrix")
+            if np.any(fit_w.astype(bool) & ~w.astype(bool)):
+                raise ValueError("training_measured cannot manufacture native assays")
+        if self.virtual_assays is not None:
+            assays = np.asarray(self.virtual_assays)
+            if assays.shape != (z.shape[0],) or any(str(value) == "" for value in assays):
+                raise ValueError("virtual_assays must be aligned non-empty labels")
         if len(self.cell_ids) != z.shape[0] or len(set(self.cell_ids)) != z.shape[0]:
             raise ValueError("Cell IDs must be unique and aligned")
         if len(self.target_ids) != z.shape[1] or len(set(self.target_ids)) != z.shape[1]:
@@ -115,6 +161,16 @@ class ExperimentDataset:
                 raise ValueError(f"Group {name!r} is not aligned to cells")
         if self.evaluation is not None:
             self.evaluation.validate(z.shape)
+        if self.measurement_evaluation is not None:
+            if self.evaluation is not None:
+                raise ValueError("Use one evaluation contract per dataset")
+            self.measurement_evaluation.validate(z.shape)
+            if self.virtual_assays is None or not np.array_equal(
+                    np.asarray(self.measurement_evaluation.assays).astype(str),
+                    np.asarray(self.virtual_assays).astype(str)):
+                raise ValueError("Measurement evaluation and training assay assignments differ")
+        if self.observation_plan is not None and self.training_measured is None:
+            raise ValueError("observation_plan requires explicit training_measured")
         if self.natural_observed is not None:
             d = np.asarray(self.natural_observed)
             if d.shape != z.shape or not np.all(np.isin(d, [0, 1])):

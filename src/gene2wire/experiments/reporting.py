@@ -24,13 +24,29 @@ import pandas as pd
 _BLOCK_CONTEXT = ("experiment", "group_mode", "training_panel", "training_block_fraction",
                   "block_fraction", "evaluation_scope")
 _OVERLAP_CONTEXT = ("panel_design", "arm", "requested_overlap", "actual_overlap", "panel_size")
+_MEASUREMENT_CONTEXT = (
+    "panel_seed", "gene_requested_coverage", "gene_coverage", "gene_overlap",
+    "target_requested_coverage", "target_coverage", "target_overlap",
+    "positive_retention", "condition_roles",
+)
 _CONTEXT = ("dataset", "sharing_strength", "analysis", "mechanism", "loss_rate",
             "calibration_fraction", "calibration_spec", *_BLOCK_CONTEXT,
-            *_OVERLAP_CONTEXT, "model")
-_CONFIG = ("kind", "rank", "shared_l2", "residual_l2", "use_target_features", "target_l2")
+            *_OVERLAP_CONTEXT, *_MEASUREMENT_CONTEXT, "model")
+_CONFIG = ("kind", "rank", "shared_l2", "residual_l2", "use_target_features", "target_l2",
+           "l2", "l2_u", "l2_v", "l2_map", "l2_exposure",
+           "l2_classifier", "l2_propensity", "local_certainty")
 _TABLE_ORDER = ("aggregate", "per_repetition", "selected", "tuning", "metrics",
                 "per_target", "reliability", "detection", "detection_per_target",
-                "detection_reliability", "thinning_audit", "paired_audit", "failures",
+                "detection_reliability", "observation_diagnostics", "thinning_audit",
+                "measurement_scenarios", "measurement_gene_panel_conditions",
+                "measurement_target_panel_conditions", "measurement_support",
+                "measurement_support_assays", "measurement_support_pairs",
+                "measurement_gene_target_support",
+                "measurement_unsupported_gene_target_pairs",
+                "information_access",
+                "heatmap_baseline_selection", "heatmap_contrasts", "panel_stability",
+                "projection_budget_recall", "projection_budget_recall_per_target",
+                "paired_audit", "failures",
                 "simulation_intervals", "metrics_long", "worst_panel", "overlap_contrasts")
 
 
@@ -291,7 +307,8 @@ def _final_status(frame: pd.DataFrame) -> pd.Series:
 def _configuration_signature(row: pd.Series) -> str:
     fields = ("selected_structure", "kind", "rank", "shared_l2", "residual_l2",
               "target_l2", "l2", "objective", "n_estimators", "min_samples_leaf",
-              "max_features", "max_depth")
+              "max_features", "max_depth", "l2_u", "l2_v", "l2_map",
+              "l2_exposure", "l2_classifier", "l2_propensity", "local_certainty")
     short = {"selected_structure": "kind", "rank": "K", "shared_l2": "sh",
              "residual_l2": "res", "target_l2": "tgt", "n_estimators": "trees",
              "min_samples_leaf": "leaf", "max_features": "features", "max_depth": "depth"}
@@ -318,7 +335,7 @@ def compact_summaries(tables: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataFr
     if not aggregate.empty:
         endpoint = _endpoint(aggregate)
         columns = [name for name in ("dataset", "sharing_strength", "mechanism", "loss_rate",
-            *_BLOCK_CONTEXT, *_OVERLAP_CONTEXT, "model",
+            *_BLOCK_CONTEXT, *_OVERLAP_CONTEXT, *_MEASUREMENT_CONTEXT, "model",
             "macro_auprc", "macro_log_loss", "macro_hidden_recall_at_h", "macro_brier",
             "macro_predicted_prevalence", "macro_reference_prevalence") if name in endpoint]
         for name in ("calibration_fraction", "calibration_spec"):
@@ -328,7 +345,7 @@ def compact_summaries(tables: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataFr
     selected = _primary(tables.get("selected", pd.DataFrame()))
     tuning = _primary(tables.get("tuning", pd.DataFrame()))
     groups = [name for name in ("dataset", "sharing_strength", *_BLOCK_CONTEXT,
-                                *_OVERLAP_CONTEXT, "model")
+                                *_OVERLAP_CONTEXT, *_MEASUREMENT_CONTEXT, "model")
               if name in selected]
     if not selected.empty and groups:
         rows = []
@@ -363,7 +380,7 @@ def compact_summaries(tables: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataFr
         output["nonconverged_final_fits_first_10_see_selected_csv"] = incomplete.loc[:, columns].head(10)
     if not tuning.empty:
         group_cols = [name for name in ("dataset", "sharing_strength", *_BLOCK_CONTEXT,
-                                        *_OVERLAP_CONTEXT, "model")
+                                        *_OVERLAP_CONTEXT, *_MEASUREMENT_CONTEXT, "model")
                       if name in tuning]
         if group_cols:
             rows = []
@@ -386,6 +403,10 @@ def compact_summaries(tables: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataFr
 
 
 _IMPORTANT_MODELS = ("PU", "PU-MIRT", "PU-Joint", "Reference+PU-Joint")
+_MEASUREMENT_MODELS = (
+    "PU", "PU-MIRT", "PU-Joint", "GenEML-adapted",
+    "Inductive-PU-MC", "SAR-PU", "Reference+PU-Joint",
+)
 _PU_MODELS = _IMPORTANT_MODELS[:3]
 _ASSAY_MODELS = ("Logistic", "MIRT", "Joint")
 _REPORT_LIMITS = {
@@ -462,6 +483,9 @@ def _assay_only(frame: pd.DataFrame) -> bool:
 
 
 def _important_models(frame: pd.DataFrame) -> tuple[str, ...]:
+    if (not frame.empty and "experiment" in frame
+            and frame["experiment"].eq("measurement_degradation").any()):
+        return _MEASUREMENT_MODELS
     return _ASSAY_MODELS if _assay_only(frame) else _IMPORTANT_MODELS
 
 
@@ -472,7 +496,11 @@ def _report_scope(frame: pd.DataFrame, *, endpoint: bool = False,
     if frame.empty:
         return frame
     if "evaluation_scope" in frame:
-        frame = frame.loc[frame.evaluation_scope.eq("blocked")]
+        if ("experiment" in frame
+                and frame["experiment"].eq("measurement_degradation").any()):
+            frame = frame.loc[frame.evaluation_scope.eq("native_reference")]
+        else:
+            frame = frame.loc[frame.evaluation_scope.eq("blocked")]
     if masked and "training_panel" in frame:
         frame = frame.loc[frame.training_panel.eq("masked")]
     if endpoint:

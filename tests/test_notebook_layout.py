@@ -35,6 +35,13 @@ EXPECTED_NOTEBOOKS = {
     "gene_panel_overlap/spider_spatial.ipynb",
     "gene_panel_overlap/simulation.ipynb",
     "native_target_panels/spider_seq.ipynb",
+    "measurement_degradation/simulation.ipynb",
+    "measurement_degradation/barseq_a1.ipynb",
+    "measurement_degradation/barseq_m1.ipynb",
+    "measurement_degradation/merge_seq.ipynb",
+    "measurement_degradation/projection_tags.ipynb",
+    "measurement_degradation/spider_spatial.ipynb",
+    "measurement_degradation/spider_seq.ipynb",
 }
 
 

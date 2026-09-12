@@ -64,6 +64,25 @@ checkpoints and result families. Default additional positive loss is zero;
 Projection-TAGs keeps natural detections. Block fractions refer to selected
 target columns, not positive loss. The primary notebooks above remain unchanged.
 
+## Combined measurement degradation
+
+The new [measurement-degradation protocol](docs/MEASUREMENT_DEGRADATION.md)
+combines union-preserving three-assay gene panels, target panels, and fold-local
+assay-by-target positive censoring. Here `gene_coverage=100%` means every assay
+measures the entire declared gene pool—for BARseq, A/B/C each measure all 23 of
+23 genes. It is not the older fixed-eight-gene, 100%-overlap condition.
+
+Seven output-cleared entry points live under
+[`notebooks/measurement_degradation/`](notebooks/measurement_degradation/):
+simulation, BARseq A1, BARseq M1, MERGE-seq, Projection-TAGs, SPIDER spatial,
+and SPIDER-Seq. They retain the current 15 fitted methods and add
+`GenEML-adapted`, `Inductive-PU-MC (ShiftIMC-adapted)`, and
+`SAR-PU (SAR-EM)`. Artificial target-panel exclusions remain missing through
+`W_fit = W_native & B[assay,target]`, while headline test metrics use the same
+fixed native reference scope for every condition. These notebooks are intended
+for the source-pinned local/OnDemand Python environment; no Colab copies are
+generated.
+
 The positive-label and target-block notebooks start with these shared defaults:
 
 ```python

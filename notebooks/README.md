@@ -37,6 +37,37 @@ outcomes in a hidden block become unmeasured.
 
 Builder: [`build_target_block_masking.py`](../scripts/notebooks/build_target_block_masking.py)
 
+## Combined measurement degradation
+
+These experiments jointly vary union-preserving three-assay gene coverage,
+target coverage, and fold-local assay-by-target positive retention. Coverage is
+the fraction measured by each assay, not overlap between fixed-size panels:
+BARseq at 100% gene coverage measures all 23 genes in each of A/B/C. Artificial
+off-panel target entries remain unmeasured through `W_fit`, while every
+condition's headline metric uses the fixed native outer-test reference scope.
+See the [complete protocol](../docs/MEASUREMENT_DEGRADATION.md).
+
+| Dataset | Notebook |
+|---|---|
+| Simulation | [`simulation.ipynb`](measurement_degradation/simulation.ipynb) |
+| BARseq A1 | [`barseq_a1.ipynb`](measurement_degradation/barseq_a1.ipynb) |
+| BARseq M1 | [`barseq_m1.ipynb`](measurement_degradation/barseq_m1.ipynb) |
+| MERGE-seq | [`merge_seq.ipynb`](measurement_degradation/merge_seq.ipynb) |
+| Projection-TAGs | [`projection_tags.ipynb`](measurement_degradation/projection_tags.ipynb) |
+| SPIDER spatial | [`spider_spatial.ipynb`](measurement_degradation/spider_spatial.ipynb) |
+| SPIDER-Seq | [`spider_seq.ipynb`](measurement_degradation/spider_seq.ipynb) |
+
+Builder:
+[`build_measurement_degradation.py`](../scripts/notebooks/build_measurement_degradation.py)
+
+The notebooks retain the existing 15 fitted methods and add three explicitly
+labelled comparators: `GenEML-adapted`,
+`Inductive-PU-MC (ShiftIMC-adapted)`, and `SAR-PU (SAR-EM)`. They display panel,
+support, censoring, selected-parameter, metric, convergence/failure, runtime,
+and checkpoint diagnostics plus the retention curve, coverage heatmap, and the
+dataset-appropriate recovery or panel-sensitivity figure. They run in the
+source-pinned local/OnDemand Python environment and have no Colab copies.
+
 ## Gene-panel overlap
 
 These experiments change which input-gene columns are visible while holding the
