@@ -41,9 +41,8 @@ For BARseq the declared source pool has 23 genes. The implemented sizes are:
 | Requested gene coverage | Genes in A | Genes in B | Genes in C | A/B/C union |
 |---:|---:|---:|---:|---:|
 | 1 | 23 | 23 | 23 | 23 |
-| 5/6 | 19 | 19 | 19 | 23 |
-| 2/3 | 15 | 15 | 15 | 23 |
-| 1/2 | 12 | 12 | 12 | 23 |
+| 0.7 | 16 | 16 | 16 | 23 |
+| 0.4 | 9 | 9 | 9 | 23 |
 
 Thus the new 100% condition is **23/23 genes in every BARseq assay**. The eight
 genes used by the older gene-overlap notebook were a fixed panel-size design;
@@ -57,6 +56,13 @@ construction over the dataset's declared targets. The artificial target panel
 is then intersected with native assay availability; it never manufactures a
 measurement that the source dataset did not contain. Planned panel incidence
 and effective fold-local support are both exported.
+
+Requested target coverage 0.4 is an explicit stress condition, not a guarantee
+that the assay-target graph is connected. Integer rounding and native target
+availability can produce `graph_connected=False`, particularly for BARseq A1
+(`T=11`) and MERGE-seq (`T=5`). Such a mask is reported rather than redrawn:
+connectivity, components, single-assay targets, unsupported targets, requested
+coverage, and realized coverage all remain visible in preflight and exports.
 
 ## Fixed design and masking order
 
@@ -163,24 +169,27 @@ folds are preserved.
 
 ## Predeclared condition schedule
 
-The protocol avoids the full `4 x 3 x 5` Cartesian product. It fits these
+The fast protocol avoids the full `3 x 3 x 4` Cartesian product. It fits these
 deduplicated slices:
 
 | Role | Gene coverage | Target coverage | Positive retention | Mechanism |
 |---|---:|---:|---:|---|
 | Full control | 1 | 1 | 1 | assay-target heterogeneous design with no realized censoring |
-| Retention curve | 2/3 | 2/3 | 1, 0.75, 0.50, 0.25, 0.10 | heterogeneous |
-| Coverage heatmap | 1, 5/6, 2/3, 1/2 | 1, 2/3, 1/2 | 0.50 | heterogeneous |
-| Mechanism control | 2/3 | 2/3 | 0.50 | exactly count-matched uniform/SCAR |
+| Retention curve | 0.7 | 0.7 | 1, 0.7, 0.4, 0.1 | heterogeneous |
+| Coverage heatmap and curves | 1, 0.7, 0.4 | 1, 0.7, 0.4 | 0.4 | heterogeneous |
+| Mechanism control | 0.7 | 0.7 | 0.4 | exactly count-matched uniform/SCAR |
 
-The anchor is `(2/3, 2/3, 0.50)`. Identical conditions shared by the curve,
+The requested anchor is `(0.7, 0.7, 0.4)`. Identical conditions shared by the curve,
 heatmap, and control schedule are trained once and carry all applicable role
 labels. Projection-TAGs additionally retains its natural standard-versus-
 amplified recovery condition; it is kept distinct from artificial censoring.
-The canonical configuration uses five outcome-blind panel seeds. Simulation
-uses five independently generated datasets at each sharing strength and nests
-the five panel seeds within each generated dataset, so panel sensitivity is
-computed before uncertainty is summarized across independent simulations.
+The fast canonical configuration uses two outcome-blind panel seeds. Simulation
+uses two independently generated datasets at each sharing strength and nests
+the two panel seeds within each generated dataset, so panel sensitivity is
+computed before uncertainty is summarized across independent simulations. This
+two-by-two configuration is intended for rapid result inspection, not formal
+superiority confidence intervals; formal runs must increase independent data
+repetitions without treating nested panel seeds or folds as independent units.
 
 ## Models and information access
 
@@ -209,6 +218,21 @@ configuration. Duplicate comparator configurations are removed and each added
 comparator's search is capped at 32 genuine candidates. `Logistic-rescaled`,
 when defined, is a post-hoc prediction and is not counted as a nineteenth fit.
 
+PU-Joint and Joint use the explicit `rank_top2_total_ratio` strategy: an adaptive
+but validation-isolated 32-native-candidate search. It first evaluates one
+anchor-penalty candidate for each declared positive rank, retains the two best
+distinct converged ranks using development
+validation only, and spends the remaining native budget on a deterministic
+balanced design in total-shrinkage and residual/shared-ratio coordinates. Each
+native Joint configuration is optimized from both the exact tuned direct and
+exact tuned low-rank inner-training solutions. A missing or non-converged
+endpoint is retried and then reported as a failure rather than silently replaced
+with an arbitrary initializer. The two exact endpoints are also selectable
+boundary candidates outside the 32 native configurations. The preflight search
+plan records the rank screen, retained-rank ceiling, refinement ceiling, endpoint
+count, optimizer starts per native candidate, and maximum total trials; the
+realized `rank`, `penalty`, and `inherited_endpoint` stages remain in `tuning.csv`.
+
 ## Notebook diagnostics, exports, and figures
 
 The notebooks show bounded summaries and write the complete tables and arrays.
@@ -231,19 +255,27 @@ The audit surface includes:
   retained-count checks;
 - aggregate and per-target metrics on all declared evaluation scopes, plus
   per-group and per-repetition variability, calibration/reliability tables,
-  selected configurations, every tuning trial, convergence, retries, failures,
-  runtimes, and checkpoint/cache status; and
+  selected configurations, every tuning trial, and a bounded PU-Joint
+  rank/penalty trace with total shrinkage, residual/shared ratio, optimizer
+  message, and endpoint initializer diagnostics, followed by convergence,
+  retries, failures, runtimes, and checkpoint/cache status; and
 - the fixed heatmap-baseline selection and the resulting contrast table.
 
 The primary figures are:
 
 1. macro-AUPRC versus positive-label retention, both for the key PU/structured
    subset and for all fitted methods;
-2. a zero-centered gene-coverage by target-coverage heatmap of
-   `Brier(fixed baseline) - Brier(PU-MIRT)`, where one baseline is selected from
-   development-validation loss for the whole grid and never chosen per test
-   cell; and
-3. macro-AUPRC versus same-cell cross-panel prediction sensitivity for datasets
+2. macro-AUPRC versus realized gene coverage, with requested target coverage and
+   positive retention fixed at their anchors;
+3. macro-AUPRC versus realized target coverage, with requested gene coverage and
+   positive retention fixed at their anchors;
+4. a zero-centered gene-coverage by target-coverage heatmap of
+   `Brier(fixed external baseline) - Brier(PU-Joint)`. The external candidate
+   set is PU, GenEML-adapted, Inductive-PU-MC, and SAR-PU; a baseline is eligible
+   only with converged development results on the complete grid and is frozen
+   once for the whole heatmap. PU-MIRT is a structural ablation of PU-Joint and
+   neither proposed-family model is a baseline candidate; and
+5. macro-AUPRC versus same-cell cross-panel prediction sensitivity for datasets
    other than Projection-TAGs, or amplification-confirmed recall at the
    prespecified top-ranked budgets for Projection-TAGs.
 
@@ -251,4 +283,10 @@ Run a notebook from top to bottom in Python 3.10 or newer. The bootstrap uses an
 exact 40-character source commit and SHA256 source-tree hash, does not run
 `pip`, and does not modify the active environment. Checkpoints and complete
 exports remain under the configured `BASE_DIR`; the notebooks themselves stay
-clean and contain no executed result claims.
+clean and contain no executed result claims. New runs use
+`checkpoints/measurement_degradation_v2_compact`: small completed records are
+compressed in one SQLite index per logical store, while large fitted arrays use
+content-addressed compressed blobs plus a compact manifest index. Worker JSONL
+transport files are removed only after their normalized progress table and final
+manifest are safely exported. Legacy v1 checkpoints are neither deleted nor
+mixed into the v2 directory.

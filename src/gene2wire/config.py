@@ -140,8 +140,15 @@ class TuningConfig:
             raise ValueError("candidate_budget must be None or a positive integer")
         if not isinstance(self.include_endpoints, bool):
             raise ValueError("include_endpoints must be a boolean")
-        if self.strategy not in {"full_joint", "staged_rank_l2"}:
-            raise ValueError("strategy must be full_joint or staged_rank_l2")
+        if self.strategy not in {
+            "full_joint",
+            "staged_rank_l2",
+            "rank_top2_total_ratio",
+        }:
+            raise ValueError(
+                "strategy must be full_joint, staged_rank_l2, or "
+                "rank_top2_total_ratio"
+            )
         if self.metric != "observed_log_loss":
             raise ValueError("v0.1 supports observed_log_loss tuning only")
         if not self.ranks or any(
@@ -167,7 +174,7 @@ class TuningConfig:
         )
         if any(not _finite_number(x) or x < 0 for x in anchors):
             raise ValueError("anchor penalties must be finite and nonnegative")
-        if self.strategy == "staged_rank_l2" and (
+        if self.strategy in {"staged_rank_l2", "rank_top2_total_ratio"} and (
             self.anchor_shared_l2 not in self.shared_l2
             or self.anchor_residual_l2 not in self.residual_l2
             or self.anchor_target_l2 not in self.target_l2

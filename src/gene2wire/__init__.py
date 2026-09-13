@@ -4,6 +4,8 @@ from .adapters import load_npz_bundle, save_npz_bundle
 from .checkpoint import (
     AtomicArrayCheckpointStore,
     AtomicCheckpointStore,
+    CompactArrayCheckpointStore,
+    CompactCheckpointStore,
     experiment_fingerprint,
     hash_named_files,
     sha256_array,
@@ -13,13 +15,21 @@ from .checkpoint import (
 from .config import ExperimentConfig, FitConfig, ModelConfig, TuningConfig, load_config
 from .data import DatasetBundle
 from .metrics import BrierReport, brier_report, masked_brier, masked_log_loss
-from .models import FittedModel, UnifiedPUModel
+from .models import FittedModel, JointEndpointStarts, UnifiedPUModel
 from .runner import CORE_API_VERSION, GridRunResult, ModelRunResult, run_model_grid
-from .tuning import TrialResult, TuningResult, full_joint_candidates, tune_model
+from .tuning import (
+    TrialResult,
+    TuningResult,
+    candidate_search_plan,
+    full_joint_candidates,
+    tune_model,
+)
 
 __all__ = [
     "AtomicArrayCheckpointStore",
     "AtomicCheckpointStore",
+    "CompactArrayCheckpointStore",
+    "CompactCheckpointStore",
     "BrierReport",
     "CORE_API_VERSION",
     "DatasetBundle",
@@ -27,6 +37,7 @@ __all__ = [
     "FitConfig",
     "FittedModel",
     "GridRunResult",
+    "JointEndpointStarts",
     "ModelConfig",
     "ModelRunResult",
     "TrialResult",
@@ -34,6 +45,7 @@ __all__ = [
     "TuningResult",
     "UnifiedPUModel",
     "brier_report",
+    "candidate_search_plan",
     "experiment_fingerprint",
     "full_joint_candidates",
     "hash_named_files",

@@ -25,7 +25,7 @@ _spec = importlib.util.spec_from_file_location(
 _common = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_common)
 
-PROTOCOL_VERSION = "0912-v5-measurement-degradation"
+PROTOCOL_VERSION = "0912-v6-measurement-degradation"
 NAMES = (
     "simulation",
     "BARseq_A1",
@@ -51,14 +51,17 @@ from pathlib import Path
 import os
 
 # Shared scientific defaults. Change switches here before Run All.
+PROTOCOL_VERSION = '__PROTOCOL__'
 N_OUTER_FOLDS = 3
 USE_LOCATION = False
 USE_TARGET_FEATURES = False
 N_JOBS = 32
 PARALLEL_UNIT = 'scenario'
-N_REPETITIONS = 5  # Independent generated datasets per simulation sharing strength.
-N_PANEL_SEEDS = 5  # Panel-mask repeats within each real or generated dataset.
-STRATEGY = 'full_joint'
+# Fast exploratory defaults. Increase both for formal uncertainty estimates.
+N_REPETITIONS = 2  # Independent generated datasets per simulation sharing strength.
+N_PANEL_SEEDS = 2  # Panel-mask repeats within each real or generated dataset.
+# Explicit Joint search: rank screen -> top two ranks -> total/ratio refinement.
+STRATEGY = 'rank_top2_total_ratio'
 CANDIDATE_BUDGET = 32
 SEED = 20260912
 PAIRED_FRACTION = 0.20
@@ -66,12 +69,14 @@ CALIBRATION_FRACTIONS = (PAIRED_FRACTION,)
 
 # Per-assay coverage: 1.0 means every assay measures every available item.
 # These are coverage levels, not the legacy fixed-K pairwise-overlap levels.
-GENE_COVERAGES = (1.0, 5.0 / 6.0, 2.0 / 3.0, 0.50)
-TARGET_COVERAGES = (1.0, 2.0 / 3.0, 0.50)
-POSITIVE_RETENTIONS = (1.0, 0.75, 0.50, 0.25, 0.10)
-ANCHOR_GENE_COVERAGE = 2.0 / 3.0
-ANCHOR_TARGET_COVERAGE = 2.0 / 3.0
-ANCHOR_POSITIVE_RETENTION = 0.50
+GENE_COVERAGES = (1.0, 0.70, 0.40)
+TARGET_COVERAGES = (1.0, 0.70, 0.40)
+POSITIVE_RETENTIONS = (1.0, 0.70, 0.40, 0.10)
+# Anchors must be members of their grids. Integer panel sizes can make realized
+# coverage differ slightly; the preflight audit prints every realized value.
+ANCHOR_GENE_COVERAGE = 0.70
+ANCHOR_TARGET_COVERAGE = 0.70
+ANCHOR_POSITIVE_RETENTION = 0.40
 VIRTUAL_ASSAYS = ('A', 'B', 'C')
 HETEROGENEITY_DELTA = 1.0
 INCLUDE_MATCHED_UNIFORM_CONTROL = True
@@ -94,7 +99,7 @@ SHOW_FULL_DIAGNOSTICS = False
 BASE_DIR = Path(os.environ.get(
     'GENE2WIRE_PROJECT_DIR', '/home/yueyue/gene2wire')).expanduser()
 RAW_DATA_DIR = BASE_DIR / 'raw_data'
-CHECKPOINT_DIR = BASE_DIR / 'checkpoints' / 'measurement_degradation_v1'
+CHECKPOINT_DIR = BASE_DIR / 'checkpoints' / 'measurement_degradation_v2_compact'
 EXPORT_DIR = BASE_DIR / 'paper_figure_exports'
 FIGURE_DIR = BASE_DIR / 'figures' / 'measurement_degradation' / '__DATE__'
 CODE_CACHE_DIR = BASE_DIR / 'code'
@@ -120,6 +125,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from IPython.display import display
+from gene2wire import candidate_search_plan
 from gene2wire.experiments.measurement_experiment import (
     MeasurementConfig,
     preview_measurement_experiment,
@@ -128,6 +134,7 @@ from gene2wire.experiments.measurement_experiment import (
 )
 from gene2wire.experiments.measurement_plotting import (
     plot_accuracy_panel_sensitivity,
+    plot_coverage_auprc,
     plot_gene_target_brier_heatmap,
     plot_projection_tags_budget_recall,
     plot_retention_auprc,
@@ -138,7 +145,6 @@ from gene2wire.experiments.reporting import (
     display_diagnostics,
     load_existing_exports,
 )
-from gene2wire.tuning import full_joint_candidates
 
 if SHOW_FULL_DIAGNOSTICS:
     configure_full_display()
@@ -146,6 +152,7 @@ else:
     configure_compact_display()
 
 settings = Settings(
+    protocol_version=PROTOCOL_VERSION,
     n_outer_folds=N_OUTER_FOLDS,
     use_location=USE_LOCATION,
     use_target_features=USE_TARGET_FEATURES,
@@ -308,14 +315,35 @@ def preflight_measurement(dataset):
         display(tables['measurement_support_counts'])
 
     tuning = settings.tuning_config(features.X.shape[1], len(dataset.target_ids))
-    base_candidates = pd.DataFrame([{
-        'model': model.name,
-        'maximum_trials': tuning.candidate_budget,
-        'bounded_grid_candidates': len(full_joint_candidates(model, tuning)),
-        'eligible_structures': '; '.join(sorted({
-            candidate.kind for candidate in full_joint_candidates(model, tuning)
-        })),
-    } for model in settings.models()])
+    base_candidates = []
+    for model in settings.models():
+        plan = candidate_search_plan(model, tuning)
+        base_candidates.append({
+            'model': model.name,
+            'adaptive': plan['adaptive'],
+            'declared_native_budget': plan['declared_native_budget'],
+            'stage_policy': (
+                'rank_screen -> retain_top_2 -> total_shrinkage_ratio_refinement'
+                if plan['adaptive'] else 'bounded_declared_grid'
+            ),
+            'declared_rank_count': (
+                len({rank for rank in tuning.ranks if rank > 0})
+                if model.kind in ('lowrank', 'joint') else 0
+            ),
+            'rank_screen_candidates': plan['rank_screen_candidates'],
+            'retained_rank_count': plan['retained_ranks'],
+            'refinement_candidates': plan['refinement_candidates'],
+            'maximum_native_candidates': plan['maximum_native_candidates'],
+            'inherited_endpoint_count': plan['inherited_endpoint_candidates'],
+            'maximum_total_trials': plan['maximum_total_trials'],
+            'optimizer_starts_per_native_candidate': (
+                plan['optimizer_starts_per_native_candidate']
+            ),
+            'maximum_scored_candidate_start_paths': (
+                plan['maximum_scored_candidate_start_paths']
+            ),
+        })
+    base_candidates = pd.DataFrame(base_candidates)
     display(base_candidates)
     print('GenEML-adapted, Inductive-PU-MC and SAR-PU use the same candidate-budget ceiling; '
           'their realized trials and selected parameters are recorded in tuning.csv and selected.csv.')
@@ -397,7 +425,8 @@ def display_measurement_audits(artifacts, label):
             'rank', 'l2', 'lambda', 'penalty', 'propensity', 'exposure',
             'factor', 'iteration', 'converged', 'retry', 'objective',
             'structure', 'validation', 'trial', 'budget', 'maxiter',
-            'tolerance', 'message', 'status',
+            'tolerance', 'message', 'status', 'shrinkage', 'ratio',
+            'initializer', 'start',
         )
         identity = (
             'dataset', 'sharing_strength', 'condition_roles', 'mechanism',
@@ -413,7 +442,9 @@ def display_measurement_audits(artifacts, label):
     tuning = artifacts.tables.get('tuning', pd.DataFrame())
     if not tuning.empty and 'model' in tuning:
         important = tuning.loc[tuning['model'].isin(KEY_MEASUREMENT_MODELS)].copy()
-        groups = [column for column in ('model', 'condition_roles', 'mechanism') if column in important]
+        groups = [column for column in (
+            'model', 'condition_roles', 'mechanism', 'stage'
+        ) if column in important]
         if groups:
             important['validation_loss'] = pd.to_numeric(
                 important.get('validation_loss'), errors='coerce')
@@ -423,6 +454,27 @@ def display_measurement_audits(artifacts, label):
             ).reset_index()
             print('Recorded tuning trials for important models:')
             display(_balanced_model_table(summary))
+
+        joint_trace = important.loc[
+            important['model'].eq('PU-Joint')
+            & important.get(
+                'stage', pd.Series('', index=important.index)
+            ).isin(('rank', 'penalty'))
+        ].copy()
+        if not joint_trace.empty:
+            trace_columns = [column for column in (
+                'dataset', 'sharing_strength', 'condition_roles', 'mechanism',
+                'gene_coverage', 'target_coverage', 'positive_retention',
+                'repetition', 'outer_fold', 'model', 'stage', 'index', 'rank',
+                'shared_l2', 'residual_l2', 'total_shrinkage',
+                'residual_shared_ratio', 'validation_loss', 'converged',
+                'iterations', 'optimizer_message',
+            ) if column in joint_trace]
+            print(
+                'PU-Joint adaptive rank/penalty trace '
+                '(bounded view; complete rows remain in tuning.csv):'
+            )
+            display(_bounded_table(joint_trace.loc[:, trace_columns], limit=60))
 
     detection = artifacts.tables.get('detection', pd.DataFrame())
     if not detection.empty:
@@ -531,6 +583,65 @@ display(retention_figure_paths)
 '''
 
 
+COVERAGE_PLOTS = '''
+coverage_figure_paths = {}
+for label, artifacts in all_artifacts.items():
+    coverage = _role_rows(
+        artifacts.tables.get('per_repetition', pd.DataFrame()), 'coverage_heatmap')
+    required = {
+        'gene_requested_coverage', 'gene_coverage',
+        'target_requested_coverage', 'target_coverage',
+        'positive_retention', 'macro_auprc',
+    }
+    if coverage.empty or not required.issubset(coverage.columns):
+        raise RuntimeError(f'{label}: coverage-curve coordinates are missing or incomplete.')
+    for column in required:
+        coverage[column] = pd.to_numeric(coverage[column], errors='coerce')
+    saved_protocol = getattr(artifacts, 'manifest', {}).get('measurement_protocol', {})
+    saved_anchor_gene_coverage = float(saved_protocol.get(
+        'anchor_gene_coverage', ANCHOR_GENE_COVERAGE))
+    saved_anchor_target_coverage = float(saved_protocol.get(
+        'anchor_target_coverage', ANCHOR_TARGET_COVERAGE))
+    saved_anchor_retention = float(saved_protocol.get(
+        'anchor_retention', ANCHOR_POSITIVE_RETENTION))
+    common = coverage.loc[
+        np.isclose(coverage['positive_retention'], saved_anchor_retention)
+        & np.isfinite(coverage['macro_auprc'])
+    ].copy()
+    curve_specs = (
+        (
+            'gene',
+            common.loc[np.isclose(
+                common['target_requested_coverage'], saved_anchor_target_coverage)],
+            'gene_coverage',
+            f'gene coverage (requested target anchor={saved_anchor_target_coverage:g})',
+        ),
+        (
+            'target',
+            common.loc[np.isclose(
+                common['gene_requested_coverage'], saved_anchor_gene_coverage)],
+            'target_coverage',
+            f'target coverage (requested gene anchor={saved_anchor_gene_coverage:g})',
+        ),
+    )
+    for dimension, curve, coverage_col, subtitle in curve_specs:
+        curve = curve.loc[np.isfinite(curve[coverage_col])]
+        if curve.empty:
+            raise RuntimeError(
+                f'{label}: no finite {dimension}-coverage curve rows at the saved anchors.')
+        for group_label, group in _plot_groups(curve):
+            figure, axis = plot_coverage_auprc(
+                group, coverage_col=coverage_col,
+                key_models=KEY_MEASUREMENT_MODELS,
+                title=(f'{label} ({group_label}) — {subtitle}; '
+                       f'retention={saved_anchor_retention:g}'))
+            suffix = f'{group_label}_{dimension}_coverage_macro_auprc_key'
+            coverage_figure_paths[(label, group_label, dimension)] = _save_show(
+                figure, label, suffix)
+display(coverage_figure_paths)
+'''
+
+
 HEATMAP_PLOTS = '''
 heatmap_figure_paths = {}
 for label, artifacts in all_artifacts.items():
@@ -551,7 +662,7 @@ for label, artifacts in all_artifacts.items():
         raise RuntimeError(f'{label}: no native-reference coverage-heatmap metrics were recorded.')
     for group_label, group in _plot_groups(heatmap):
         figure, axis = plot_gene_target_brier_heatmap(
-            group, baseline_model=baseline_model, comparison_model='PU-MIRT',
+            group, baseline_model=baseline_model, comparison_model='PU-Joint',
             title=f'{label} ({group_label}) — fixed {baseline_model} contrast')
         suffix = f'{group_label}_gene_target_brier_heatmap'
         heatmap_figure_paths[(label, group_label)] = _save_show(figure, label, suffix)
@@ -830,7 +941,8 @@ def notebook(name: str, commit: str, source_hash: str, date_suffix=None):
     if name == "Projection_TAGs":
         modules.append("openpyxl")
     config = (
-        CONFIG.replace("__DATE__", date_suffix)
+        CONFIG.replace("__PROTOCOL__", PROTOCOL_VERSION)
+        .replace("__DATE__", date_suffix)
         .replace("__COMMIT__", commit)
         .replace("__HASH__", source_hash)
         .replace("__EXPORT_DIRS__", repr({label: None}))
@@ -848,7 +960,11 @@ def notebook(name: str, commit: str, source_hash: str, date_suffix=None):
         `GENE_COVERAGES` and `TARGET_COVERAGES` are **per-assay coverage**, not pairwise
         overlap. At coverage 1.0, A, B and C each measure every available item. Thus BARseq
         uses all 23 genes per assay at 1.0; the earlier fixed-eight-gene 100%-overlap endpoint
-        is not reused.
+        is not reused. Requested target coverage 0.40 is an explicit stress level, not a
+        bridge-complete design guarantee. Integer rounding and native availability in small-T
+        data (notably BARseq A1 with T=11 and MERGE-seq with T=5) can yield
+        `graph_connected=False`; the mask is not redrawn to force connectivity. Preflight and
+        exported support tables report the realized coverage and graph status.
 
         Gene and target panels share the same nested, union-preserving cyclic generator, but
         their downstream meanings differ. Missing genes are masked before train-only scaling
@@ -874,7 +990,10 @@ def notebook(name: str, commit: str, source_hash: str, date_suffix=None):
         PU-Joint and the full retained benchmark suite use the same split, observed masks,
         paired-reference budget and candidate ceiling. This family additionally enables
         GenEML-adapted, Inductive-PU-MC and SAR-PU. The `-adapted` label is retained until the
-        Python 3 port is validated as implementation-equivalent to the historical GenEML code."""),
+        Python 3 port is validated as implementation-equivalent to the historical GenEML code.
+        `rank_top2_total_ratio` explicitly screens declared Joint ranks, retains the two best
+        distinct converged ranks using development validation, and allocates the remaining
+        native budget across total-shrinkage and residual/shared-ratio coordinates."""),
         ("code", SETTINGS),
         ("markdown", """## CPU allocation and live workers
 
@@ -914,13 +1033,24 @@ def notebook(name: str, commit: str, source_hash: str, date_suffix=None):
 
         Both panels use native-reference test entries. The key view names the three established
         PU models and the three new comparators; the full view retains every fitted benchmark.
-        All five retention levels are shown and simulation is separated by sharing strength."""),
+        All four retention levels are shown and simulation is separated by sharing strength."""),
         ("code", RETENTION_PLOTS),
+        ("markdown", """## Gene-coverage and target-coverage degradation curves
+
+        Both plots use native-reference Macro-AUPRC at the configured anchor retention. The
+        gene-coverage curve fixes requested target coverage at its anchor; the target-coverage
+        curve fixes requested gene coverage at its anchor. Their x axes use realized coverage,
+        so integer panel-size rounding remains visible instead of being relabelled as requested
+        coverage. Only the six key deployable methods are shown to keep this diagnostic compact."""),
+        ("code", COVERAGE_PLOTS),
         ("markdown", """## Joint gene-coverage × target-coverage heatmap
 
-        One baseline is selected using development validation loss over the whole grid, then
-        frozen. Positive color values mean `Brier(fixed baseline) - Brier(PU-MIRT) > 0` and
-        therefore favor PU-MIRT. No baseline is selected cell-by-cell or from test metrics."""),
+        One external baseline is selected using development validation loss over the whole grid,
+        then frozen. PU-MIRT is a PU-Joint structural ablation, so neither PU-MIRT nor PU-Joint
+        is eligible to be the fixed-baseline candidate. Positive color values mean
+        `Brier(fixed external baseline) - Brier(PU-Joint) > 0` and therefore favor PU-Joint.
+        A baseline must have converged results for the complete development grid; none is
+        selected cell-by-cell or from test metrics."""),
         ("code", HEATMAP_PLOTS),
         ("markdown", (
             "## Amplification-confirmed recovery at fixed budgets\n\n"
@@ -930,7 +1060,8 @@ def notebook(name: str, commit: str, source_hash: str, date_suffix=None):
             if name == "Projection_TAGs" else
             "## Accuracy versus cross-panel prediction sensitivity\n\n"
             "Macro-AUPRC is paired with the same-cell prediction change across independently "
-            "drawn gene panels at full target coverage and 50% positive retention. The plot "
+            "drawn gene panels at full target coverage and the configured anchor retention "
+            "(40% by default). The plot "
             "selects the realized anchor gene coverage before comparing models. Lower sensitivity "
             "means more stable predictions. This table uses fixed native-reference pairs and "
             "never treats mask repetitions as animals."
@@ -940,9 +1071,11 @@ def notebook(name: str, commit: str, source_hash: str, date_suffix=None):
 
         The visible report includes exact panel/support audits, important-model metrics,
         PU-MIRT/PU-Joint/new-comparator selected settings, candidate counts, detector/propensity
-        checks, convergence/retry/boundary evidence and every failure count. Complete tuning,
-        per-target, per-group, reliability, checkpoint and prediction records remain exported;
-        no failed grid cell is silently omitted."""),
+        checks, convergence/retry/boundary evidence and every failure count. The bounded
+        PU-Joint trace exposes rank screening, penalty refinement, total shrinkage,
+        residual/shared ratio, and optimizer/initializer messages. Complete tuning, per-target,
+        per-group, reliability, checkpoint and prediction records remain exported; no failed
+        grid cell is silently omitted."""),
         ("code", RESULT_AUDIT),
         ("markdown", "## Display bounded shared and measurement-specific reports"),
         ("code", DIAGNOSTICS),

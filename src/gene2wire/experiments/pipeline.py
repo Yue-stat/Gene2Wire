@@ -18,7 +18,7 @@ from joblib import Parallel, delayed, parallel_config
 from scipy.stats import t as student_t
 from threadpoolctl import threadpool_limits
 
-from ..checkpoint import AtomicCheckpointStore, sha256_array, sha256_file
+from ..checkpoint import CompactCheckpointStore, sha256_array, sha256_file
 from ..data import DatasetBundle
 from ..runner import run_model_grid
 from ..seeds import stable_seed
@@ -646,7 +646,11 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                                      "stage": trial.stage, "index": trial.index,
                                      "validation_loss": trial.validation_loss,
                                      "converged": trial.converged, "iterations": trial.iterations,
-                                     "seed": trial.seed} for trial in model_result.tuning.trials)
+                                     "seed": trial.seed,
+                                     "total_shrinkage": trial.total_shrinkage,
+                                     "residual_shared_ratio": trial.residual_shared_ratio,
+                                     "optimizer_message": trial.optimizer_message}
+                                    for trial in model_result.tuning.trials)
         primary = scenario["analysis"] == "primary"
         if primary and settings.run_information_controls and not assay_only:
             pu_models = {model.name: model for model in settings.models() if model.pu}
@@ -675,7 +679,11 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                                              "stage": trial.stage, "index": trial.index,
                                              "validation_loss": trial.validation_loss,
                                              "converged": trial.converged, "iterations": trial.iterations,
-                                             "seed": trial.seed} for trial in control.tuning.trials)
+                                             "seed": trial.seed,
+                                             "total_shrinkage": trial.total_shrinkage,
+                                             "residual_shared_ratio": trial.residual_shared_ratio,
+                                             "optimizer_message": trial.optimizer_message}
+                                            for trial in control.tuning.trials)
         # Rescaling is only defined here for target-constant detection mechanisms.
         if scenario["mechanism"] in ("scar", "target_sar") and "Logistic" in result.models:
             q = result.models["Logistic"].latent_probability
@@ -822,6 +830,8 @@ def _load_unit_result(store, key, run_id, export_path):
     if cached is None:
         return None
     payload = cached["payload"]
+    if payload.get("run_id", run_id) != run_id:
+        raise ValueError("scenario checkpoint run identity does not match")
     # A complete summary is reusable only while its predictions/audits exist
     # unchanged. Missing exports can be rebuilt from the finer model caches.
     for relative, digest in payload["artifact_hashes"].items():
@@ -856,10 +866,14 @@ def _run_checkpointed_fold(prepared, repetition, settings, checkpoint_dir,
             files.extend((export_path / "units" / fingerprint({**prefix, **scenario})).glob("*"))
         numeric = {name: list(pd.DataFrame(rows).select_dtypes(include="number").columns)
                    for name, rows in tables.items()}
-        payload = {"tables": tables, "numeric_columns": numeric,
+        payload = {"checkpoint_schema": 2, "run_id": run_id,
+                   "source_hash": fit_version.split(":", 1)[0],
+                   "protocol_hash": fingerprint(settings.scientific_dict()),
+                   "fit_version_hash": fingerprint(fit_version),
+                   "tables": tables, "numeric_columns": numeric,
                    "artifact_hashes": {p.relative_to(export_path).as_posix(): sha256_file(p)
                                        for p in files if p.is_file()}}
-        store = AtomicCheckpointStore(Path(checkpoint_dir) / "experiment_units" / run_id)
+        store = CompactCheckpointStore(Path(checkpoint_dir) / "experiment_units" / run_id)
         store.save_complete(key, run_id, jsonable(payload))
     writer({"event": "unit_complete", "elapsed_seconds": time.monotonic()-started,
             "failed_scenarios": len(tables["failures"])})
@@ -936,6 +950,13 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
         input_identities.append({"name": dataset.name,
             "repetition": dataset.metadata.get("experiment_repetition", dataset.metadata.get("repetition")),
             "experiment_context": dataset.metadata.get("experiment_context", {}),
+            # Scenario declarations are scientific inputs, not reporting-only
+            # metadata.  In particular, measurement-degradation anchors and
+            # control switches can change this schedule without changing any
+            # feature or label array.  Include the canonical declaration in
+            # the run identity so those runs cannot share an export directory
+            # or completed-unit summaries.
+            "declared_scenarios": dataset.metadata.get("measurement_scenarios"),
             "model_seed": dataset.metadata.get("model_seed"),
             "model_allowlist": dataset.metadata.get("model_allowlist"),
             "evaluation": None if dataset.evaluation is None else {
@@ -984,12 +1005,20 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
     manifest.update(manifest_extra or {})
     export_path.mkdir(parents=True, exist_ok=True)
     manifest.update(run_id=run_id, requested_n_jobs=settings.n_jobs, completed=False,
-                    checkpoint_dir=str(Path(checkpoint_dir).resolve()))
+                    checkpoint_dir=str(Path(checkpoint_dir).resolve()),
+                    checkpoint_schema="compact-v2",
+                    checkpoint_layout={
+                        "small_records": "context-sharded SQLite + zlib",
+                        "numeric_records": "shared content-addressed NPZ + SQLite manifest",
+                        "scenario_summaries": "run-level SQLite + zlib",
+                        "raw_progress_events": "retained on failure; removed after completed export",
+                        "legacy_read": True,
+                    })
     atomic_json(manifest, export_path / "manifest.json")
     # Every completed-summary checkpoint is a fold/repetition/scenario unit,
     # independently of how those units are grouped for scheduling. The default
     # exposes loss rates to the outer process pool without nesting parallelism.
-    store = AtomicCheckpointStore(Path(checkpoint_dir) / "experiment_units" / run_id)
+    store = CompactCheckpointStore(Path(checkpoint_dir) / "experiment_units" / run_id)
     results, pending, inventory, evaluation_plan = [], [], [], []
     for fold_group, (prepared, repetition) in enumerate(contexts):
         planned_models = _planned_models(prepared, settings)
@@ -1088,6 +1117,19 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
                     unknown_fit_model_evaluations=relay.unknown_units,
                     metric_rows=len(tables["metrics"]), table_files=[f"{name}.csv" for name in tables])
     atomic_json(manifest, export_path / "manifest.json")
+    # Worker JSONL files are only a transient transport. Their normalized
+    # contents now exist in progress_events.csv and the completed manifest has
+    # been committed, so retaining a fresh UUID directory after every rerun
+    # would duplicate diagnostics. If aggregation/export failed above, this
+    # cleanup is never reached and the raw events remain available. Cleanup is
+    # best-effort because a filesystem race must not invalidate completed
+    # scientific outputs.
+    try:
+        for event_file in event_dir.glob("*.jsonl"):
+            event_file.unlink()
+        event_dir.rmdir()
+    except OSError:
+        pass
     print(f"All results exported to: {export_path}")
     if len(tables["failures"]):
         print(f"Calibration not estimable in {len(tables['failures'])} units; see failures.csv. Do not omit these from reporting.")
@@ -1142,7 +1184,7 @@ def _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
     from dataclasses import replace
     from .qiao import (QiaoFit, fit_qiao, qiao_candidate_grid,
                        qiao_model_names, qiao_target_inputs)
-    from ..checkpoint import AtomicArrayCheckpointStore, unit_key
+    from ..checkpoint import CompactArrayCheckpointStore, unit_key
     # Sensitivities are intentionally not inputs to these observed-label fits.
     del tuning_e, final_e
     train, validation, test = prepared.fold.train_rows, prepared.fold.validation_rows, prepared.fold.test_rows
@@ -1159,7 +1201,7 @@ def _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
                                      y, yr, penalties=settings.penalties,
                                      candidate_budget=settings.candidate_budget)
     budget = min(settings.candidate_budget, 32)
-    store = AtomicArrayCheckpointStore(Path(checkpoint_dir) / "qiao")
+    store = CompactArrayCheckpointStore(Path(checkpoint_dir) / "qiao")
     versions = {package: importlib.metadata.version(package) for package in ("numpy", "scipy")}
     code_hash = source_hash()
     cell_ids = np.asarray(prepared.cell_ids, dtype=str)
@@ -1202,7 +1244,11 @@ def _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
                     arrays["target_features"], config["objective"], config["rank"], config["l2"],
                     stats["converged"], stats["iterations"], stats["objective_value"],
                     stats["optimizer_message"], stats["n_measured"])
-                return fitted, arrays["prediction"], arrays["ranking_score"], True, identity
+                probability = fitted.predict_proba(prediction_x)
+                ranking_score = fitted.predict_score(prediction_x)
+                if config["objective"] == "logit":
+                    ranking_score = probability
+                return fitted, probability, ranking_score, True, identity
             fitted = fit_qiao(x, target, d, w, **config, seed=seed, maxiter=maxiter,
                               tolerance=settings.tolerance,
                               init_direct_maxiter=settings.init_direct_maxiter,
@@ -1217,8 +1263,7 @@ def _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
                      "n_measured": fitted.n_measured, "seed": seed,
                      "maxiter": maxiter, "continued": initial is not None}
             store.save_complete(key, identity, stats,
-                {"prediction": probability, "ranking_score": ranking_score,
-                 "cell_loading": fitted.cell_loading, "target_loading": fitted.target_loading,
+                {"cell_loading": fitted.cell_loading, "target_loading": fitted.target_loading,
                  "target_intercept": fitted.target_intercept, "target_features": target})
             return fitted, probability, ranking_score, False, identity
 
@@ -1314,7 +1359,7 @@ def _run_pu_comparators(prepared, observed, tuning_e, final_e, settings, context
     from dataclasses import fields as dataclass_fields
 
     from ..candidate_design import select_balanced_candidates
-    from ..checkpoint import AtomicArrayCheckpointStore, unit_key
+    from ..checkpoint import CompactArrayCheckpointStore, unit_key
     from ..config import ModelConfig
     from .pu_comparators import (
         AssayTargetPropensityEncoder,
@@ -1443,7 +1488,7 @@ def _run_pu_comparators(prepared, observed, tuning_e, final_e, settings, context
         _model_seed_coordinate(prepared, context.get("repetition")),
         context.get("outer_fold"),
     )
-    store = (None if checkpoint_dir is None else AtomicArrayCheckpointStore(
+    store = (None if checkpoint_dir is None else CompactArrayCheckpointStore(
         Path(checkpoint_dir) / "pu_comparators"))
     versions = {
         package: importlib.metadata.version(package)

@@ -10,6 +10,7 @@ import pytest
 from gene2wire.experiments.measurement_plotting import (
     KEY_MODELS,
     plot_accuracy_panel_sensitivity,
+    plot_coverage_auprc,
     plot_gene_target_brier_heatmap,
     plot_projection_tags_budget_recall,
     plot_retention_auprc,
@@ -57,6 +58,55 @@ def test_retention_plot_rejects_unknown_mode_and_invalid_probabilities():
     bad = table.assign(retention=1.5)
     with pytest.raises(ValueError, match=r"lie in \[0, 1\]"):
         plot_retention_auprc(bad)
+
+
+def test_coverage_plot_averages_repetitions_and_leaves_y_axis_data_scaled():
+    rows = []
+    for repetition in (0, 1):
+        for coverage in (.4, .7, 1.0):
+            for model, offset in (("PU", 0.0), ("PU-Joint", .015),
+                                  ("Logistic", -.02)):
+                rows.append({
+                    "repetition": repetition,
+                    "gene_coverage": coverage,
+                    "model": model,
+                    "macro_auprc": .25 + .1 * coverage + offset + .01 * repetition,
+                })
+    table = pd.DataFrame(rows)
+
+    figure, axis = plot_coverage_auprc(
+        table, coverage_col="gene_coverage", coverage_label="Gene coverage"
+    )
+    assert [line.get_label() for line in axis.lines] == ["PU", "PU-Joint"]
+    pu = next(line for line in axis.lines if line.get_label() == "PU")
+    np.testing.assert_allclose(pu.get_xdata(), [.4, .7, 1.0])
+    np.testing.assert_allclose(pu.get_ydata(), [.295, .325, .355])
+    assert axis.get_xlabel() == "Gene coverage"
+    assert axis.get_xlim() == (0.0, 1.0)
+    assert axis.get_ylim()[0] > 0.0
+    plt.close(figure)
+
+    figure, axis = plot_coverage_auprc(
+        table, coverage_col="gene_coverage", mode="full"
+    )
+    assert {line.get_label() for line in axis.lines} == {
+        "Logistic", "PU", "PU-Joint"
+    }
+    plt.close(figure)
+
+
+def test_coverage_plot_rejects_invalid_coverage_and_empty_model_subset():
+    table = pd.DataFrame({
+        "target_coverage": [.7], "model": ["PU"], "macro_auprc": [.3]
+    })
+    with pytest.raises(ValueError, match=r"lie in \[0, 1\]"):
+        plot_coverage_auprc(
+            table.assign(target_coverage=1.1), coverage_col="target_coverage"
+        )
+    with pytest.raises(ValueError, match="none of the requested"):
+        plot_coverage_auprc(
+            table, coverage_col="target_coverage", key_models=("PU-Joint",)
+        )
 
 
 def test_brier_heatmap_uses_one_fixed_baseline_and_zero_centered_scale():

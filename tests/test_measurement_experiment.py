@@ -88,6 +88,19 @@ def _settings(**updates) -> Settings:
     return Settings(**values)
 
 
+def test_fast_measurement_defaults_are_the_declared_protocol_grid():
+    config = MeasurementConfig()
+    assert config.gene_coverages == (1.0, 0.7, 0.4)
+    assert config.target_coverages == (1.0, 0.7, 0.4)
+    assert config.retentions == (1.0, 0.7, 0.4, 0.1)
+    assert (
+        config.anchor_gene_coverage,
+        config.anchor_target_coverage,
+        config.anchor_retention,
+    ) == (0.7, 0.7, 0.4)
+    assert config.n_panel_seeds == 2
+
+
 def _full_config() -> MeasurementConfig:
     return MeasurementConfig(
         gene_coverages=(1.0,),
@@ -368,6 +381,64 @@ def test_condition_registry_deduplicates_coordinates_and_merges_roles():
         assert len(keys) == len(set(keys))
         np.testing.assert_array_equal(
             pipeline._fit_measured(prepared), view.training_measured)
+
+
+def test_declared_measurement_scenarios_are_part_of_run_identity(tmp_path):
+    """Changing only the scenario schedule must select a new export run."""
+
+    dataset = _dataset()
+    identity_folds = (
+        Fold(0, np.arange(22, 38), np.arange(38, 45), np.arange(0, 22)),
+        Fold(1, np.arange(0, 15), np.arange(15, 22), np.arange(22, 45)),
+    )
+    dataset = replace(
+        dataset,
+        split_builder=lambda n_outer_folds, seed: identity_folds,
+    )
+    settings = _settings(maxiter=100, retry_maxiter=200, init_direct_maxiter=100)
+    common = dict(
+        gene_coverages=(1.0,),
+        target_coverages=(1.0,),
+        retentions=(1.0, 0.5),
+        anchor_gene_coverage=1.0,
+        anchor_target_coverage=1.0,
+        anchor_retention=1.0,
+        include_natural_recovery=False,
+        n_panel_seeds=1,
+    )
+    without_control = MeasurementConfig(
+        **common, include_matched_uniform=False)
+    with_control = MeasurementConfig(
+        **common, include_matched_uniform=True)
+    first_views, _ = build_measurement_views(
+        dataset, settings, without_control, repetition=0)
+    second_views, _ = build_measurement_views(
+        dataset, settings, with_control, repetition=0)
+
+    # The feature/target design is deliberately unchanged; only the declared
+    # mechanism-control schedule differs.
+    assert len(first_views) == len(second_views) == 1
+    np.testing.assert_array_equal(
+        first_views[0].training_measured, second_views[0].training_measured)
+    assert (
+        first_views[0].metadata["measurement_scenarios"]
+        != second_views[0].metadata["measurement_scenarios"]
+    )
+
+    first = pipeline._execute(
+        first_views, settings,
+        checkpoint_dir=tmp_path / "checkpoints",
+        export_dir=tmp_path / "exports",
+        progress=False,
+    )
+    second = pipeline._execute(
+        second_views, settings,
+        checkpoint_dir=tmp_path / "checkpoints",
+        export_dir=tmp_path / "exports",
+        progress=False,
+    )
+    assert first.manifest["run_id"] != second.manifest["run_id"]
+    assert first.export_dir != second.export_dir
 
 
 def test_paired_reference_budget_is_stratified_by_biology_and_virtual_assay():

@@ -54,6 +54,7 @@ class _DirectWarmStartKey:
     target_l2: float
     nuisance_l2: float
     maxiter: int
+    retry_maxiter: int
     tolerance: float
     n_features: int
     n_targets: int
@@ -529,6 +530,40 @@ class FittedModel:
         )
 
 
+@dataclass(frozen=True)
+class JointEndpointStarts:
+    """Converged endpoint fits used for deterministic Joint multi-start.
+
+    Both fits must have been trained on exactly the data passed to the Joint
+    fit.  The orchestration layer is responsible for that provenance boundary;
+    :class:`UnifiedPUModel` validates all parameter and feature schemas that a
+    fitted state carries.  Supplying fitted states, rather than only tuned
+    configurations, makes the two advertised starts real endpoint solutions.
+    """
+
+    direct: FittedModel
+    lowrank: FittedModel
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.direct, FittedModel) or not isinstance(
+            self.lowrank, FittedModel
+        ):
+            raise TypeError("Joint endpoint starts must be fitted models")
+        if canonical_model_config(self.direct.config).kind != "direct":
+            raise ValueError("Joint direct endpoint start must be a direct fit")
+        if canonical_model_config(self.lowrank.config).kind != "lowrank":
+            raise ValueError("Joint low-rank endpoint start must be a lowrank fit")
+        for label, fitted in (("direct", self.direct), ("low-rank", self.lowrank)):
+            if not fitted.converged:
+                raise RuntimeError(
+                    f"Joint {label} endpoint initializer did not converge"
+                )
+            if not np.isfinite(fitted.objective):
+                raise FloatingPointError(
+                    f"Joint {label} endpoint initializer has a non-finite objective"
+                )
+
+
 class UnifiedPUModel:
     """Fit one canonical projection model with a shared likelihood.
 
@@ -555,10 +590,14 @@ class UnifiedPUModel:
         config: ModelConfig,
         fit_config: FitConfig | None = None,
         warm_start_cache: DirectWarmStartCache | None = None,
+        joint_endpoint_starts: JointEndpointStarts | None = None,
     ):
         self.config = canonical_model_config(config)
         self.fit_config = fit_config or FitConfig()
         self.warm_start_cache = warm_start_cache
+        if joint_endpoint_starts is not None and self.config.kind != "joint":
+            raise ValueError("Joint endpoint starts require kind='joint'")
+        self.joint_endpoint_starts = joint_endpoint_starts
         self.fitted_: FittedModel | None = None
 
     def fit(self, data: DatasetBundle, exposure: Any = 1.0, seed: int = 0) -> FittedModel:
@@ -598,20 +637,105 @@ class UnifiedPUModel:
                 f"{rank_cap}"
             )
 
-        theta0 = self._initialize(
-            x, s, w, e, target_features, seed, nuisance=nuisance,
-            lowrank_feature_indices=lowrank_feature_indices,
-        )
-
         def fun(theta: Array) -> tuple[float, Array]:
             return self._objective_gradient(
                 theta, x, s, w, e, target_features, nuisance,
                 lowrank_feature_indices,
             )
 
+        if self.joint_endpoint_starts is None:
+            starts = ((
+                self.fit_config.initialization,
+                self._initialize(
+                    x, s, w, e, target_features, seed, nuisance=nuisance,
+                    lowrank_feature_indices=lowrank_feature_indices,
+                ),
+            ),)
+        else:
+            starts = self._joint_endpoint_initializers(
+                x,
+                n_targets,
+                target_features,
+                nuisance,
+                nuisance_names,
+                lowrank_feature_indices,
+            )
+
+        outcomes: list[tuple[str, Any, int, bool]] = []
+        failures: list[str] = []
+        for label, theta0 in starts:
+            try:
+                result, start_iterations, retried = self._minimize_from_start(
+                    fun, theta0
+                )
+            except FloatingPointError as error:
+                failures.append(f"{label}: {error}")
+                continue
+            outcomes.append((label, result, start_iterations, retried))
+        if not outcomes:
+            details = "; ".join(failures) if failures else "no starts were supplied"
+            raise FloatingPointError(
+                f"all {self.config.name} optimizer starts failed: {details}"
+            )
+
+        # A converged solution always outranks a non-converged one.  If all
+        # starts exhaust the declared retry, retain the best finite result so
+        # the tuner can record a failed candidate rather than disguising it as
+        # converged.  It is not selectable under the core tuning policy.
+        converged = [outcome for outcome in outcomes if bool(outcome[1].success)]
+        eligible = converged or outcomes
+        label, result, _, selected_retried = min(
+            eligible, key=lambda outcome: (float(outcome[1].fun), outcome[0])
+        )
+        iterations = sum(outcome[2] for outcome in outcomes)
+        diagnostics = ", ".join(
+            f"{start_label}={'ok' if start_result.success else 'failed'}"
+            f"/{float(start_result.fun):.12g}"
+            f"{'/retry' if start_retried else ''}"
+            for start_label, start_result, _, start_retried in outcomes
+        )
+        if failures:
+            diagnostics = ", ".join((diagnostics, *failures))
+        b_shared, a_shared, residual, target_coeff, nuisance_coeff, intercept = self._unpack(
+            result.x, n_features, n_targets, n_target_features, n_nuisance,
+            len(lowrank_feature_indices),
+        )
+        fitted = FittedModel(
+            config=self.config,
+            cell_shared=b_shared,
+            target_shared=a_shared,
+            residual=residual,
+            target_coeff=target_coeff,
+            target_features=target_features if self.config.use_target_features else None,
+            nuisance_coeff=nuisance_coeff,
+            nuisance_names=nuisance_names,
+            intercept=intercept,
+            objective=float(result.fun),
+            converged=bool(result.success),
+            iterations=iterations,
+            message=(
+                f"initializer={label}; starts=[{diagnostics}]; "
+                + ("deterministic continuation: " if selected_retried else "")
+                + str(result.message)
+            ),
+            lowrank_feature_indices=lowrank_feature_indices,
+        )
+        self.fitted_ = fitted
+        return fitted
+
+    def _minimize_from_start(
+        self,
+        fun: Callable[[Array], tuple[float, Array]],
+        theta0: Array,
+    ) -> tuple[Any, int, bool]:
+        """Run one declared optimizer path and its deterministic continuation."""
+
+        initial = np.asarray(theta0, dtype=np.float64)
+        if initial.ndim != 1 or not np.all(np.isfinite(initial)):
+            raise ValueError("optimizer initializer must be a finite 1-D array")
         result = minimize(
             fun,
-            theta0,
+            initial,
             method="L-BFGS-B",
             jac=True,
             options={
@@ -632,7 +756,10 @@ class UnifiedPUModel:
             # Continue from the same solution, with the same objective and
             # tolerance.  Never change a penalty or seed to obtain convergence.
             retry = minimize(
-                fun, result.x, method="L-BFGS-B", jac=True,
+                fun,
+                result.x,
+                method="L-BFGS-B",
+                jac=True,
                 options={
                     "maxiter": self.fit_config.retry_maxiter,
                     "ftol": self.fit_config.tolerance,
@@ -646,28 +773,206 @@ class UnifiedPUModel:
                 result = retry
         if not np.isfinite(result.fun) or not np.all(np.isfinite(result.x)):
             raise FloatingPointError("optimizer produced non-finite parameters")
-        b_shared, a_shared, residual, target_coeff, nuisance_coeff, intercept = self._unpack(
-            result.x, n_features, n_targets, n_target_features, n_nuisance,
-            len(lowrank_feature_indices),
+        return result, iterations, retried
+
+    def _joint_endpoint_initializers(
+        self,
+        x: Array,
+        n_targets: int,
+        target_features: Array | None,
+        nuisance: Array | None,
+        nuisance_names: tuple[str, ...],
+        lowrank_feature_indices: tuple[tuple[int, ...], ...],
+    ) -> tuple[tuple[str, Array], ...]:
+        """Embed the two fitted endpoints as prediction-preserving Joint starts."""
+
+        if self.config.kind != "joint" or self.joint_endpoint_starts is None:
+            raise RuntimeError("Joint endpoint initialization requires a Joint fit")
+        if lowrank_feature_indices:
+            raise ValueError("ordinary Joint endpoint starts do not support grouped factors")
+
+        direct = self._validated_joint_endpoint(
+            "direct",
+            self.joint_endpoint_starts.direct,
+            x,
+            n_targets,
+            target_features,
+            nuisance,
+            nuisance_names,
         )
-        fitted = FittedModel(
-            config=self.config,
-            cell_shared=b_shared,
-            target_shared=a_shared,
-            residual=residual,
-            target_coeff=target_coeff,
-            target_features=target_features if self.config.use_target_features else None,
-            nuisance_coeff=nuisance_coeff,
-            nuisance_names=nuisance_names,
-            intercept=intercept,
-            objective=float(result.fun),
-            converged=bool(result.success),
-            iterations=iterations,
-            message=("deterministic continuation: " if retried else "") + str(result.message),
-            lowrank_feature_indices=lowrank_feature_indices,
+        lowrank = self._validated_joint_endpoint(
+            "low-rank",
+            self.joint_endpoint_starts.lowrank,
+            x,
+            n_targets,
+            target_features,
+            nuisance,
+            nuisance_names,
         )
-        self.fitted_ = fitted
+
+        starts = []
+        for label, fitted, coefficient in (
+            ("direct_endpoint", direct, direct.residual),
+            (
+                "lowrank_endpoint",
+                lowrank,
+                lowrank.cell_shared @ lowrank.target_shared.T,
+            ),
+        ):
+            assert coefficient is not None
+            if label == "lowrank_endpoint" and (
+                lowrank.cell_shared.shape[1] == self.config.rank
+            ):
+                # Preserve the tuned low-rank parameterization exactly when it
+                # already has the candidate rank.
+                cell_shared = np.array(lowrank.cell_shared, copy=True)
+                target_shared = np.array(lowrank.target_shared, copy=True)
+            else:
+                cell_shared, target_shared = self._deterministic_factorization(
+                    coefficient, self.config.rank
+                )
+            # Keeping the coefficient remainder in C makes each start reproduce
+            # its fitted endpoint logits exactly, even when endpoint and Joint
+            # ranks differ.  For a matching low-rank rank this is numerical zero.
+            residual = coefficient - cell_shared @ target_shared.T
+            theta = self._pack(
+                cell_shared,
+                target_shared,
+                residual,
+                None
+                if fitted.target_coeff is None
+                else np.array(fitted.target_coeff, copy=True),
+                None
+                if fitted.nuisance_coeff is None
+                else np.array(fitted.nuisance_coeff, copy=True),
+                np.array(fitted.intercept, copy=True),
+            )
+            if not np.all(np.isfinite(theta)):
+                raise FloatingPointError(
+                    f"{label} produced a non-finite Joint initializer"
+                )
+            starts.append((label, theta))
+        return tuple(starts)
+
+    def _validated_joint_endpoint(
+        self,
+        label: str,
+        fitted: FittedModel,
+        x: Array,
+        n_targets: int,
+        target_features: Array | None,
+        nuisance: Array | None,
+        nuisance_names: tuple[str, ...],
+    ) -> FittedModel:
+        """Validate an endpoint state against the current truth-free schema."""
+
+        config = canonical_model_config(fitted.config)
+        expected_kind = "direct" if label == "direct" else "lowrank"
+        if config.kind != expected_kind:
+            raise ValueError(f"Joint {label} endpoint has the wrong model kind")
+        if config.pu != self.config.pu:
+            raise ValueError(f"Joint {label} endpoint PU setting differs")
+        if config.use_target_features != self.config.use_target_features:
+            raise ValueError(
+                f"Joint {label} endpoint target-feature setting differs"
+            )
+        if config.nuisance_l2 != self.config.nuisance_l2:
+            raise ValueError(f"Joint {label} endpoint nuisance_l2 differs")
+        if config.lowrank_feature_groups or fitted.lowrank_feature_indices:
+            raise ValueError("grouped low-rank fits are not ordinary Joint endpoints")
+
+        n_features = x.shape[1]
+        if fitted.intercept.shape != (n_targets,) or not np.all(
+            np.isfinite(fitted.intercept)
+        ):
+            raise ValueError(f"Joint {label} endpoint intercept is invalid")
+        other = (
+            self.joint_endpoint_starts.lowrank
+            if expected_kind == "direct"
+            else self.joint_endpoint_starts.direct
+        )
+        if n_targets != other.intercept.size:
+            raise ValueError("Joint endpoint target counts differ")
+
+        if expected_kind == "direct":
+            if (
+                fitted.residual is None
+                or fitted.residual.shape != (n_features, n_targets)
+                or fitted.cell_shared is not None
+                or fitted.target_shared is not None
+            ):
+                raise ValueError("Joint direct endpoint coefficient schema is invalid")
+            coefficient_arrays = (fitted.residual,)
+        else:
+            if (
+                fitted.residual is not None
+                or fitted.cell_shared is None
+                or fitted.target_shared is None
+                or fitted.cell_shared.ndim != 2
+                or fitted.target_shared.ndim != 2
+                or fitted.cell_shared.shape
+                != (n_features, fitted.target_shared.shape[1])
+                or fitted.target_shared.shape[0] != n_targets
+                or fitted.target_shared.shape[1] != config.rank
+            ):
+                raise ValueError("Joint low-rank endpoint factor schema is invalid")
+            coefficient_arrays = (fitted.cell_shared, fitted.target_shared)
+        if any(not np.all(np.isfinite(value)) for value in coefficient_arrays):
+            raise ValueError(f"Joint {label} endpoint coefficients are non-finite")
+
+        if self.config.use_target_features:
+            if (
+                target_features is None
+                or fitted.target_features is None
+                or not np.array_equal(fitted.target_features, target_features)
+                or fitted.target_coeff is None
+                or fitted.target_coeff.shape
+                != (n_features, target_features.shape[1])
+                or not np.all(np.isfinite(fitted.target_coeff))
+            ):
+                raise ValueError(
+                    f"Joint {label} endpoint target-feature schema is invalid"
+                )
+        elif fitted.target_features is not None or fitted.target_coeff is not None:
+            raise ValueError(f"Joint {label} endpoint has unexpected target terms")
+
+        if nuisance is None:
+            if fitted.nuisance_coeff is not None or fitted.nuisance_names:
+                raise ValueError(f"Joint {label} endpoint has unexpected nuisance terms")
+        elif (
+            fitted.nuisance_coeff is None
+            or fitted.nuisance_coeff.shape != (nuisance.shape[1], n_targets)
+            or fitted.nuisance_names != nuisance_names
+            or not np.all(np.isfinite(fitted.nuisance_coeff))
+        ):
+            raise ValueError(f"Joint {label} endpoint nuisance schema is invalid")
         return fitted
+
+    @staticmethod
+    def _deterministic_factorization(
+        coefficient: Array, rank: int
+    ) -> tuple[Array, Array]:
+        """Return a sign-canonical SVD factorization with live zero directions."""
+
+        u, singular, vt = np.linalg.svd(coefficient, full_matrices=False)
+        if rank > singular.size:
+            raise ValueError("Joint rank exceeds endpoint coefficient dimensions")
+        u = np.array(u[:, :rank], copy=True)
+        vt = np.array(vt[:rank], copy=True)
+        # SVD vector signs are arbitrary. Canonicalizing them makes start state
+        # hashes and optimizer paths reproducible across repeated calls.
+        for component in range(rank):
+            pivot = int(np.argmax(np.abs(u[:, component])))
+            if u[pivot, component] < 0:
+                u[:, component] *= -1.0
+                vt[component] *= -1.0
+        roots = np.sqrt(np.maximum(singular[:rank], 0.0))
+        # A zero-zero factor pair is a stationary direction in a bilinear
+        # model. Give unused components a tiny deterministic magnitude and let
+        # the residual below cancel their product exactly at initialization.
+        live_scale = 1e-4 * max(1.0, float(np.max(roots, initial=0.0)))
+        roots = np.where(roots > np.finfo(float).eps, roots, live_scale)
+        return u * roots[None, :], vt.T * roots[None, :]
 
     def _initialize(
         self,
@@ -762,6 +1067,7 @@ class UnifiedPUModel:
             tolerance=max(self.fit_config.tolerance, 1e-7),
             initialization="random",
             init_direct_maxiter=self.fit_config.init_direct_maxiter,
+            retry_maxiter=self.fit_config.retry_maxiter,
         )
 
         def fit_direct_initializer() -> _DirectWarmStart:
@@ -781,6 +1087,11 @@ class UnifiedPUModel:
                 exposure=e,
                 seed=seed,
             )
+            if not direct_fit.converged:
+                raise RuntimeError(
+                    f"{self.config.name} direct initializer did not converge "
+                    "after the declared retry"
+                )
             direct_coef = direct_fit.residual
             assert direct_coef is not None
             return _DirectWarmStart(
@@ -800,6 +1111,7 @@ class UnifiedPUModel:
                 target_l2=self.config.target_l2,
                 nuisance_l2=self.config.nuisance_l2,
                 maxiter=direct_fit_config.maxiter,
+                retry_maxiter=direct_fit_config.retry_maxiter,
                 tolerance=direct_fit_config.tolerance,
                 n_features=n_features,
                 n_targets=n_targets,

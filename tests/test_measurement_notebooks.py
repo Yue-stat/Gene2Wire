@@ -5,6 +5,7 @@ import ast
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import nbformat
 import pytest
@@ -86,7 +87,7 @@ def test_notebooks_are_thin_source_pinned_ondemand_entrypoints(name):
     code = _source(book, "code")
     provenance = book["metadata"]["gene2wire"]
     assert provenance == {
-        "protocol": "0912-v5-measurement-degradation",
+        "protocol": "0912-v6-measurement-degradation",
         "core_commit": "a" * 40,
         "source_hash": "b" * 64,
         "dataset": name,
@@ -94,11 +95,15 @@ def test_notebooks_are_thin_source_pinned_ondemand_entrypoints(name):
         "environment": "OnDemand",
         "experiment": "measurement_degradation",
     }
+    assert f"PROTOCOL_VERSION = '{provenance['protocol']}'" in code
+    assert "protocol_version=PROTOCOL_VERSION" in code
     assert "CORE_COMMIT = '" + "a" * 40 + "'" in code
     assert "EXPECTED_SOURCE_HASH = '" + "b" * 64 + "'" in code
     assert "https://github.com/Yue-stat/Gene2Wire.git" in code
     assert "GENE2WIRE_PROJECT_DIR" in code
     assert "paper_figure_exports" in code
+    assert "checkpoints' / 'measurement_degradation_v2_compact" in code
+    assert "measurement_degradation_v1" not in code
     assert "pip install" not in code
     assert "google.colab" not in code
     assert ".png" not in code
@@ -112,21 +117,22 @@ def test_config_uses_revised_coverage_not_legacy_fixed_k_overlap():
     namespace = {}
     exec(book["cells"][2]["source"], namespace)
     expected = {
+        "PROTOCOL_VERSION": "0912-v6-measurement-degradation",
         "N_OUTER_FOLDS": 3,
         "N_JOBS": 32,
-        "N_REPETITIONS": 5,
-        "N_PANEL_SEEDS": 5,
+        "N_REPETITIONS": 2,
+        "N_PANEL_SEEDS": 2,
         "USE_LOCATION": False,
         "USE_TARGET_FEATURES": False,
-        "STRATEGY": "full_joint",
+        "STRATEGY": "rank_top2_total_ratio",
         "CANDIDATE_BUDGET": 32,
         "PAIRED_FRACTION": .20,
-        "GENE_COVERAGES": (1.0, 5 / 6, 2 / 3, .5),
-        "TARGET_COVERAGES": (1.0, 2 / 3, .5),
-        "POSITIVE_RETENTIONS": (1.0, .75, .5, .25, .10),
-        "ANCHOR_GENE_COVERAGE": 2 / 3,
-        "ANCHOR_TARGET_COVERAGE": 2 / 3,
-        "ANCHOR_POSITIVE_RETENTION": .5,
+        "GENE_COVERAGES": (1.0, .7, .4),
+        "TARGET_COVERAGES": (1.0, .7, .4),
+        "POSITIVE_RETENTIONS": (1.0, .7, .4, .10),
+        "ANCHOR_GENE_COVERAGE": .7,
+        "ANCHOR_TARGET_COVERAGE": .7,
+        "ANCHOR_POSITIVE_RETENTION": .4,
         "VIRTUAL_ASSAYS": ("A", "B", "C"),
         "INCLUDE_MATCHED_UNIFORM_CONTROL": True,
         "INCLUDE_NATURAL_RECOVERY": True,
@@ -137,6 +143,9 @@ def test_config_uses_revised_coverage_not_legacy_fixed_k_overlap():
     markdown = _source(book, "markdown")
     assert "coverage 1.0 measures all 23/23 genes" in markdown
     assert "legacy same-eight-gene" in markdown
+    assert "target coverage 0.40 is an explicit stress level" in markdown
+    assert "graph_connected=False" in markdown
+    assert "mask is not redrawn to force connectivity" in markdown
     code = _source(book, "code")
     assert "int(full.iloc[0]['panel_size']) != pool_size" in code
 
@@ -163,6 +172,16 @@ def test_every_notebook_enables_all_shared_controls_and_pu_comparators(name):
     assert "run_pu_comparators=RUN_PU_COMPARATORS" in code
     assert "n_panel_seeds=N_PANEL_SEEDS" in code
     assert "supervision_profile='paired_reference'" in code
+    assert "declared_native_budget" in code
+    assert "candidate_search_plan(model, tuning)" in code
+    assert "rank_top2_total_ratio" in code
+    assert "rank_screen -> retain_top_2 -> total_shrinkage_ratio_refinement" in code
+    assert "retained_rank_count" in code
+    assert "inherited_endpoint_count" in code
+    assert "declared_rank_count" in code
+    assert "maximum_scored_candidate_start_paths" in code
+    assert "bounded_grid_candidates" not in code
+    assert "full_joint_candidates" not in code
     for model in (
         "PU-Joint", "GenEML-adapted", "Inductive-PU-MC", "SAR-PU"
     ):
@@ -231,9 +250,20 @@ def test_requested_plots_use_fixed_scopes_and_export_pdf(name):
     assert "plot_retention_auprc(" in code
     assert "retention_col='positive_retention'" in code
     assert "for mode in ('key', 'full')" in code
+    # One shared call runs for both predeclared gene and target curve specs.
+    assert code.count("plot_coverage_auprc(") == 1
+    assert "'gene'," in code
+    assert "'target'," in code
+    assert "coverage_col=coverage_col" in code
+    assert "key_models=KEY_MEASUREMENT_MODELS" in code
+    assert "target_requested_coverage" in code
+    assert "gene_requested_coverage" in code
+    assert "saved_anchor_target_coverage" in code
+    assert "saved_anchor_gene_coverage" in code
+    assert "saved_anchor_retention" in code
     assert "plot_gene_target_brier_heatmap(" in code
     assert "heatmap_baseline_selection" in code
-    assert "comparison_model='PU-MIRT'" in code
+    assert "comparison_model='PU-Joint'" in code
     assert "evaluation_scope'].eq('native_reference')" in code
     assert "figure.savefig(" in code
     assert ".pdf'" in code
@@ -249,6 +279,74 @@ def test_requested_plots_use_fixed_scopes_and_export_pdf(name):
         assert "np.isclose(stability['target_coverage'], 1.0)" in code
         assert "is_reference_probability" in code
         assert "plot_projection_tags_budget_recall(" not in code
+
+
+def test_coverage_plot_cell_draws_gene_and_target_anchor_slices():
+    book = builder().notebook("BARseq_A1", "a" * 40, "b" * 64, "0912")
+    helper_source = next(
+        cell["source"] for cell in book["cells"]
+        if cell["cell_type"] == "code" and "def _role_rows(" in cell["source"]
+    )
+    plot_source = next(
+        cell["source"] for cell in book["cells"]
+        if cell["cell_type"] == "code" and "coverage_figure_paths = {}" in cell["source"]
+    )
+    rows = []
+    for gene_requested, gene_actual in ((1.0, 1.0), (.7, .73), (.4, .39)):
+        for target_requested, target_actual in ((1.0, 1.0), (.7, .73), (.4, .36)):
+            for model in ("PU", "PU-MIRT", "PU-Joint"):
+                rows.append({
+                    "condition_roles": "coverage_heatmap",
+                    "evaluation_scope": "native_reference",
+                    "mechanism": "assay_target_sar",
+                    "gene_requested_coverage": gene_requested,
+                    "gene_coverage": gene_actual,
+                    "target_requested_coverage": target_requested,
+                    "target_coverage": target_actual,
+                    "positive_retention": .4,
+                    "macro_auprc": .2,
+                    "model": model,
+                })
+    calls = []
+
+    def fake_plot(table, *, coverage_col, key_models, title):
+        calls.append((coverage_col, tuple(key_models), table.copy(), title))
+        return object(), object()
+
+    namespace = {
+        "pd": __import__("pandas"),
+        "np": __import__("numpy"),
+        "FIGURE_DIR": Path("unused"),
+        "KEY_MEASUREMENT_MODELS": ("PU", "PU-MIRT", "PU-Joint"),
+        "ANCHOR_GENE_COVERAGE": .7,
+        "ANCHOR_TARGET_COVERAGE": .7,
+        "ANCHOR_POSITIVE_RETENTION": .4,
+        "all_artifacts": {
+            "BARseq A1": SimpleNamespace(
+                tables={"per_repetition": __import__("pandas").DataFrame(rows)},
+                manifest={"measurement_protocol": {
+                    "anchor_gene_coverage": .7,
+                    "anchor_target_coverage": .7,
+                    "anchor_retention": .4,
+                }},
+            ),
+        },
+        "plot_coverage_auprc": fake_plot,
+        "_save_show": lambda figure, label, suffix: suffix,
+        "display": lambda value: None,
+    }
+    exec(helper_source, namespace)
+    namespace["_save_show"] = lambda figure, label, suffix: suffix
+    exec(plot_source, namespace)
+
+    assert [call[0] for call in calls] == ["gene_coverage", "target_coverage"]
+    gene_curve, target_curve = calls[0][2], calls[1][2]
+    assert gene_curve["target_requested_coverage"].eq(.7).all()
+    assert sorted(gene_curve["gene_coverage"].unique()) == [.39, .73, 1.0]
+    assert target_curve["gene_requested_coverage"].eq(.7).all()
+    assert sorted(target_curve["target_coverage"].unique()) == [.36, .73, 1.0]
+    assert gene_curve["positive_retention"].eq(.4).all()
+    assert target_curve["positive_retention"].eq(.4).all()
 
 
 @pytest.mark.parametrize("name", NAMES)
@@ -277,12 +375,23 @@ def test_visible_audits_cover_panels_parameters_detection_and_failures(name):
         "convergence",
         "failures",
         "display_diagnostics(artifacts",
+        "total_shrinkage",
+        "residual_shared_ratio",
+        "optimizer_message",
     ):
         assert token in code
+    for hint in ("'shrinkage'", "'ratio'", "'initializer'", "'start'"):
+        assert hint in code
+    assert "important['model'].eq('PU-Joint')" in code
+    assert ".isin(('rank', 'penalty'))" in code
+    assert "complete rows remain in tuning.csv" in code
 
 
 def test_public_measurement_notebook_api_is_importable():
+    from gene2wire import candidate_search_plan
     from gene2wire.experiments import measurement_experiment, measurement_plotting
+
+    assert callable(candidate_search_plan)
 
     for name in (
         "MeasurementConfig",
@@ -293,6 +402,7 @@ def test_public_measurement_notebook_api_is_importable():
         assert callable(getattr(measurement_experiment, name))
     for name in (
         "plot_retention_auprc",
+        "plot_coverage_auprc",
         "plot_gene_target_brier_heatmap",
         "plot_accuracy_panel_sensitivity",
         "plot_projection_tags_budget_recall",

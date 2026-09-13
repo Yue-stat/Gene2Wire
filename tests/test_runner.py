@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import sqlite3
 from unittest.mock import patch
 
 import numpy as np
@@ -7,7 +8,7 @@ import pytest
 
 from gene2wire import DatasetBundle, FitConfig, ModelConfig, TuningConfig, run_model_grid
 from gene2wire.checkpoint import AtomicArrayCheckpointStore, unit_key
-from gene2wire.models import model_identity
+from gene2wire.models import UnifiedPUModel, model_identity
 from gene2wire.runner import _compatible_joint_endpoint
 
 
@@ -147,8 +148,18 @@ def test_runner_shares_warm_starts_across_model_families(tmp_path: Path):
 
     # The two compatible model families and both ranks need only one direct
     # initializer for tuning and one for the distinct development/refit data.
-    manifests = list((tmp_path / "checkpoints" / "warm_starts").glob("*.json"))
-    assert len(manifests) == 2
+    warm_root = tmp_path / "checkpoints" / "compact_units"
+    blobs = list(warm_root.glob("*/arrays/arrays--*.npz"))
+    indexes = list(warm_root.glob("*/arrays/manifest_index/index.sqlite3"))
+    # The shared blob pool also contains final refits and model predictions;
+    # inspect semantic keys rather than counting arbitrary pooled NPZ blobs.
+    assert blobs
+    assert len(indexes) == 1
+    with sqlite3.connect(indexes[0]) as connection:
+        keys = [row[0] for row in connection.execute(
+            "SELECT unit_key FROM completed_checkpoint"
+        )]
+    assert sum('"task":"direct_warm_start"' in key for key in keys) == 2
 
 
 def test_runner_carries_standalone_winners_into_joint_independent_of_input_order():
@@ -181,6 +192,11 @@ def test_runner_carries_standalone_winners_into_joint_independent_of_input_order
         str(model_identity(result.models["MIRT"].tuning.best_config)),
     }
     assert expected.issubset({str(model_identity(trial.config)) for trial in joint_trials})
+    assert result.models["Joint"].tuning.best_config.kind == "joint"
+    message = result.models["Joint"].summary()["final_optimizer_message"]
+    assert "initializer=" in message
+    assert "direct_endpoint=" in message
+    assert "lowrank_endpoint=" in message
 
 
 def test_joint_endpoint_compatibility_excludes_nuisance_and_separate_a_models():
@@ -198,3 +214,34 @@ def test_joint_endpoint_compatibility_excludes_nuisance_and_separate_a_models():
         ),
         joint,
     )
+
+
+def test_adaptive_joint_fails_before_fit_when_an_endpoint_source_is_missing():
+    train, validation, test_x, exposure = partitions()
+    tuning = TuningConfig(
+        strategy="rank_top2_total_ratio",
+        ranks=(0, 1),
+        shared_l2=(0.1,),
+        residual_l2=(0.1,),
+        target_l2=(0.1,),
+        anchor_shared_l2=0.1,
+        anchor_residual_l2=0.1,
+        anchor_target_l2=0.1,
+        candidate_budget=2,
+        include_endpoints=True,
+    )
+    with patch.object(UnifiedPUModel, "fit", side_effect=AssertionError("fitted")):
+        with pytest.raises(ValueError, match="requires exactly one compatible"):
+            run_model_grid(
+                train=train,
+                validation=validation,
+                test_X=test_x,
+                train_exposure=exposure[:36],
+                validation_exposure=exposure[36:54],
+                test_exposure=exposure[54:],
+                models=(
+                    ModelConfig(name="Logistic", kind="direct", pu=False),
+                    ModelConfig(name="Joint", kind="joint", rank=1, pu=False),
+                ),
+                tuning=tuning,
+            )

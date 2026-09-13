@@ -83,33 +83,54 @@ fixed native reference scope for every condition. These notebooks are intended
 for the source-pinned local/OnDemand Python environment; no Colab copies are
 generated.
 
-The positive-label and target-block notebooks start with these shared defaults:
+The combined measurement-degradation notebooks use these fast exploratory defaults:
 
 ```python
 N_OUTER_FOLDS = 3
 USE_LOCATION = False
 USE_TARGET_FEATURES = False
 N_JOBS = 32
-N_REPETITIONS = 5
-STRATEGY = 'full_joint'
+N_REPETITIONS = 2
+N_PANEL_SEEDS = 2
+GENE_COVERAGES = (1.0, 0.7, 0.4)
+TARGET_COVERAGES = (1.0, 0.7, 0.4)
+POSITIVE_RETENTIONS = (1.0, 0.7, 0.4, 0.1)
+STRATEGY = 'rank_top2_total_ratio'
 SHOW_FULL_DIAGNOSTICS = False
 ```
 
-`full_joint` searches simultaneous rank/penalty combinations from a deterministic
-bounded Cartesian grid. The common profile gives each model family a native
-budget of 32 genuine candidates. Joint additionally evaluates the exact selected
-direct and low-rank winners when compatible standalone models are present, so its
-selection set can contain up to 34 rows; those endpoint fits are reused from the
-standalone candidate/refit caches. It does not imply exhaustive evaluation of an
-arbitrarily large grid. Actual candidates, endpoint provenance and selected
-configurations are exported.
+For Joint models, `rank_top2_total_ratio` makes the 32-trial native budget
+hierarchical rather than a sampled Cartesian grid: screen the declared ranks,
+retain the two best converged ranks, then balance refinement candidates in
+total-shrinkage and residual/shared-ratio
+coordinates. Every genuine Joint candidate is optimized deterministically from
+both the tuned direct and tuned low-rank inner-training endpoints. The two exact
+endpoint candidates remain selectable boundaries outside the 32 native Joint
+configurations. Missing or non-converged endpoint initializers trigger a retry or
+an explicit failure; actual stages, candidates, starts, endpoint provenance, and
+selected configurations are exported.
+
+The coverage grid contains requested per-assay values. Realized coverage after
+integer rounding is shown in every notebook. Requested target coverage 0.4 is a
+stress arm, not a bridge-complete guarantee, and small-target datasets can have a
+disconnected assay-target graph at that level. The heatmap compares PU-Joint
+against one external baseline frozen by complete-grid development validation;
+PU-MIRT is retained as a structural ablation and cannot become that baseline.
+Separate gene- and target-coverage Macro-AUPRC curves accompany the retention
+curve and heatmap.
 
 In simulation, the default `truth_uses_location = USE_LOCATION` controls the
 generated projection signal as well as predictor inputs. Gene-only simulation
-therefore does not silently generate a location-dependent truth. Five
-repetitions generate five independent datasets per sharing strength; each
-dataset contributes three outer spatial folds. Aggregate its folds before
-calculating uncertainty across independent generated datasets.
+therefore does not silently generate a location-dependent truth. The fast default
+generates two independent datasets per sharing strength and two nested panel seeds
+per dataset; each dataset contributes three outer spatial folds. Aggregate folds
+and panel seeds before using the independent generated datasets as uncertainty
+units. Two repetitions are for rapid inspection, not formal superiority intervals.
+
+New runs write small checkpoint records into compact SQLite indexes and large
+arrays as content-addressed compressed blobs below
+`checkpoints/measurement_degradation_v2_compact`. Legacy v1 checkpoints remain
+untouched and are not mixed into the new directory.
 
 Read [the experiment protocol](docs/PROTOCOL_0908.md) for the observation model,
 paired-reference access rules, exact endpoints, information-budget baselines,

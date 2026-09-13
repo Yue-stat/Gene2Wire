@@ -90,7 +90,8 @@ def test_interruption_preserves_the_first_completed_candidate_attempt(tmp_path, 
     with pytest.raises(RuntimeError, match="simulated interruption"):
         _run(prepared, settings, context, tmp_path)
     assert len(completed) == 1
-    assert list((tmp_path / "qiao").glob("*.json"))
+    assert (tmp_path / "qiao" / "manifest_index" / "index.sqlite3").is_file()
+    assert list((tmp_path / "qiao").glob("arrays--*.npz"))
     first_attempt = completed[0]
     _, tables = _run(prepared, settings, context, tmp_path)
     assert completed.count(first_attempt) == 1

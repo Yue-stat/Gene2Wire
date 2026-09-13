@@ -11,8 +11,8 @@ from typing import Any, Callable, Mapping, Sequence
 import numpy as np
 
 from .checkpoint import (
-    AtomicArrayCheckpointStore,
-    AtomicCheckpointStore,
+    CompactArrayCheckpointStore,
+    CompactCheckpointStore,
     canonical_json,
     experiment_fingerprint,
     sha256_array,
@@ -24,6 +24,7 @@ from .data import DatasetBundle
 from .models import (
     DirectWarmStartCache,
     FittedModel,
+    JointEndpointStarts,
     UnifiedPUModel,
     _exposure_matrix,
     model_identity,
@@ -75,6 +76,7 @@ class ModelRunResult:
             "final_converged": self.fitted.converged,
             "final_iterations": self.fitted.iterations,
             "final_objective": self.fitted.objective,
+            "final_optimizer_message": self.fitted.message,
             "resumed": self.resumed,
         }
 
@@ -166,6 +168,25 @@ def _bundle_hash(bundle: DatasetBundle) -> str:
     if bundle.Y_target is not None:
         parts["Y_target"] = sha256_array(bundle.Y_target)
     return hashlib.sha256(canonical_json(parts).encode("utf-8")).hexdigest()
+
+
+def _endpoint_start_identity(starts: JointEndpointStarts) -> dict[str, Any]:
+    """Content-address development endpoint starts used by a Joint refit."""
+
+    def one(fitted: FittedModel) -> dict[str, Any]:
+        _, arrays = _state_to_checkpoint(fitted)
+        return {
+            "config": model_identity(fitted.config),
+            "arrays": {
+                name: sha256_array(value) for name, value in sorted(arrays.items())
+            },
+        }
+
+    return {
+        "recipe": "exact_development_direct_lowrank_v1",
+        "direct": one(starts.direct),
+        "lowrank": one(starts.lowrank),
+    }
 
 
 def _resolve_tuning(
@@ -308,11 +329,14 @@ def run_model_grid(
     development-refitted preprocessor, permitting a new feature schema. The
     outer-test interface deliberately accepts ``test_X`` rather than a bundle,
     so hidden masks and pre-hide reference labels cannot enter model selection.
-    Candidate trials, reusable direct warm starts, and completed fitted
-    models/predictions are checkpointed independently when ``checkpoint_dir``
-    is supplied. ``on_progress`` reports timed model, candidate, and final-refit
-    events, including compatible checkpoint and in-memory reuse. It supplements
-    the existing ``on_model`` callback without changing its behavior.
+    Candidate validation records, reusable direct warm starts, canonical final
+    fits, and one latent prediction per completed model are checkpointed when
+    ``checkpoint_dir`` is supplied. A completed-model wrapper references its
+    canonical refit instead of duplicating fitted arrays, and observed
+    probabilities are reconstructed exactly from the saved latent probability
+    and fingerprinted exposure. ``on_progress`` reports timed model, candidate,
+    and final-refit events, including compatible checkpoint and in-memory reuse.
+    It supplements the existing ``on_model`` callback without changing it.
     """
 
     _require_reference_free("train", train)
@@ -360,6 +384,19 @@ def run_model_grid(
                         "must use the same FitConfig"
                     )
                 selected.append(source)
+        if (
+            model_tuning.strategy == "rank_top2_total_ratio"
+            and any(rank > 0 for rank in model_tuning.ranks)
+        ):
+            present = {source.kind for source in selected}
+            missing = {"direct", "lowrank"}.difference(present)
+            if missing:
+                raise ValueError(
+                    f"Joint model {base_model.name!r} uses rank_top2_total_ratio "
+                    "but requires exactly one compatible standalone source of "
+                    "each kind and is missing: "
+                    f"{sorted(missing)}"
+                )
         return tuple(selected)
 
     endpoint_source_map = {
@@ -500,11 +537,35 @@ def run_model_grid(
     refit_store = None
     if checkpoint_dir is not None:
         checkpoint_root = Path(checkpoint_dir)
-        trial_store = AtomicCheckpointStore(checkpoint_root / "trials")
-        model_store = AtomicArrayCheckpointStore(checkpoint_root / "models")
-        refit_store = AtomicArrayCheckpointStore(checkpoint_root / "refits")
-        warm_start_store = AtomicArrayCheckpointStore(
-            checkpoint_root / "warm_starts"
+        # A scenario-context shard has only one outer worker; its sequential
+        # supervision controls share the same two indexes. This avoids a single
+        # SQLite writer hotspot on shared OnDemand filesystems while replacing
+        # per-candidate JSON/manifest storms. Legacy unsharded checkpoints
+        # remain readable and are never deleted.
+        shard_context = {
+            key: value for key, value in context.items() if key != "supervision"
+        }
+        checkpoint_shard = hashlib.sha256(
+            canonical_json(shard_context).encode("utf-8")
+        ).hexdigest()[:20]
+        unit_root = checkpoint_root / "compact_units" / checkpoint_shard
+        trial_store = CompactCheckpointStore(
+            unit_root / "trials", legacy_root=checkpoint_root / "trials"
+        )
+        # Model wrappers, canonical refits, and direct initializers share one
+        # content-addressed blob pool and one manifest index. Their semantic
+        # unit keys keep the namespaces disjoint; per-kind legacy roots retain
+        # backward-compatible reads.
+        array_root = unit_root / "arrays"
+        model_store = CompactArrayCheckpointStore(
+            array_root, legacy_root=checkpoint_root / "models"
+        )
+        refit_store = CompactArrayCheckpointStore(
+            array_root, legacy_root=checkpoint_root / "refits"
+        )
+        warm_start_store = CompactArrayCheckpointStore(
+            array_root,
+            legacy_root=checkpoint_root / "warm_starts",
         )
 
     # These caches are deliberately scoped to this run's fixed input arrays.
@@ -526,13 +587,53 @@ def run_model_grid(
     candidate_cache = {}
     final_fit_cache = {}
 
-    def final_coordinates(config: ModelConfig, fit_config: FitConfig) -> tuple[str, int]:
+    def development_joint_starts(
+        base_model: ModelConfig, selected: ModelConfig
+    ) -> JointEndpointStarts | None:
+        if base_model.kind != "joint" or selected.kind != "joint":
+            return None
+        sources = endpoint_source_map.get(base_model.name, ())
+        fitted_by_kind = {
+            source.kind: results[source.name].fitted
+            for source in sources
+            if source.name in results
+        }
+        if not fitted_by_kind:
+            # Preserve standalone Joint use when no endpoint models were
+            # requested. Canonical experiment grids supply both endpoints.
+            return None
+        if set(fitted_by_kind) != {"direct", "lowrank"}:
+            raise RuntimeError(
+                "a Joint development multi-start requires both direct and low-rank endpoints"
+            )
+        return JointEndpointStarts(
+            direct=fitted_by_kind["direct"],
+            lowrank=fitted_by_kind["lowrank"],
+        )
+
+    def final_coordinates(
+        config: ModelConfig,
+        fit_config: FitConfig,
+        joint_starts: JointEndpointStarts | None = None,
+    ) -> tuple[str, int]:
         identity = model_identity(config)
         final_seed = stable_seed(
             seed, "refit", config.kind, config.rank, config.use_target_features,
         )
-        return unit_key(task="canonical_refit", context=context, candidate=identity,
-                        fit=asdict(fit_config), seed=final_seed), final_seed
+        coordinates = {
+            "task": "canonical_refit",
+            "context": context,
+            "candidate": identity,
+            "fit": asdict(fit_config),
+            "seed": final_seed,
+        }
+        if joint_starts is not None:
+            if config.kind != "joint":
+                raise ValueError("Joint refit starts require a genuine Joint config")
+            coordinates["joint_endpoint_starts"] = _endpoint_start_identity(
+                joint_starts
+            )
+        return unit_key(**coordinates), final_seed
 
     results: dict[str, ModelRunResult] = {}
 
@@ -544,7 +645,32 @@ def run_model_grid(
         model_started = perf_counter()
         model_key = unit_key(task="completed_model", **context, model=base_model.name)
         model_fingerprint = model_fingerprints[base_model.name]
-        cached = None if model_store is None else model_store.load(model_key, model_fingerprint)
+        cached = None
+        if model_store is not None:
+            try:
+                cached = model_store.load(model_key, model_fingerprint)
+            except (OSError, ValueError):
+                # A damaged wrapper is never accepted as resumed. The
+                # candidate/refit stores below can reconstruct it safely.
+                cached = None
+        if cached is not None and cached["payload"].get("checkpoint_schema") == 2:
+            dependency = cached["payload"].get("canonical_refit")
+            if not isinstance(dependency, Mapping):
+                cached = None
+            else:
+                try:
+                    cached_refit = (
+                        None if refit_store is None else refit_store.load(
+                            str(dependency.get("key", "")),
+                            str(dependency.get("fingerprint", "")),
+                        )
+                    )
+                except (OSError, ValueError):
+                    cached_refit = None
+                if cached_refit is None:
+                    cached = None
+                else:
+                    cached["canonical_refit_record"] = cached_refit
         emit("model_start", base_model.name, index=model_index, total=len(base_models),
              cache_status="checkpoint" if cached is not None else "pending")
         if cached is not None:
@@ -558,13 +684,28 @@ def run_model_grid(
                 raise ValueError("completed checkpoint base model does not match")
             if tuple(payload.get("test_cell_ids", [])) != test_ids:
                 raise ValueError("completed checkpoint test cell order does not match")
-            fitted_model = _state_from_checkpoint(payload["fitted"], arrays)
+            if payload.get("checkpoint_schema") == 2:
+                if (payload.get("source_hash") != source_hash
+                        or payload.get("data_fingerprint") != data_fingerprint):
+                    raise ValueError("completed checkpoint source/data identity does not match")
+                refit_record = cached["canonical_refit_record"]
+                fitted_model = _state_from_checkpoint(
+                    refit_record["payload"]["fitted"], refit_record["arrays"]
+                )
+            else:
+                # Backward-compatible reader for the former duplicated wrapper.
+                fitted_model = _state_from_checkpoint(payload["fitted"], arrays)
             tuned = TuningResult.from_dict(payload["tuning"])
             latent = np.asarray(arrays["latent_probability"], dtype=np.float64)
-            observed = np.asarray(arrays["observed_probability"], dtype=np.float64)
+            observed = (
+                test_e * latent if tuned.best_config.pu else latent.copy()
+            ) if payload.get("checkpoint_schema") == 2 else np.asarray(
+                arrays["observed_probability"], dtype=np.float64
+            )
             expected_shape = (test_array.shape[0], train.n_targets)
             if latent.shape != expected_shape or observed.shape != expected_shape:
                 raise ValueError("completed checkpoint prediction shape does not match")
+            fitted_model = replace(fitted_model, config=tuned.best_config)
             result = ModelRunResult(
                 model_name=base_model.name,
                 tuning=tuned,
@@ -574,7 +715,18 @@ def run_model_grid(
                 resumed=True,
             )
             results[base_model.name] = result
-            refit_key, _ = final_coordinates(tuned.best_config, _resolve_fit(fit, base_model.name))
+            cached_joint_starts = development_joint_starts(
+                base_model, tuned.best_config
+            )
+            refit_key, _ = final_coordinates(
+                tuned.best_config,
+                _resolve_fit(fit, base_model.name),
+                cached_joint_starts,
+            )
+            if payload.get("checkpoint_schema") == 2 and payload[
+                "canonical_refit"
+            ].get("key") != refit_key:
+                raise ValueError("completed checkpoint canonical refit key does not match")
             final_fit_cache[refit_key] = fitted_model
             if on_model is not None:
                 on_model(base_model.name, "resumed")
@@ -611,11 +763,19 @@ def run_model_grid(
             required_endpoints=required or None,
         )
         refit_started = perf_counter()
-        refit_key, final_seed = final_coordinates(tuned.best_config, model_fit)
+        refit_joint_starts = development_joint_starts(
+            base_model, tuned.best_config
+        )
+        refit_key, final_seed = final_coordinates(
+            tuned.best_config, model_fit, refit_joint_starts
+        )
         fitted_model = final_fit_cache.get(refit_key)
         refit_cache_status = "memory" if fitted_model is not None else "pending"
         if fitted_model is None and refit_store is not None:
-            cached_refit = refit_store.load(refit_key, data_fingerprint)
+            try:
+                cached_refit = refit_store.load(refit_key, data_fingerprint)
+            except (OSError, ValueError):
+                cached_refit = None
             if cached_refit is not None:
                 fitted_model = _state_from_checkpoint(cached_refit["payload"]["fitted"], cached_refit["arrays"])
                 if model_identity(fitted_model.config) != model_identity(tuned.best_config):
@@ -624,12 +784,27 @@ def run_model_grid(
         emit("refit_start", base_model.name, cache_status=refit_cache_status,
              config=asdict(tuned.best_config), seed=final_seed)
         if fitted_model is None:
-            fitted_model = UnifiedPUModel(tuned.best_config, model_fit, warm_start_cache=refit_warm_starts).fit(
+            fitted_model = UnifiedPUModel(
+                tuned.best_config,
+                model_fit,
+                warm_start_cache=refit_warm_starts,
+                joint_endpoint_starts=refit_joint_starts,
+            ).fit(
                 development, exposure=development_e, seed=final_seed,
             )
             if refit_store is not None:
                 metadata, arrays = _state_to_checkpoint(fitted_model)
-                refit_store.save_complete(refit_key, data_fingerprint, {"fitted": metadata}, arrays)
+                refit_store.save_complete(
+                    refit_key,
+                    data_fingerprint,
+                    {
+                        "checkpoint_schema": 2,
+                        "source_hash": source_hash,
+                        "data_fingerprint": data_fingerprint,
+                        "fitted": metadata,
+                    },
+                    arrays,
+                )
             refit_cache_status = "fitted"
         final_fit_cache[refit_key] = fitted_model
         emit("refit_complete", base_model.name, cache_status=refit_cache_status,
@@ -656,22 +831,23 @@ def run_model_grid(
             resumed=False,
         )
         if model_store is not None:
-            fitted_metadata, fitted_arrays = _state_to_checkpoint(fitted_model)
             model_store.save_complete(
                 model_key,
                 model_fingerprint,
                 {
+                    "checkpoint_schema": 2,
+                    "source_hash": source_hash,
+                    "data_fingerprint": data_fingerprint,
                     "model_name": base_model.name,
                     "base_config": asdict(base_model),
                     "tuning": tuned.to_dict(),
-                    "fitted": fitted_metadata,
+                    "canonical_refit": {
+                        "key": refit_key,
+                        "fingerprint": data_fingerprint,
+                    },
                     "test_cell_ids": list(test_ids),
                 },
-                {
-                    **fitted_arrays,
-                    "latent_probability": latent,
-                    "observed_probability": observed,
-                },
+                {"latent_probability": latent},
             )
         results[base_model.name] = result
         if on_model is not None:

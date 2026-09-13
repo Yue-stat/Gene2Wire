@@ -1,4 +1,4 @@
-"""Machine-independent fingerprints and atomic JSON checkpoints."""
+"""Machine-independent fingerprints and atomic compact checkpoints."""
 
 from __future__ import annotations
 
@@ -6,7 +6,10 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import tempfile
+import zlib
+from contextlib import closing
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -282,6 +285,143 @@ class AtomicCheckpointStore:
         return self.load(key, fingerprint=fingerprint) is not None
 
 
+class CompactCheckpointStore:
+    """Concurrent, compact index for small completed checkpoint records.
+
+    ``AtomicCheckpointStore`` deliberately creates one JSON file per unit.  That
+    is convenient for a handful of records, but candidate-level and
+    scenario-level experiments can otherwise leave tens of thousands of tiny
+    files on a shared filesystem.  This store provides the same ``save/load``
+    contract in one SQLite index per logical checkpoint directory.  Payloads
+    are canonical-JSON encoded, checksummed, compressed, and committed in a
+    transaction; SQLite supplies process-safe atomicity and crash recovery.
+
+    Existing JSON checkpoints are read as a compatibility fallback, but new
+    records are written only to ``index.sqlite3``.  Nothing in an existing
+    checkpoint directory is deleted or silently adopted across fingerprints.
+    """
+
+    _SCHEMA_VERSION = 1
+
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        read_legacy: bool = True,
+        legacy_root: str | Path | None = None,
+    ):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.path = self.root / "index.sqlite3"
+        legacy_path = self.root if legacy_root is None else Path(legacy_root)
+        # An explicit fallback is read-only compatibility. Do not manufacture
+        # empty legacy trials/models/refits/warm-start directories in a fresh
+        # compact run merely by constructing a reader.
+        self._legacy = (
+            AtomicCheckpointStore(legacy_path)
+            if read_legacy and (legacy_root is None or legacy_path.exists())
+            else None
+        )
+        with closing(self._connect()) as connection:
+            with connection:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS completed_checkpoint (
+                        key_sha256 TEXT PRIMARY KEY,
+                        unit_key TEXT NOT NULL,
+                        fingerprint TEXT NOT NULL,
+                        payload_zlib BLOB NOT NULL,
+                        payload_sha256 TEXT NOT NULL,
+                        schema_version INTEGER NOT NULL,
+                        status TEXT NOT NULL CHECK(status = 'complete')
+                    )
+                    """
+                )
+
+    def _connect(self) -> sqlite3.Connection:
+        # Keep SQLite's network-filesystem-friendly default rollback journal
+        # (do not opt into WAL). Each operation is intentionally short, while
+        # the busy timeout lets independent scenario workers serialize commits.
+        connection = sqlite3.connect(self.path, timeout=60.0)
+        connection.execute("PRAGMA busy_timeout=60000")
+        connection.execute("PRAGMA synchronous=FULL")
+        return connection
+
+    @staticmethod
+    def _key_sha256(key: str) -> str:
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+    def save_complete(self, key: str, fingerprint: str, payload: Any) -> Path:
+        if not isinstance(key, str) or not key:
+            raise ValueError("checkpoint key must be nonempty")
+        if not isinstance(fingerprint, str) or not fingerprint:
+            raise ValueError("fingerprint must be nonempty")
+        safe_payload = _jsonable(payload)
+        payload_text = canonical_json(safe_payload)
+        checksum = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+        compressed = sqlite3.Binary(zlib.compress(payload_text.encode("utf-8"), level=6))
+        with closing(self._connect()) as connection:
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO completed_checkpoint (
+                        key_sha256, unit_key, fingerprint, payload_zlib,
+                        payload_sha256, schema_version, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'complete')
+                    ON CONFLICT(key_sha256) DO UPDATE SET
+                        unit_key=excluded.unit_key,
+                        fingerprint=excluded.fingerprint,
+                        payload_zlib=excluded.payload_zlib,
+                        payload_sha256=excluded.payload_sha256,
+                        schema_version=excluded.schema_version,
+                        status='complete'
+                    """,
+                    (
+                        self._key_sha256(key), key, fingerprint, compressed,
+                        checksum, self._SCHEMA_VERSION,
+                    ),
+                )
+        return self.path
+
+    def load(self, key: str, fingerprint: str | None = None) -> dict[str, Any] | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT unit_key, fingerprint, payload_zlib, payload_sha256,
+                       schema_version, status
+                FROM completed_checkpoint WHERE key_sha256 = ?
+                """,
+                (self._key_sha256(key),),
+            ).fetchone()
+        if row is None:
+            return (None if self._legacy is None else
+                    self._legacy.load(key, fingerprint=fingerprint))
+        unit_key_value, stored_fingerprint, compressed, checksum, version, status = row
+        if unit_key_value != key or status != "complete" or version != self._SCHEMA_VERSION:
+            raise ValueError(f"invalid compact checkpoint record: {self.path}")
+        if fingerprint is not None and stored_fingerprint != fingerprint:
+            return (None if self._legacy is None else
+                    self._legacy.load(key, fingerprint=fingerprint))
+        try:
+            payload_text = zlib.decompress(bytes(compressed)).decode("utf-8")
+            payload = json.loads(payload_text)
+        except (UnicodeDecodeError, json.JSONDecodeError, zlib.error) as error:
+            raise ValueError(f"invalid compact checkpoint payload: {self.path}") from error
+        actual_checksum = hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+        if not isinstance(checksum, str) or checksum != actual_checksum:
+            raise ValueError(f"compact checkpoint payload checksum mismatch: {self.path}")
+        return {
+            "status": "complete",
+            "unit_key": key,
+            "fingerprint": stored_fingerprint,
+            "payload": payload,
+            "payload_sha256": checksum,
+        }
+
+    def is_complete(self, key: str, fingerprint: str) -> bool:
+        return self.load(key, fingerprint=fingerprint) is not None
+
+
 class AtomicArrayCheckpointStore:
     """Atomic metadata + compressed-array checkpoints for completed model units.
 
@@ -328,7 +468,7 @@ class AtomicArrayCheckpointStore:
                 os.fsync(handle.fileno())
             arrays_sha256 = sha256_file(temporary)
             arrays_path = self.root / f"arrays--{arrays_sha256[:24]}.npz"
-            if arrays_path.exists():
+            if arrays_path.exists() and sha256_file(arrays_path) == arrays_sha256:
                 temporary.unlink()
             else:
                 os.replace(temporary, arrays_path)
@@ -397,6 +537,110 @@ class AtomicArrayCheckpointStore:
                 raise ValueError(f"checkpoint array index mismatch: {arrays_path}")
             arrays = {name: np.array(archive[name], copy=True) for name in names}
         return {"payload": safe_payload, "arrays": arrays, "manifest": manifest}
+
+    def is_complete(self, key: str, fingerprint: str) -> bool:
+        return self.load(key, fingerprint=fingerprint) is not None
+
+
+class CompactArrayCheckpointStore:
+    """Content-addressed arrays with one compact manifest index.
+
+    Large numeric payloads remain ordinary compressed NPZ blobs, so concurrent
+    workers never rewrite a monolithic array database.  Only the small mapping
+    from a semantic checkpoint key to its checksummed blob is consolidated.
+    Existing ``AtomicArrayCheckpointStore`` manifests remain readable and are
+    never removed.
+    """
+
+    _PAYLOAD_SCHEMA = 1
+
+    def __init__(self, root: str | Path, *, legacy_root: str | Path | None = None):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._index = CompactCheckpointStore(
+            self.root / "manifest_index", read_legacy=False
+        )
+        legacy_path = self.root if legacy_root is None else Path(legacy_root)
+        self._legacy = (
+            AtomicArrayCheckpointStore(legacy_path)
+            if legacy_root is None or legacy_path.exists()
+            else None
+        )
+
+    def save_complete(
+        self,
+        key: str,
+        fingerprint: str,
+        payload: Any,
+        arrays: Mapping[str, Any],
+    ) -> Path:
+        if not fingerprint:
+            raise ValueError("fingerprint must be nonempty")
+        if any(not isinstance(name, str) or not name for name in arrays):
+            raise ValueError("array names must be nonempty strings")
+        safe_arrays: dict[str, np.ndarray] = {}
+        for name, value in arrays.items():
+            array = np.asarray(value)
+            if array.dtype.hasobject:
+                raise ValueError(f"checkpoint array {name!r} has object dtype")
+            safe_arrays[name] = array
+
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".arrays.", suffix=".tmp", dir=self.root
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                np.savez_compressed(handle, **safe_arrays)
+                handle.flush()
+                os.fsync(handle.fileno())
+            arrays_sha256 = sha256_file(temporary)
+            arrays_path = self.root / f"arrays--{arrays_sha256[:24]}.npz"
+            if arrays_path.exists() and sha256_file(arrays_path) == arrays_sha256:
+                temporary.unlink()
+            else:
+                os.replace(temporary, arrays_path)
+            self._index.save_complete(
+                key,
+                fingerprint,
+                {
+                    "schema": self._PAYLOAD_SCHEMA,
+                    "checkpoint_payload": _jsonable(payload),
+                    "arrays_file": arrays_path.name,
+                    "arrays_sha256": arrays_sha256,
+                    "array_names": sorted(safe_arrays),
+                },
+            )
+            return self._index.path
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+
+    def load(self, key: str, fingerprint: str | None = None) -> dict[str, Any] | None:
+        record = self._index.load(key, fingerprint=fingerprint)
+        if record is None:
+            return (None if self._legacy is None else
+                    self._legacy.load(key, fingerprint=fingerprint))
+        indexed = record["payload"]
+        if indexed.get("schema") != self._PAYLOAD_SCHEMA:
+            raise ValueError(f"invalid compact array checkpoint schema: {self._index.path}")
+        arrays_name = indexed.get("arrays_file")
+        if not isinstance(arrays_name, str) or Path(arrays_name).name != arrays_name:
+            raise ValueError(f"invalid compact checkpoint array filename: {self._index.path}")
+        arrays_path = self.root / arrays_name
+        if (not arrays_path.exists()
+                or sha256_file(arrays_path) != indexed.get("arrays_sha256")):
+            raise ValueError(f"checkpoint array checksum mismatch: {arrays_path}")
+        with np.load(arrays_path, allow_pickle=False) as archive:
+            names = sorted(archive.files)
+            if names != sorted(indexed.get("array_names", [])):
+                raise ValueError(f"checkpoint array index mismatch: {arrays_path}")
+            arrays = {name: np.array(archive[name], copy=True) for name in names}
+        return {
+            "payload": indexed.get("checkpoint_payload"),
+            "arrays": arrays,
+            "manifest": self._index.path,
+        }
 
     def is_complete(self, key: str, fingerprint: str) -> bool:
         return self.load(key, fingerprint=fingerprint) is not None

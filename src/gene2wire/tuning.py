@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-from itertools import product
+from itertools import combinations, product
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable, Iterable, Mapping, MutableMapping, Sequence
@@ -18,7 +18,14 @@ from .config import FitConfig, ModelConfig, TuningConfig
 from .candidate_design import select_balanced_candidates
 from .data import DatasetBundle
 from .metrics import masked_log_loss
-from .models import DirectWarmStartCache, UnifiedPUModel, canonical_model_config, model_identity
+from .models import (
+    DirectWarmStartCache,
+    FittedModel,
+    JointEndpointStarts,
+    UnifiedPUModel,
+    canonical_model_config,
+    model_identity,
+)
 from .seeds import stable_seed
 
 
@@ -31,6 +38,9 @@ class TrialResult:
     converged: bool
     iterations: int
     seed: int
+    total_shrinkage: float | None = None
+    residual_shared_ratio: float | None = None
+    optimizer_message: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
@@ -50,14 +60,34 @@ class TrialResult:
         missing = required.difference(value)
         if missing:
             raise ValueError(f"checkpointed trial is missing fields: {sorted(missing)}")
+        config = ModelConfig(**dict(value["config"]))
+        total, ratio = _joint_penalty_summary(config)
+        for name, expected in (
+            ("total_shrinkage", total),
+            ("residual_shared_ratio", ratio),
+        ):
+            if name not in value:  # Backward-compatible compact checkpoint.
+                continue
+            supplied = value.get(name)
+            if supplied is None and expected is None:
+                continue
+            if supplied is None or expected is None or not np.isclose(
+                float(supplied), expected, rtol=1e-12, atol=0.0
+            ):
+                raise ValueError(
+                    f"checkpointed trial {name} does not match its model config"
+                )
         return cls(
             stage=str(value["stage"]),
             index=int(value["index"]),
-            config=ModelConfig(**dict(value["config"])),
+            config=config,
             validation_loss=float(value["validation_loss"]),
             converged=bool(value["converged"]),
             iterations=int(value["iterations"]),
             seed=int(value["seed"]),
+            total_shrinkage=total,
+            residual_shared_ratio=ratio,
+            optimizer_message=str(value.get("optimizer_message", "")),
         )
 
 
@@ -91,6 +121,22 @@ class TuningResult:
             trials=tuple(TrialResult.from_dict(item) for item in trials),
             strategy=str(value["strategy"]),
         )
+
+
+def _joint_penalty_summary(
+    config: ModelConfig,
+) -> tuple[float | None, float | None]:
+    """Auditable derived coordinates for a genuine Joint configuration."""
+
+    if config.kind != "joint" or config.rank < 1:
+        return None, None
+    total = float(np.sqrt(config.shared_l2 * config.residual_l2))
+    ratio = (
+        float(config.residual_l2 / config.shared_l2)
+        if config.shared_l2 > 0
+        else None
+    )
+    return total, ratio
 
 
 def full_joint_candidates(base: ModelConfig, tuning: TuningConfig) -> tuple[ModelConfig, ...]:
@@ -247,25 +293,336 @@ def _stage_two_candidates(
     return full_joint_candidates(base, narrowed)
 
 
+def _trial_tie_key(trial: TrialResult) -> tuple[Any, ...]:
+    """Stable selection order shared by final and rank-stage selection."""
+
+    config = trial.config
+    # Prefer a converged fit, then the declared validation objective.  Model
+    # simplicity is only a deterministic tie break; it never overrides loss.
+    return (
+        not trial.converged,
+        trial.validation_loss,
+        config.rank,
+        -config.shared_l2,
+        -config.residual_l2,
+        -config.target_l2,
+        trial.index,
+    )
+
+
+def _top_rank_trials(
+    trials: Iterable[TrialResult], count: int = 2
+) -> tuple[TrialResult, ...]:
+    """Return the best distinct, converged ranks from a rank screen."""
+
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise ValueError("rank retention count must be a positive integer")
+    ordered = sorted((trial for trial in trials if trial.converged), key=_trial_tie_key)
+    expected = min(count, len({trial.config.rank for trial in trials}))
+    selected: list[TrialResult] = []
+    seen: set[int] = set()
+    for trial in ordered:
+        if trial.config.rank in seen:
+            continue
+        selected.append(trial)
+        seen.add(trial.config.rank)
+        if len(selected) == count:
+            break
+    if len(selected) != expected:
+        raise RuntimeError(
+            "Joint rank screen did not yield the required number of converged "
+            f"ranks: expected {expected}, observed {len(selected)}"
+        )
+    return tuple(selected)
+
+
+def _penalty_log(value: float, floor: float) -> float:
+    """Log coordinate with a separate finite location for an exact zero."""
+
+    return float(np.log10(value)) if value > 0 else floor
+
+
+def _joint_shrinkage_coordinates(
+    candidates: Sequence[ModelConfig],
+) -> np.ndarray:
+    """Map Joint penalties to rank, total-shrinkage, and ratio coordinates.
+
+    For positive penalties the two search coordinates are
+
+    ``log_total = (log10(shared_l2) + log10(residual_l2)) / 2`` and
+    ``log_ratio = log10(residual_l2 / shared_l2)``.
+
+    Thus the change of variables is one-to-one and does not silently alter the
+    user's penalty grid.  An exact zero is placed one log decade below the
+    smallest positive declared penalty so grids containing zero remain finite.
+    """
+
+    values = tuple(candidates)
+    if not values:
+        raise ValueError("cannot map an empty Joint candidate grid")
+    penalties = [
+        penalty
+        for candidate in values
+        for penalty in (candidate.shared_l2, candidate.residual_l2)
+        if penalty > 0
+    ]
+    floor = (float(np.log10(min(penalties))) - 1.0) if penalties else -1.0
+    rows = []
+    for candidate in values:
+        shared = _penalty_log(candidate.shared_l2, floor)
+        residual = _penalty_log(candidate.residual_l2, floor)
+        target = _penalty_log(candidate.target_l2, floor)
+        rows.append(
+            (
+                float(candidate.rank),
+                0.5 * (shared + residual),
+                residual - shared,
+                target,
+            )
+        )
+    return np.asarray(rows, dtype=np.float64)
+
+
+def _select_joint_shrinkage_candidates(
+    candidates: Sequence[ModelConfig], count: int
+) -> tuple[ModelConfig, ...]:
+    """Outcome-independent bounded design in total/ratio coordinates.
+
+    The greedy design first balances marginal levels of retained rank, total
+    shrinkage, residual/shared ratio, and (when active) target penalty.  Ties
+    maximize separation in normalized coordinate space.  Numeric statistical
+    identity is the final tie break, so enumeration order, display name, PU
+    status, labels, and random seed cannot change the selected grid.
+    """
+
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise ValueError("count must be a positive integer")
+    values = tuple(candidates)
+    if not values:
+        raise ValueError("cannot select from an empty Joint candidate grid")
+    if any(candidate.kind != "joint" or candidate.rank < 1 for candidate in values):
+        raise ValueError("shrinkage design requires positive-rank Joint candidates")
+    unique = {canonical_json(model_identity(candidate)): candidate for candidate in values}
+    if len(unique) != len(values):
+        raise ValueError("Joint shrinkage candidate grid contains duplicates")
+    ordered = tuple(
+        sorted(
+            values,
+            key=lambda candidate: (
+                candidate.rank,
+                candidate.shared_l2,
+                candidate.residual_l2,
+                candidate.target_l2,
+            ),
+        )
+    )
+    if count >= len(ordered):
+        return ordered
+
+    raw = _joint_shrinkage_coordinates(ordered)
+    level_counts: list[np.ndarray] = []
+    level_codes: list[np.ndarray] = []
+    normalized: list[np.ndarray] = []
+    active_columns: list[int] = []
+    for column in range(raw.shape[1]):
+        levels, inverse = np.unique(raw[:, column], return_inverse=True)
+        if len(levels) == 1:
+            continue
+        active_columns.append(column)
+        level_counts.append(np.zeros(len(levels), dtype=np.int64))
+        level_codes.append(inverse)
+        normalized.append((raw[:, column] - levels.min()) / np.ptp(levels))
+
+    # Distinct statistical candidates imply at least one active coordinate.
+    points = np.column_stack(normalized)
+    pair_counts: list[np.ndarray] = []
+    pair_codes: list[np.ndarray] = []
+    for left, right in combinations(range(len(level_codes)), 2):
+        code = level_codes[left] * len(level_counts[right]) + level_codes[right]
+        pair_counts.append(
+            np.zeros(
+                len(level_counts[left]) * len(level_counts[right]),
+                dtype=np.int64,
+            )
+        )
+        pair_codes.append(code)
+    total_ratio_count = None
+    total_ratio_code = None
+    if 1 in active_columns and 2 in active_columns:
+        total_index = active_columns.index(1)
+        ratio_index = active_columns.index(2)
+        total_ratio_code = (
+            level_codes[total_index] * len(level_counts[ratio_index])
+            + level_codes[ratio_index]
+        )
+        total_ratio_count = np.zeros(
+            len(level_counts[total_index]) * len(level_counts[ratio_index]),
+            dtype=np.int64,
+        )
+    available = np.ones(len(ordered), dtype=bool)
+    nearest = np.full(len(ordered), np.inf)
+    selected: list[int] = []
+    for _ in range(count):
+        imbalance = sum(
+            2 * frequency[code] + 1
+            for frequency, code in zip(level_counts, level_codes)
+        )
+        eligible = np.flatnonzero(available)
+        if total_ratio_count is not None and total_ratio_code is not None:
+            shrinkage_imbalance = (
+                2 * total_ratio_count[total_ratio_code] + 1
+            )
+            eligible = eligible[
+                shrinkage_imbalance[eligible]
+                == shrinkage_imbalance[eligible].min()
+            ]
+        eligible = eligible[imbalance[eligible] == imbalance[eligible].min()]
+        if pair_counts:
+            pair_imbalance = sum(
+                2 * frequency[code] + 1
+                for frequency, code in zip(pair_counts, pair_codes)
+            )
+            eligible = eligible[
+                pair_imbalance[eligible] == pair_imbalance[eligible].min()
+            ]
+        separation = (
+            nearest[eligible]
+            if selected
+            else -np.sum((points[eligible] - 0.5) ** 2, axis=1)
+        )
+        best = separation.max()
+        chosen = int(
+            eligible[
+                np.flatnonzero(
+                    np.isclose(separation, best, rtol=0.0, atol=1e-12)
+                )[0]
+            ]
+        )
+        selected.append(chosen)
+        available[chosen] = False
+        for frequency, code in zip(level_counts, level_codes):
+            frequency[code[chosen]] += 1
+        for frequency, code in zip(pair_counts, pair_codes):
+            frequency[code[chosen]] += 1
+        if total_ratio_count is not None and total_ratio_code is not None:
+            total_ratio_count[total_ratio_code[chosen]] += 1
+        nearest = np.minimum(
+            nearest, np.sum((points - points[chosen]) ** 2, axis=1)
+        )
+    return tuple(ordered[index] for index in selected)
+
+
+def _joint_rank_screen_count(rank_count: int, budget: int | None) -> int:
+    """Number of declared ranks inspected before adaptive refinement."""
+
+    if rank_count < 1:
+        return 0
+    if budget is None:
+        return rank_count
+    minimum = rank_count + min(2, rank_count)
+    if budget < minimum:
+        raise ValueError(
+            "rank_top2_total_ratio candidate_budget is too small: screening all "
+            f"{rank_count} positive ranks and reserving refinement for the retained "
+            f"ranks requires at least {minimum} native candidates"
+        )
+    return rank_count
+
+
+def candidate_search_plan(
+    base: ModelConfig, tuning: TuningConfig
+) -> dict[str, Any]:
+    """Describe the static upper bound of a model's candidate search.
+
+    Endpoint-aware Joint refinement depends on validation-ranked stage-one
+    results, so ``len(full_joint_candidates(...))`` is not its execution plan.
+    This helper exposes the declared budget and stage bounds without looking at
+    outcomes.  ``inherited_endpoint_candidates`` is a maximum: the runner can
+    supply fewer endpoints only when the corresponding standalone model is not
+    part of the requested model set.
+    """
+
+    if (
+        base.kind == "joint"
+        and tuning.strategy == "rank_top2_total_ratio"
+        and not tuning.include_endpoints
+    ):
+        raise ValueError(
+            "rank_top2_total_ratio Joint search requires include_endpoints=True"
+        )
+    if (
+        base.kind != "joint"
+        or not tuning.include_endpoints
+        or tuning.strategy != "rank_top2_total_ratio"
+    ):
+        candidates = full_joint_candidates(base, tuning)
+        return {
+            "adaptive": False,
+            "declared_native_budget": tuning.candidate_budget,
+            "rank_screen_candidates": 0,
+            "retained_ranks": 0,
+            "refinement_candidates": len(candidates),
+            "maximum_native_candidates": len(candidates),
+            "inherited_endpoint_candidates": 0,
+            "maximum_total_trials": len(candidates),
+            "optimizer_starts_per_native_candidate": 1,
+            "maximum_scored_candidate_start_paths": len(candidates),
+        }
+
+    positive_ranks = tuple(rank for rank in tuning.ranks if rank > 0)
+    rank_count = _joint_rank_screen_count(
+        len(positive_ranks), tuning.candidate_budget
+    )
+    retained = min(2, rank_count)
+    target_count = len(tuning.target_l2) if base.use_target_features else 1
+    positive_shared = sum(value > 0 for value in tuning.shared_l2)
+    positive_residual = sum(value > 0 for value in tuning.residual_l2)
+    # One anchor per retained rank can be duplicated by the positive refinement
+    # pool.  Subtract it only when both anchor penalties are themselves valid.
+    duplicate_anchors = retained * int(
+        tuning.anchor_shared_l2 > 0
+        and tuning.anchor_residual_l2 > 0
+        and (
+            not base.use_target_features
+            or tuning.anchor_target_l2 in tuning.target_l2
+        )
+    )
+    refinement_pool = max(
+        0,
+        retained * positive_shared * positive_residual * target_count
+        - duplicate_anchors,
+    )
+    if tuning.candidate_budget is None:
+        refinement_count = refinement_pool
+    else:
+        refinement_count = min(
+            refinement_pool, max(0, tuning.candidate_budget - rank_count)
+        )
+    native = rank_count + refinement_count
+    inherited = 2
+    return {
+        "adaptive": True,
+        "declared_native_budget": tuning.candidate_budget,
+        "rank_screen_candidates": rank_count,
+        "retained_ranks": retained,
+        "refinement_candidates": refinement_count,
+        "maximum_native_candidates": native,
+        "inherited_endpoint_candidates": inherited,
+        "maximum_total_trials": native + inherited,
+        "optimizer_starts_per_native_candidate": inherited,
+        # Counts independently initialized paths for scored candidates. A
+        # deterministic continuation after non-convergence is a retry of the
+        # same path, and internal endpoint construction is reported separately.
+        "maximum_scored_candidate_start_paths": native * inherited + inherited,
+    }
+
+
 def _winner(trials: Iterable[TrialResult]) -> TrialResult:
     values = tuple(trials)
     if not values:
         raise ValueError("cannot select from zero trials")
 
-    def tie_key(trial: TrialResult) -> tuple[Any, ...]:
-        config = trial.config
-        # Prefer simpler rank, then stronger regularization, only after loss.
-        return (
-            not trial.converged,
-            trial.validation_loss,
-            config.rank,
-            -config.shared_l2,
-            -config.residual_l2,
-            -config.target_l2,
-            trial.index,
-        )
-
-    return min(values, key=tie_key)
+    return min(values, key=_trial_tie_key)
 
 
 def _validate_schema_alignment(
@@ -291,6 +648,38 @@ def _validate_schema_alignment(
         raise ValueError("model requires aligned Y_target features")
     if train.nuisance_names != validation.nuisance_names:
         raise ValueError("train and validation nuisance schemas differ")
+
+
+def _fitted_state_identity(fitted: FittedModel) -> dict[str, Any]:
+    """Content identity for an optimizer start used by a Joint candidate."""
+
+    arrays = {
+        "cell_shared": fitted.cell_shared,
+        "target_shared": fitted.target_shared,
+        "residual": fitted.residual,
+        "target_coeff": fitted.target_coeff,
+        "target_features": fitted.target_features,
+        "nuisance_coeff": fitted.nuisance_coeff,
+        "intercept": fitted.intercept,
+    }
+    return {
+        "config": model_identity(fitted.config),
+        "arrays": {
+            name: None if value is None else sha256_array(np.asarray(value))
+            for name, value in arrays.items()
+        },
+        "lowrank_feature_indices": fitted.lowrank_feature_indices,
+    }
+
+
+def _joint_start_identity(starts: JointEndpointStarts) -> dict[str, Any]:
+    """Checkpoint coordinates for the deterministic two-endpoint recipe."""
+
+    return {
+        "recipe": "exact_inner_train_direct_lowrank_v1",
+        "direct": _fitted_state_identity(starts.direct),
+        "lowrank": _fitted_state_identity(starts.lowrank),
+    }
 
 
 def tune_model(
@@ -322,8 +711,11 @@ def tune_model(
     ``candidate_budget`` applies only to genuine ``kind='joint'`` candidates.
     The supplied direct and low-rank configurations are evaluated as mandatory
     boundary candidates in addition to that budget. Their statistical fits are
-    eligible for the shared candidate/refit caches, so carrying a tuned
-    standalone winner into Joint does not duplicate optimization work.
+    eligible for the shared trial cache. Joint candidates are optimized from
+    both converged endpoint solutions fitted on *inner training only*.  Only
+    those two endpoint states are retained locally. A checkpoint-only resume
+    deterministically rebuilds them; a development-set refit is never used for
+    tuning.
     """
 
     _validate_schema_alignment(train, validation, base_model)
@@ -350,6 +742,13 @@ def tune_model(
     if required:
         if base_model.kind != "joint":
             raise ValueError("required_endpoints are supported only for Joint tuning")
+        if (
+            tuning.strategy == "rank_top2_total_ratio"
+            and not tuning.include_endpoints
+        ):
+            raise ValueError(
+                "rank_top2_total_ratio Joint tuning requires include_endpoints=True"
+            )
         normalized_required = []
         seen_required = set()
         for endpoint in required:
@@ -399,13 +798,25 @@ def tune_model(
     )
 
     memory = {} if candidate_cache is None else candidate_cache
+    fitted_by_identity: dict[str, FittedModel] = {}
 
     def emit(event: str, **details: Any) -> None:
         if on_progress is not None:
             on_progress({"event": event, "model": base_model.name, **details})
 
-    def evaluate(candidates: Iterable[ModelConfig], stage: str) -> tuple[TrialResult, ...]:
+    def evaluate(
+        candidates: Iterable[ModelConfig],
+        stage: str,
+        *,
+        joint_endpoint_starts: JointEndpointStarts | None = None,
+        retain_fits: bool = False,
+    ) -> tuple[TrialResult, ...]:
         stage_trials: list[TrialResult] = []
+        start_identity = (
+            None
+            if joint_endpoint_starts is None
+            else _joint_start_identity(joint_endpoint_starts)
+        )
         # Inspect each candidate using the exact lookup used for evaluation, so
         # an incompatible file never appears in the resume count. Retain these
         # small TrialResult records to avoid reading checkpoint files twice.
@@ -425,6 +836,15 @@ def tune_model(
                 "fit": asdict(fit_config),
                 "trial_seed": trial_seed,
             }
+            if start_identity is not None:
+                if config.kind != "joint":
+                    raise ValueError(
+                        "endpoint multi-start can be used only for Joint candidates"
+                    )
+                # A local optimum can depend on the exact endpoint solutions.
+                # Their content identity therefore belongs in both memory and
+                # disk checkpoint coordinates, not merely in diagnostics.
+                coordinates["joint_endpoint_starts"] = start_identity
             checkpoint_key = unit_key(**coordinates)
             # Memory is scoped to fixed data by the runner. Including the
             # supplied fingerprint also protects explicitly shared caller caches.
@@ -446,7 +866,16 @@ def tune_model(
                     or not np.isfinite(previous.validation_loss)
                 ):
                     raise ValueError("checkpointed trial does not match requested candidate")
-            prepared.append((config, trial_seed, checkpoint_key, cache_key, previous, cache_status))
+            prepared.append(
+                (
+                    config,
+                    trial_seed,
+                    checkpoint_key,
+                    cache_key,
+                    previous,
+                    cache_status,
+                )
+            )
 
         memory_cached = sum(item[-1] == "memory" for item in prepared)
         checkpoint_cached = sum(item[-1] == "checkpoint" for item in prepared)
@@ -455,33 +884,85 @@ def tune_model(
              total=len(prepared), cached=cached_count, memory_cached=memory_cached,
              checkpoint_cached=checkpoint_cached, pending=len(prepared) - cached_count)
         stage_started = perf_counter()
-        for stage_index, (config, trial_seed, checkpoint_key, cache_key, previous,
-                          cache_status) in enumerate(prepared, start=1):
+        for stage_index, (
+            config,
+            trial_seed,
+            checkpoint_key,
+            cache_key,
+            previous,
+            cache_status,
+        ) in enumerate(prepared, start=1):
             trial_index = len(trials)
             candidate_started = perf_counter()
             details = {"stage": stage, "index": stage_index, "total": len(prepared),
                        "trial_index": trial_index, "config": asdict(config)}
             emit("candidate_start", **details, cache_status=cache_status)
+            fitted = None
             if previous is not None:
                 trial = replace(previous, stage=stage, index=trial_index, config=config)
+                if retain_fits:
+                    # Compact trial checkpoints intentionally omit parameter
+                    # arrays.  Rebuild the endpoint on the identical inner
+                    # training split rather than borrowing the later
+                    # train+validation refit, which would leak validation.
+                    fitted = UnifiedPUModel(
+                        config,
+                        fit_config,
+                        warm_start_cache=warm_start_cache,
+                    ).fit(train_safe, exposure=train_exposure, seed=trial_seed)
+                    rebuilt_q = fitted.predict_observed(
+                        validation_safe.X_cell,
+                        exposure=validation_exposure,
+                        x_nuisance=validation_safe.X_nuisance,
+                    )
+                    rebuilt_loss = masked_log_loss(
+                        validation_safe.S_observed,
+                        rebuilt_q,
+                        validation_safe.W_measured,
+                    )
+                    if (
+                        fitted.converged != trial.converged
+                        or not np.isclose(
+                            rebuilt_loss,
+                            trial.validation_loss,
+                            rtol=1e-8,
+                            atol=1e-10,
+                        )
+                    ):
+                        raise RuntimeError(
+                            "rebuilt inner-training endpoint does not match its "
+                            "cached tuning trial"
+                        )
+                    cache_status = f"{cache_status}+inner_train_refit"
             else:
-                fitted = UnifiedPUModel(config, fit_config, warm_start_cache=warm_start_cache).fit(
-                    train_safe, exposure=train_exposure, seed=trial_seed
-                )
+                fitted = UnifiedPUModel(
+                    config,
+                    fit_config,
+                    warm_start_cache=warm_start_cache,
+                    joint_endpoint_starts=joint_endpoint_starts,
+                ).fit(train_safe, exposure=train_exposure, seed=trial_seed)
                 q_validation = fitted.predict_observed(
                     validation_safe.X_cell,
                     exposure=validation_exposure,
                     x_nuisance=validation_safe.X_nuisance,
                 )
                 score = masked_log_loss(validation_safe.S_observed, q_validation, validation_safe.W_measured)
+                total_shrinkage, residual_shared_ratio = _joint_penalty_summary(
+                    config
+                )
                 trial = TrialResult(
                     stage=stage, index=trial_index, config=config,
                     validation_loss=score, converged=fitted.converged,
                     iterations=fitted.iterations, seed=trial_seed,
+                    total_shrinkage=total_shrinkage,
+                    residual_shared_ratio=residual_shared_ratio,
+                    optimizer_message=fitted.message,
                 )
                 if checkpoint_store is not None:
                     checkpoint_store.save_complete(checkpoint_key, cache_fingerprint, {"trial": trial.to_dict()})
                 cache_status = "fitted"
+            if fitted is not None and retain_fits:
+                fitted_by_identity[canonical_json(model_identity(config))] = fitted
             memory[cache_key] = trial
             trials.append(trial)
             stage_trials.append(trial)
@@ -495,25 +976,137 @@ def tune_model(
              elapsed_seconds=perf_counter() - stage_started)
         return tuple(stage_trials)
 
-    if required:
-        # The incumbent endpoint policy is deliberately independent of the
-        # enumeration used by the legacy include_endpoints grid.  Positive
-        # ranks are genuine Joint configurations; rank zero is a direct alias
-        # and is therefore not counted against the native Joint budget.
+    def evaluate_rank_top2_total_ratio(
+        starts: JointEndpointStarts | None,
+    ) -> tuple[TrialResult, ...]:
+        """Run the genuine-Joint portion of the adaptive bounded search."""
+
+        if base_model.kind != "joint":
+            raise ValueError("rank_top2_total_ratio is Joint-specific")
         positive_ranks = tuple(rank for rank in tuning.ranks if rank > 0)
+        if not positive_ranks:
+            return ()
+        adaptive_tuning = replace(
+            tuning,
+            ranks=positive_ranks,
+            include_endpoints=False,
+            candidate_budget=None,
+        )
+        rank_candidates = _stage_one_candidates(base_model, adaptive_tuning)
+        if tuning.candidate_budget is not None:
+            screen_count = _joint_rank_screen_count(
+                len(rank_candidates), tuning.candidate_budget
+            )
+            if screen_count < len(rank_candidates):
+                rank_candidates = select_balanced_candidates(
+                    rank_candidates, screen_count
+                )
+        rank_trials = evaluate(
+            rank_candidates,
+            "rank",
+            joint_endpoint_starts=starts,
+        )
+        retained = _top_rank_trials(rank_trials, count=2)
+        refinement_pool: list[ModelConfig] = []
+        for rank_trial in retained:
+            refinement_pool.extend(
+                _stage_two_candidates(
+                    base_model, adaptive_tuning, rank_trial.config.rank
+                )
+            )
+        done = {
+            canonical_json(model_identity(trial.config))
+            for trial in rank_trials
+        }
+        refinement = tuple(
+            candidate
+            for candidate in refinement_pool
+            if candidate.shared_l2 > 0
+            and candidate.residual_l2 > 0
+            and canonical_json(model_identity(candidate)) not in done
+        )
+        if tuning.candidate_budget is not None:
+            remaining = tuning.candidate_budget - len(rank_trials)
+            refinement = (
+                ()
+                if remaining <= 0 or not refinement
+                else _select_joint_shrinkage_candidates(
+                    refinement, min(remaining, len(refinement))
+                )
+            )
+        elif refinement:
+            refinement = _select_joint_shrinkage_candidates(
+                refinement, len(refinement)
+            )
+        penalty_trials = (
+            evaluate(
+                refinement,
+                "penalty",
+                joint_endpoint_starts=starts,
+            )
+            if refinement
+            else ()
+        )
+        result = (*rank_trials, *penalty_trials)
+        if (
+            tuning.candidate_budget is not None
+            and len(result) > tuning.candidate_budget
+        ):
+            raise RuntimeError(
+                "internal error: Joint native candidate budget exceeded"
+            )
+        return result
+
+    if required:
+        # Evaluate and retain exact endpoint fits first.  These fits use only
+        # inner-training rows; validation is used solely for their score.  The
+        # endpoint trials remain selectable boundary models but never consume
+        # the native Joint candidate budget.
+        positive_ranks = tuple(rank for rank in tuning.ranks if rank > 0)
+        endpoint_trials = evaluate(
+            required,
+            "inherited_endpoint",
+            retain_fits=bool(positive_ranks),
+        )
+        endpoint_fits: dict[str, FittedModel] = {}
+        if positive_ranks:
+            for endpoint in required:
+                key = canonical_json(model_identity(endpoint))
+                fitted_endpoint = fitted_by_identity.get(key)
+                if fitted_endpoint is None:
+                    raise RuntimeError("failed to retain an inner-training endpoint fit")
+                if endpoint.kind in endpoint_fits:
+                    raise ValueError(
+                        f"multiple tuned {endpoint.kind} endpoints make Joint initialization ambiguous"
+                    )
+                endpoint_fits[endpoint.kind] = fitted_endpoint
+            if set(endpoint_fits) != {"direct", "lowrank"}:
+                raise ValueError(
+                    "endpoint-aware Joint tuning requires exactly one tuned direct "
+                    "and one tuned low-rank endpoint"
+                )
+            joint_starts = JointEndpointStarts(
+                direct=endpoint_fits["direct"],
+                lowrank=endpoint_fits["lowrank"],
+            )
+        else:
+            joint_starts = None
+
+        # Positive ranks are genuine Joint structures; rank zero is the exact
+        # direct endpoint and is already represented above.  The explicit
+        # rank_top2_total_ratio strategy screens ranks before penalties so a
+        # 32-candidate budget is not spent on arbitrary Cartesian triples.
+        # Legacy strategies retain their advertised enumeration semantics.
         native_trials: tuple[TrialResult, ...]
         if not positive_ranks:
             native_trials = ()
         else:
-            # Keep the declared search strategy.  In particular, a staged
-            # Joint search gets a rank stage followed by a penalty stage; the
-            # only difference from the ordinary path is that its budget is
-            # reserved for genuine Joint candidates and exact standalone
-            # winners are appended afterwards.
             native_tuning = replace(
-                tuning, ranks=positive_ranks, include_endpoints=False
+                tuning, ranks=positive_ranks, include_endpoints=False,
             )
-            if tuning.strategy == "staged_rank_l2":
+            if tuning.strategy == "rank_top2_total_ratio":
+                native_trials = evaluate_rank_top2_total_ratio(joint_starts)
+            elif tuning.strategy == "staged_rank_l2":
                 first = _stage_one_candidates(base_model, native_tuning)
                 if tuning.candidate_budget is not None:
                     first_budget = min(
@@ -521,7 +1114,9 @@ def tune_model(
                         max(1, tuning.candidate_budget // 2),
                     )
                     first = _budget_candidates(first, first_budget)
-                rank_trials = evaluate(first, "rank")
+                rank_trials = evaluate(
+                    first, "rank", joint_endpoint_starts=joint_starts
+                )
                 selected = _winner(rank_trials).config
                 second = _stage_two_candidates(
                     selected, native_tuning, selected.rank
@@ -542,12 +1137,39 @@ def tune_model(
                         if remaining <= 0
                         else _budget_candidates(second, remaining)
                     )
-                native_trials = (*rank_trials, *evaluate(second, "penalty"))
+                native_trials = (
+                    *rank_trials,
+                    *evaluate(
+                        second,
+                        "penalty",
+                        joint_endpoint_starts=joint_starts,
+                    ),
+                )
             else:
                 native = full_joint_candidates(base_model, native_tuning)
-                native_trials = evaluate(native, "joint_grid")
-        endpoint_trials = evaluate(required, "inherited_endpoint")
+                native_trials = evaluate(
+                    native,
+                    "joint_grid",
+                    joint_endpoint_starts=joint_starts,
+                )
+        if (
+            tuning.candidate_budget is not None
+            and len(native_trials) > tuning.candidate_budget
+        ):
+            raise RuntimeError("internal error: Joint native candidate budget exceeded")
         selectable = (*native_trials, *endpoint_trials)
+    elif tuning.strategy == "rank_top2_total_ratio":
+        if base_model.kind == "joint":
+            raise ValueError(
+                "rank_top2_total_ratio Joint tuning requires include_endpoints=True "
+                "and the tuned direct/low-rank configs in required_endpoints"
+            )
+        else:
+            # The adaptive reparameterization is Joint-specific. Direct and
+            # low-rank endpoints retain their bounded Cartesian searches.
+            selectable = evaluate(
+                full_joint_candidates(base_model, tuning), "joint_grid"
+            )
     elif tuning.strategy == "full_joint" or base_model.kind == "direct":
         selectable = evaluate(full_joint_candidates(base_model, tuning), "joint_grid")
     else:

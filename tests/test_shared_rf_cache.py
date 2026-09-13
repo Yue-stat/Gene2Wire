@@ -1,7 +1,9 @@
 """Reuse fitted predictions without reusing a different scenario's selection."""
 from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
 import os
 from threading import Barrier
+import time
 from unittest.mock import patch
 
 import numpy as np
@@ -58,3 +60,51 @@ def test_concurrent_identical_rf_fits_compute_once(tmp_path, monkeypatch):
     assert len(calls) == 1
     assert sorted(result[2] for result in results) == [False, True]
     np.testing.assert_array_equal(results[0][0], results[1][0])
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or "fork" not in multiprocessing.get_all_start_methods(),
+    reason="Cross-process OnDemand deduplication requires POSIX fork and record locks",
+)
+def test_processes_share_one_rf_fit_without_candidate_lock_files(tmp_path, monkeypatch):
+    context = multiprocessing.get_context("fork")
+    calls = context.Value("i", 0)
+    gate = context.Barrier(2)
+    outputs = context.Queue()
+
+    def fitted(x, y, mask, x_predict, **kwargs):
+        with calls.get_lock():
+            calls.value += 1
+        time.sleep(0.15)
+        return np.full((len(x_predict), y.shape[1]), 0.4), {}
+
+    monkeypatch.setattr(baselines, "_fit_predict", fitted)
+    x = np.arange(12, dtype=float).reshape(6, 2)
+    labels = np.array([[0], [1], [0], [1], [0], [1]])
+
+    def run():
+        try:
+            gate.wait(timeout=10)
+            result = baselines._cached_fit_predict(
+                x, labels, np.ones_like(labels, dtype=bool), x[:2],
+                kind="random_forest", config={"n_estimators": 8}, seed=1,
+                checkpoint_dir=tmp_path,
+            )
+            outputs.put(("ok", result[2], result[0]))
+        except BaseException as error:  # Surface child failures in the parent assertion.
+            outputs.put(("error", repr(error), None))
+
+    processes = [context.Process(target=run) for _ in range(2)]
+    for process in processes:
+        process.start()
+    results = [outputs.get(timeout=15) for _ in processes]
+    for process in processes:
+        process.join(timeout=15)
+        assert process.exitcode == 0
+
+    assert all(result[0] == "ok" for result in results), results
+    assert calls.value == 1
+    assert sorted(result[1] for result in results) == [False, True]
+    np.testing.assert_array_equal(results[0][2], results[1][2])
+    assert not list(tmp_path.glob("baseline_*.lock"))
+    assert (tmp_path / ".baseline-fit-locks").is_file()

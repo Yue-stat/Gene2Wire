@@ -10,7 +10,7 @@ import numpy as np
 
 from ..config import FitConfig, ModelConfig, TuningConfig
 
-PROTOCOL_VERSION = "0912-v5-measurement-degradation"
+PROTOCOL_VERSION = "0912-v6-measurement-degradation"
 MODEL_ORDER = ("Logistic", "MIRT", "Joint", "PU", "PU-MIRT", "PU-Joint")
 
 
@@ -57,7 +57,11 @@ class Settings:
                 raise ValueError(f"{field} must be a positive integer")
         if self.n_outer_folds < 2:
             raise ValueError("At least two outer folds are required")
-        if self.strategy not in {"full_joint", "staged_rank_l2"}:
+        if self.strategy not in {
+            "full_joint",
+            "staged_rank_l2",
+            "rank_top2_total_ratio",
+        }:
             raise ValueError("Unknown tuning strategy")
         if self.parallel_unit not in {"scenario", "fold"}:
             raise ValueError("parallel_unit must be 'scenario' or 'fold'")

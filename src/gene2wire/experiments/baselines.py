@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 from time import perf_counter
 from typing import Any, Callable, Literal, Mapping, Sequence
 from zipfile import BadZipFile
@@ -23,6 +24,10 @@ import sklearn
 from sklearn.ensemble import RandomForestClassifier
 
 from ..checkpoint import canonical_json, sha256_array, sha256_source_tree
+
+
+_FIT_THREAD_LOCKS: dict[tuple[str, int], threading.Lock] = {}
+_FIT_THREAD_LOCKS_GUARD = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -164,17 +169,32 @@ def _exclusive_fit(path: Path | None):
     Other platforms retain atomic, validated checkpoints but may compute an
     identical fit concurrently. No labels or fitted model objects are pickled.
     """
-    if path is None or os.name != "posix":
+    if path is None:
         yield
         return
-    import fcntl
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.with_suffix(path.suffix + ".lock").open("a+b") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-        try:
+    # One byte-range lock file replaces one persistent ``.lock`` file per RF
+    # candidate. Distinct identities can still fit concurrently; identical
+    # fits map to the same stable byte and remain deduplicated across workers.
+    lock_path = path.parent / ".baseline-fit-locks"
+    lock_offset = int(hashlib.sha256(path.name.encode("utf-8")).hexdigest()[:8], 16)
+    thread_key = (str(lock_path.resolve()), lock_offset)
+    with _FIT_THREAD_LOCKS_GUARD:
+        thread_lock = _FIT_THREAD_LOCKS.setdefault(thread_key, threading.Lock())
+    # POSIX record locks are process-scoped, so two threads in the same worker
+    # can both acquire the same byte. The keyed Python lock closes that gap;
+    # the byte-range lock then coordinates independent Loky/process workers.
+    with thread_lock:
+        if os.name != "posix":
             yield
-        finally:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            return
+        import fcntl
+        with lock_path.open("a+b") as stream:
+            fcntl.lockf(stream.fileno(), fcntl.LOCK_EX, 1, lock_offset, os.SEEK_SET)
+            try:
+                yield
+            finally:
+                fcntl.lockf(stream.fileno(), fcntl.LOCK_UN, 1, lock_offset, os.SEEK_SET)
 
 
 def _cached_fit_predict(x: np.ndarray, y: np.ndarray, mask: np.ndarray, x_predict: np.ndarray,

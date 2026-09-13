@@ -34,9 +34,12 @@ from .pipeline import Artifacts, _atomic_csv, _execute, slug
 from .protocol import Settings, fingerprint
 
 
-GENE_COVERAGE_GRID = (1.0, 5.0 / 6.0, 2.0 / 3.0, 0.5)
-TARGET_COVERAGE_GRID = (1.0, 2.0 / 3.0, 0.5)
-RETENTION_GRID = (1.0, 0.75, 0.50, 0.25, 0.10)
+# Fast canonical grid.  The 100% control remains literal full coverage; the
+# lower levels are per-assay coverages and may round to dataset-specific actual
+# values, which are always exported by the panel audit tables.
+GENE_COVERAGE_GRID = (1.0, 0.7, 0.4)
+TARGET_COVERAGE_GRID = (1.0, 0.7, 0.4)
+RETENTION_GRID = (1.0, 0.7, 0.4, 0.10)
 
 
 def _probability_grid(values: Sequence[float], name: str) -> tuple[float, ...]:
@@ -59,14 +62,14 @@ class MeasurementConfig:
     gene_coverages: tuple[float, ...] = GENE_COVERAGE_GRID
     target_coverages: tuple[float, ...] = TARGET_COVERAGE_GRID
     retentions: tuple[float, ...] = RETENTION_GRID
-    anchor_gene_coverage: float = 2.0 / 3.0
-    anchor_target_coverage: float = 2.0 / 3.0
-    anchor_retention: float = 0.50
+    anchor_gene_coverage: float = 0.7
+    anchor_target_coverage: float = 0.7
+    anchor_retention: float = 0.4
     assay_ids: tuple[str, ...] = DEFAULT_ASSAYS
     heterogeneity_delta: float = 1.0
     include_matched_uniform: bool = True
     include_natural_recovery: bool = True
-    n_panel_seeds: int = 5
+    n_panel_seeds: int = 2
 
     def __post_init__(self) -> None:
         genes = _probability_grid(self.gene_coverages, "gene_coverages")

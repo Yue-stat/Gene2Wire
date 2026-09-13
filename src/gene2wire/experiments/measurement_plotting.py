@@ -173,6 +173,79 @@ def plot_retention_auprc(
     return figure, axis
 
 
+def plot_coverage_auprc(
+    table: pd.DataFrame,
+    *,
+    coverage_col: str,
+    coverage_label: str | None = None,
+    mode: str = "key",
+    key_models: Sequence[str] = KEY_MODELS,
+    model_col: str = "model",
+    metric_col: str = "macro_auprc",
+    ax: Axes | None = None,
+    title: str | None = None,
+) -> tuple[Figure, Axes]:
+    """Plot mean macro-AUPRC against gene or target coverage.
+
+    Callers select the scientific slice before plotting: a gene-coverage curve
+    must hold target coverage and positive retention fixed, while a
+    target-coverage curve must hold gene coverage and retention fixed.  This
+    function deliberately does not guess those anchors from the results.
+    Multiple rows at a model/coverage coordinate are treated as repetitions
+    and averaged.  The y-axis is data-scaled rather than pinned to zero.
+    """
+
+    if not isinstance(coverage_col, str) or not coverage_col.strip():
+        raise ValueError("coverage_col must be a nonempty column name")
+    name = "coverage table"
+    frame = _table(table, (coverage_col, model_col, metric_col), name=name)
+    frame[coverage_col] = _numeric(
+        frame, coverage_col, name=name, probability=True
+    )
+    frame[metric_col] = _numeric(frame, metric_col, name=name, probability=True)
+    frame[model_col] = _labels(frame, model_col, name=name)
+    if mode not in {"key", "full"}:
+        raise ValueError("mode must be 'key' or 'full'")
+    if mode == "key":
+        requested = tuple(map(str, key_models))
+        if not requested or len(set(requested)) != len(requested):
+            raise ValueError("key_models must contain distinct model names")
+        frame = frame.loc[frame[model_col].isin(requested)].copy()
+        models = [model for model in requested if model in set(frame[model_col])]
+        if not models:
+            raise ValueError("coverage table contains none of the requested key models")
+    else:
+        models = _ordered_models(frame[model_col])
+
+    summary = (
+        frame.groupby([model_col, coverage_col], observed=True, sort=False)[metric_col]
+        .mean()
+        .reset_index()
+    )
+    figure, axis = _figure_axis(ax, figsize=(7.0, 4.3))
+    for index, model in enumerate(models):
+        selected = summary.loc[summary[model_col].eq(model)].sort_values(coverage_col)
+        if selected.empty:
+            continue
+        axis.plot(
+            selected[coverage_col], selected[metric_col], marker="o",
+            linewidth=1.8, markersize=4.5, label=model,
+            color=_model_color(model, index),
+        )
+    label = coverage_label or coverage_col.replace("_", " ").strip().title()
+    if not isinstance(label, str) or not label.strip():
+        raise ValueError("coverage_label must be None or a nonempty string")
+    axis.set_xlabel(label)
+    axis.set_ylabel("Macro AUPRC ↑")
+    axis.set_xlim(0.0, 1.0)
+    axis.xaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=0))
+    axis.grid(axis="y", color="#E6E6E6", linewidth=0.7)
+    axis.spines[["top", "right"]].set_visible(False)
+    axis.legend(frameon=False, ncol=2 if len(models) > 6 else 1)
+    axis.set_title(title or f"{label} degradation")
+    return figure, axis
+
+
 def plot_gene_target_brier_heatmap(
     table: pd.DataFrame,
     *,
@@ -349,6 +422,7 @@ def plot_projection_tags_budget_recall(
 
 # Longer aliases keep notebook calls readable while retaining compact public names.
 plot_retention_auprc_curve = plot_retention_auprc
+plot_coverage_auprc_curve = plot_coverage_auprc
 plot_accuracy_panel_sensitivity_scatter = plot_accuracy_panel_sensitivity
 plot_projection_tags_budget_recall_curve = plot_projection_tags_budget_recall
 
@@ -358,6 +432,8 @@ __all__ = [
     "FULL_MODEL_ORDER",
     "plot_retention_auprc",
     "plot_retention_auprc_curve",
+    "plot_coverage_auprc",
+    "plot_coverage_auprc_curve",
     "plot_gene_target_brier_heatmap",
     "plot_accuracy_panel_sensitivity",
     "plot_accuracy_panel_sensitivity_scatter",
