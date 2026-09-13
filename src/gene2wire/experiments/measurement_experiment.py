@@ -660,48 +660,101 @@ def _manifest(config: MeasurementConfig) -> dict:
     }
 
 
+_HEATMAP_COMPARISON_MODEL = "PU-Joint"
+_HEATMAP_BASELINE_CANDIDATES = (
+    "PU",
+    "GenEML-adapted",
+    "Inductive-PU-MC",
+    "SAR-PU",
+)
+
+
 def _add_heatmap_contrasts(artifacts: Artifacts) -> None:
     """Choose one baseline using development losses, then freeze it for the grid."""
     tuning = artifacts.tables.get("tuning", pd.DataFrame())
     metrics = artifacts.tables.get("metrics", pd.DataFrame())
-    candidates = ("PU", "PU-Joint", "RF-reference")
-    required = {"model", "validation_loss", "condition_roles", "outer_fold", "repetition"}
+    required = {
+        "model", "validation_loss", "converged", "condition_roles",
+        "outer_fold", "repetition",
+    }
+    selection_columns = [
+        "model", "mean_development_validation_loss",
+        "n_attempted_development_units", "n_valid_development_units",
+        "n_expected_development_units", "full_grid_eligible", "selected",
+    ]
     selection = pd.DataFrame()
     if required.issubset(tuning):
-        frame = tuning.loc[
+        heatmap_tuning = tuning.loc[
             tuning["condition_roles"].astype(str).str.contains("coverage_heatmap", regex=False)
-            & tuning["model"].isin(candidates)
         ].copy()
+        attempted = heatmap_tuning.loc[
+            heatmap_tuning["model"].isin(_HEATMAP_BASELINE_CANDIDATES)
+        ].copy()
+        frame = attempted.copy()
         frame["validation_loss"] = pd.to_numeric(frame["validation_loss"], errors="coerce")
         frame = frame.loc[np.isfinite(frame["validation_loss"])]
-        if not frame.empty:
-            units = [column for column in (
-                "dataset", "sharing_strength", "mechanism", "panel_seed",
+        frame = frame.loc[
+            frame["converged"].map(
+                lambda value: str(value).strip().lower() in {"true", "1"}
+            )
+        ]
+        if not heatmap_tuning.empty:
+            unit_columns = [column for column in (
+                "dataset", "sharing_strength", "experiment", "analysis",
+                "mechanism", "calibration_fraction", "calibration_spec",
+                "condition_roles", "data_repetition", "panel_seed",
                 "repetition", "outer_fold", "gene_requested_coverage",
-                "gene_coverage", "target_requested_coverage", "target_coverage",
-                "positive_retention", "model"
-            ) if column in frame]
-            best = frame.groupby(units, dropna=False, observed=True)["validation_loss"].min()
-            selection = (best.groupby("model").mean().sort_values()
-                         .rename("mean_development_validation_loss").reset_index())
+                "gene_coverage", "target_requested_coverage",
+                "target_coverage", "positive_retention",
+            ) if column in heatmap_tuning]
+            units = unit_columns + ["model"]
+            best = (frame.groupby(units, dropna=False, observed=True)["validation_loss"]
+                    .min().reset_index()) if not frame.empty else pd.DataFrame(
+                        columns=units + ["validation_loss"])
+            expected_units = len(heatmap_tuning[unit_columns].drop_duplicates())
+            attempted_counts = (attempted[unit_columns + ["model"]].drop_duplicates()
+                                .groupby("model", observed=True).size()
+                                if not attempted.empty else pd.Series(dtype=int))
+            valid_counts = best.groupby("model", observed=True).size()
+            mean_loss = best.groupby("model", observed=True)["validation_loss"].mean()
+            models = list(_HEATMAP_BASELINE_CANDIDATES)
+            selection = pd.DataFrame({
+                "model": models,
+                "mean_development_validation_loss": [mean_loss.get(model, np.nan)
+                                                       for model in models],
+                "n_attempted_development_units": [int(attempted_counts.get(model, 0))
+                                                   for model in models],
+                "n_valid_development_units": [int(valid_counts.get(model, 0))
+                                               for model in models],
+                "n_expected_development_units": expected_units,
+            })
+            selection["full_grid_eligible"] = (
+                selection["n_attempted_development_units"].eq(expected_units)
+                & selection["n_valid_development_units"].eq(expected_units)
+            )
+            selection = selection.sort_values(
+                ["full_grid_eligible", "mean_development_validation_loss", "model"],
+                ascending=(False, True, True), na_position="last",
+            ).reset_index(drop=True)
             selection["selected"] = False
-            selection.loc[selection.index[0], "selected"] = True
+            eligible = selection["full_grid_eligible"]
+            if eligible.any():
+                selection.loc[selection.index[eligible][0], "selected"] = True
     if selection.empty:
-        selection = pd.DataFrame({
-            "model": ["PU"], "mean_development_validation_loss": [np.nan],
-            "selected": [True], "fallback_reason": ["no comparable finite tuning rows"],
-        })
-    baseline = str(selection.loc[selection["selected"], "model"].iloc[0])
+        selection = pd.DataFrame(columns=selection_columns)
     artifacts.tables["heatmap_baseline_selection"] = selection
+    selected = selection.loc[selection.get(
+        "selected", pd.Series(False, index=selection.index)).eq(True), "model"]
+    baseline = str(selected.iloc[0]) if len(selected) == 1 else None
 
     required_metrics = {"model", "condition_roles", "evaluation_scope",
                         "gene_coverage", "target_coverage", "macro_brier"}
     contrast = pd.DataFrame()
-    if required_metrics.issubset(metrics):
+    if baseline is not None and required_metrics.issubset(metrics):
         frame = metrics.loc[
             metrics["condition_roles"].astype(str).str.contains("coverage_heatmap", regex=False)
             & metrics["evaluation_scope"].eq("native_reference")
-            & metrics["model"].isin((baseline, "PU-MIRT"))
+            & metrics["model"].isin((baseline, _HEATMAP_COMPARISON_MODEL))
         ].copy()
         if not frame.empty:
             # Average folds/panel seeds only within a fully identified
@@ -726,12 +779,14 @@ def _add_heatmap_contrasts(artifacts: Artifacts) -> None:
             summary = (frame.groupby(coordinates + ["model"], dropna=False,
                                      observed=True)["macro_brier"]
                        .mean().unstack("model"))
-            if baseline in summary and "PU-MIRT" in summary:
+            if baseline in summary and _HEATMAP_COMPARISON_MODEL in summary:
                 contrast = summary.reset_index()
                 contrast["baseline_model"] = baseline
-                contrast["comparison_model"] = "PU-MIRT"
+                contrast["comparison_model"] = _HEATMAP_COMPARISON_MODEL
                 contrast["baseline_macro_brier"] = summary[baseline].to_numpy()
-                contrast["comparison_macro_brier"] = summary["PU-MIRT"].to_numpy()
+                contrast["comparison_macro_brier"] = summary[
+                    _HEATMAP_COMPARISON_MODEL
+                ].to_numpy()
                 contrast["brier_contrast"] = (
                     contrast["baseline_macro_brier"]
                     - contrast["comparison_macro_brier"]
@@ -747,7 +802,7 @@ def _add_heatmap_contrasts(artifacts: Artifacts) -> None:
                     contrast["baseline_probability_semantics"] = (
                         semantics[baseline].to_numpy())
                     contrast["comparison_probability_semantics"] = (
-                        semantics["PU-MIRT"].to_numpy())
+                        semantics[_HEATMAP_COMPARISON_MODEL].to_numpy())
     artifacts.tables["heatmap_contrasts"] = contrast
     for name in ("heatmap_baseline_selection", "heatmap_contrasts"):
         _atomic_csv(artifacts.tables[name], artifacts.export_dir / f"{name}.csv")

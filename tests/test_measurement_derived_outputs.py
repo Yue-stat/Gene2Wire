@@ -42,8 +42,19 @@ def test_heatmap_contrast_preserves_scientific_coordinates(tmp_path):
         ("data-a", 0.0, "assay_target_sar", 0.50, 0.30, 0.20),
         ("data-b", 1.0, "scar", 0.25, 0.50, 0.10),
     )
-    for dataset, sharing, mechanism, retention, baseline_brier, mirt_brier in conditions:
-        for model, loss in (("PU", 0.1), ("PU-Joint", 0.2)):
+    for dataset, sharing, mechanism, retention, baseline_brier, joint_brier in conditions:
+        for model, loss, converged in (
+            ("PU", 0.1, True),
+            ("SAR-PU", 0.3, True),
+            # A numerically tempting but non-converged external comparator is
+            # audited, not allowed to become the fixed baseline.
+            ("Inductive-PU-MC", 0.001, False),
+            # Neither member of the proposed-method family is eligible to be
+            # selected as the fixed comparator, even with a lower loss.
+            ("PU-MIRT", 0.01, True),
+            ("PU-Joint", 0.02, True),
+            ("RF-reference", 0.0001, True),
+        ):
             tuning_rows.append({
                 "dataset": dataset, "sharing_strength": sharing,
                 "mechanism": mechanism, "panel_seed": 0, "repetition": 0,
@@ -51,9 +62,9 @@ def test_heatmap_contrast_preserves_scientific_coordinates(tmp_path):
                 "gene_coverage": 0.67, "target_requested_coverage": 2 / 3,
                 "target_coverage": 0.67, "positive_retention": retention,
                 "condition_roles": "coverage_heatmap", "model": model,
-                "validation_loss": loss,
+                "validation_loss": loss, "converged": converged,
             })
-        for model, brier in (("PU", baseline_brier), ("PU-MIRT", mirt_brier)):
+        for model, brier in (("PU", baseline_brier), ("PU-Joint", joint_brier)):
             metric_rows.append({
                 "dataset": dataset, "sharing_strength": sharing,
                 "experiment": "measurement_degradation", "analysis": "primary",
@@ -77,13 +88,71 @@ def test_heatmap_contrast_preserves_scientific_coordinates(tmp_path):
 
     selection = artifacts.tables["heatmap_baseline_selection"]
     assert selection.loc[selection["selected"], "model"].tolist() == ["PU"]
+    assert not set(selection["model"]).intersection({"PU-MIRT", "PU-Joint"})
+    assert "RF-reference" not in set(selection["model"])
+    assert not selection.loc[
+        selection["model"].eq("Inductive-PU-MC"), "full_grid_eligible"
+    ].iloc[0]
     contrast = artifacts.tables["heatmap_contrasts"].sort_values("dataset")
     assert contrast["dataset"].tolist() == ["data-a", "data-b"]
     assert contrast["sharing_strength"].tolist() == [0.0, 1.0]
     assert contrast["mechanism"].tolist() == ["assay_target_sar", "scar"]
     assert contrast["positive_retention"].tolist() == [0.5, 0.25]
     np.testing.assert_allclose(contrast["brier_contrast"], [0.1, 0.4])
+    assert contrast["comparison_model"].eq("PU-Joint").all()
     assert contrast["baseline_probability_semantics"].eq("reference").all()
+    assert contrast["comparison_probability_semantics"].eq("reference").all()
+
+
+def test_heatmap_baseline_requires_convergence_and_complete_design(tmp_path):
+    rows = []
+    for outer_fold in (0, 1):
+        # PU and SAR-PU each miss one of the two designed units. PU-Joint is
+        # not a baseline candidate, but establishes the complete design grid.
+        rows.append({
+            "dataset": "data", "condition_roles": "coverage_heatmap",
+            "repetition": 0, "outer_fold": outer_fold,
+            "gene_coverage": 0.5, "target_coverage": 0.5,
+            "model": "PU-Joint", "validation_loss": 0.2,
+            "converged": True,
+        })
+    rows.extend((
+        {
+            "dataset": "data", "condition_roles": "coverage_heatmap",
+            "repetition": 0, "outer_fold": 0,
+            "gene_coverage": 0.5, "target_coverage": 0.5,
+            "model": "PU", "validation_loss": 0.1, "converged": True,
+        },
+        {
+            "dataset": "data", "condition_roles": "coverage_heatmap",
+            "repetition": 0, "outer_fold": 1,
+            "gene_coverage": 0.5, "target_coverage": 0.5,
+            "model": "SAR-PU", "validation_loss": 0.01, "converged": False,
+        },
+    ))
+    artifacts = _artifacts(tmp_path, tuning=pd.DataFrame(rows))
+
+    _add_heatmap_contrasts(artifacts)
+
+    selection = artifacts.tables["heatmap_baseline_selection"]
+    assert not selection["selected"].any()
+    assert not selection["full_grid_eligible"].any()
+    assert selection["n_expected_development_units"].eq(2).all()
+    assert artifacts.tables["heatmap_contrasts"].empty
+
+
+def test_heatmap_baseline_rejects_missing_convergence_evidence(tmp_path):
+    tuning = pd.DataFrame({
+        "model": ["PU"], "validation_loss": [0.1],
+        "condition_roles": ["coverage_heatmap"],
+        "repetition": [0], "outer_fold": [0],
+    })
+    artifacts = _artifacts(tmp_path, tuning=tuning)
+
+    _add_heatmap_contrasts(artifacts)
+
+    assert artifacts.tables["heatmap_baseline_selection"].empty
+    assert artifacts.tables["heatmap_contrasts"].empty
 
 
 def test_panel_stability_retains_anchor_coordinates_and_semantics(tmp_path):

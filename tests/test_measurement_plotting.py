@@ -39,6 +39,7 @@ def test_retention_plot_has_key_and_full_model_modes_and_averages_repetitions():
     np.testing.assert_allclose(pu.get_xdata(), [0.1, 0.5, 1.0])
     np.testing.assert_allclose(pu.get_ydata(), [0.225, 0.305, 0.405])
     assert axis.get_xlabel() == "Positive-label retention"
+    assert axis.get_ylim()[0] > 0.0
     plt.close(figure)
 
     figure, axis = plot_retention_auprc(table, mode="full")
@@ -66,19 +67,19 @@ def test_brier_heatmap_uses_one_fixed_baseline_and_zero_centered_scale():
             difference = (row - column) * 0.02 + 0.01
             expected[row, column] = difference
             for repetition in (0, 1):
-                pu_mirt = 0.18 + .005 * repetition
+                pu_joint = 0.18 + .005 * repetition
                 rows.extend((
                     {"gene_coverage": gene_coverage,
                      "target_coverage": target_coverage, "model": "Fixed baseline",
-                     "macro_brier": pu_mirt + difference},
+                     "macro_brier": pu_joint + difference},
                     {"gene_coverage": gene_coverage,
-                     "target_coverage": target_coverage, "model": "PU-MIRT",
-                     "macro_brier": pu_mirt},
+                     "target_coverage": target_coverage, "model": "PU-Joint",
+                     "macro_brier": pu_joint},
                     # A stronger per-cell model must not be selected in place of
                     # the predeclared fixed comparator.
                     {"gene_coverage": gene_coverage,
                      "target_coverage": target_coverage, "model": "Other",
-                     "macro_brier": pu_mirt - 0.1},
+                     "macro_brier": pu_joint - 0.1},
                 ))
     figure, axis = plot_gene_target_brier_heatmap(
         pd.DataFrame(rows), baseline_model="Fixed baseline")
@@ -97,11 +98,11 @@ def test_brier_heatmap_marks_incomplete_grid_cells_as_na():
         {"gene_coverage": .5, "target_coverage": .5,
          "model": "PU", "macro_brier": .20},
         {"gene_coverage": .5, "target_coverage": .5,
-         "model": "PU-MIRT", "macro_brier": .18},
+         "model": "PU-Joint", "macro_brier": .18},
         {"gene_coverage": 1., "target_coverage": 1.,
          "model": "PU", "macro_brier": .19},
         {"gene_coverage": 1., "target_coverage": 1.,
-         "model": "PU-MIRT", "macro_brier": .18},
+         "model": "PU-Joint", "macro_brier": .18},
     ])
     figure, axis = plot_gene_target_brier_heatmap(table)
     assert sum(text.get_text() == "NA" for text in axis.texts) == 2
@@ -121,6 +122,7 @@ def test_accuracy_sensitivity_scatter_aggregates_one_point_per_model_and_reuses_
     offsets = np.vstack([collection.get_offsets()[0] for collection in axis.collections])
     np.testing.assert_allclose(offsets, [[.12, .32], [.09, .36]])
     assert {text.get_text() for text in axis.texts} == {"PU", "PU-MIRT"}
+    assert axis.get_ylim()[0] > 0.0
     plt.close(figure)
 
 
@@ -133,7 +135,8 @@ def test_projection_tags_budget_recall_curve_sorts_budgets_and_checks_columns():
     figure, axis = plot_projection_tags_budget_recall(table)
     assert [line.get_label() for line in axis.lines] == ["PU", "PU-MIRT"]
     np.testing.assert_allclose(axis.lines[0].get_xdata(), [.01, .05, .20])
-    assert axis.get_ylim() == (0.0, 1.0)
+    assert axis.get_ylim()[0] > 0.0
+    assert axis.get_ylim()[1] < 1.0
     plt.close(figure)
 
     with pytest.raises(ValueError, match="missing required columns"):

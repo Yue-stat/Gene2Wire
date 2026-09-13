@@ -165,7 +165,6 @@ def plot_retention_auprc(
     axis.set_xlabel("Positive-label retention")
     axis.set_ylabel("Macro AUPRC ↑")
     axis.set_xlim(0.0, 1.0)
-    axis.set_ylim(bottom=0.0)
     axis.xaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=0))
     axis.grid(axis="y", color="#E6E6E6", linewidth=0.7)
     axis.spines[["top", "right"]].set_visible(False)
@@ -178,7 +177,7 @@ def plot_gene_target_brier_heatmap(
     table: pd.DataFrame,
     *,
     baseline_model: str = "PU",
-    comparison_model: str = "PU-MIRT",
+    comparison_model: str = "PU-Joint",
     gene_coverage_col: str = "gene_coverage",
     target_coverage_col: str = "target_coverage",
     model_col: str = "model",
@@ -187,7 +186,7 @@ def plot_gene_target_brier_heatmap(
     title: str | None = None,
     cmap: str = "RdBu",
 ) -> tuple[Figure, Axes]:
-    """Plot fixed-baseline Brier minus PU-MIRT Brier on the coverage grid.
+    """Plot fixed-baseline Brier minus PU-Joint Brier on the coverage grid.
 
     The baseline name is supplied once for the whole grid; this function never
     chooses a different comparator cell by cell.  Positive values favor the
@@ -291,7 +290,6 @@ def plot_accuracy_panel_sensitivity(
                           xytext=(5, 4), textcoords="offset points", fontsize=8)
     axis.set_xlabel("Cross-panel prediction sensitivity")
     axis.set_ylabel("Macro AUPRC ↑")
-    axis.set_ylim(bottom=0.0)
     axis.grid(color="#E6E6E6", linewidth=0.7)
     axis.spines[["top", "right"]].set_visible(False)
     if not annotate:
@@ -340,7 +338,6 @@ def plot_projection_tags_budget_recall(
     axis.set_xlabel("Top-ranked prediction budget")
     axis.set_ylabel("Amplification-confirmed positive recall ↑")
     axis.set_xlim(left=0.0)
-    axis.set_ylim(0.0, 1.0)
     axis.xaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=0))
     axis.yaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=0))
     axis.grid(axis="y", color="#E6E6E6", linewidth=0.7)
