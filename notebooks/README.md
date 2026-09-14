@@ -68,6 +68,29 @@ and checkpoint diagnostics plus the retention curve, coverage heatmap, and the
 dataset-appropriate recovery or panel-sensitivity figure. They run in the
 source-pinned local/OnDemand Python environment and have no Colab copies.
 
+### Results-only V3 figures
+
+[`measurement_degradation_v3/`](measurement_degradation_v3/) contains a
+separate, read-only visualization family. It leaves the notebooks above and the
+completed result exports unchanged. Each degradation curve runs from 100% at
+the left toward 0% at the right and pairs Macro-AUPRC with Macro log loss. When
+a verified export is present, each notebook also emits exactly two
+funkyheatmap-style scorecards (key and full models) over the declared mechanism
+× degree × metric grid, following the
+[funkyheatmap visual grammar](https://funkyheatmap.github.io/funkyheatmap/)
+without adding a runtime package dependency.
+
+The five supplied completed runs—simulation, BARseq A1/M1, MERGE-seq, and
+Projection-TAGs—are pinned by exact export run-ID directory. SPIDER spatial and
+SPIDER-Seq intentionally retain a missing explicit path and fail closed until a
+verified completed run directory is entered; they never fall back to fitting.
+Projection-TAGs additionally recomputes conditional candidate probabilities and
+amplification-reference precision, FDR, FPR, F1, lift, AUPRC, AUROC, Brier, and
+log loss from saved OOF prediction arrays without retraining.
+
+Builder:
+[`build_measurement_degradation_v3.py`](../scripts/notebooks/build_measurement_degradation_v3.py)
+
 ## Gene-panel overlap
 
 These experiments change which input-gene columns are visible while holding the

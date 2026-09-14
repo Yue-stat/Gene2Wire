@@ -119,6 +119,15 @@ PU-MIRT is retained as a structural ablation and cannot become that baseline.
 Separate gene- and target-coverage Macro-AUPRC curves accompany the retention
 curve and heatmap.
 
+A separate results-only figure layer lives in
+[`notebooks/measurement_degradation_v3/`](notebooks/measurement_degradation_v3/).
+It reads exact completed run directories, writes only new V3 figure/derived-CSV
+outputs, reverses degradation axes from 100% to 0%, pairs every degradation
+AUPRC curve with log loss, and adds key/full funkyheatmap-style summaries.
+Projection-TAGs also derives false-positive-aware amplification-recovery metrics
+from the saved OOF arrays. Missing explicit exports fail closed rather than
+starting a fit.
+
 In simulation, the default `truth_uses_location = USE_LOCATION` controls the
 generated projection signal as well as predictor inputs. Gene-only simulation
 therefore does not silently generate a location-dependent truth. The fast default
