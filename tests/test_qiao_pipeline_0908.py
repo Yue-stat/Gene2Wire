@@ -24,7 +24,7 @@ def _inputs():
     return prepared, settings, context
 
 
-def _run(prepared, settings, context, checkpoint, observed=None):
+def _run(prepared, settings, context, checkpoint, observed=None, on_progress=None):
     records, tables = {}, {"selected": [], "tuning": []}
 
     def record(name, prediction, semantics, extra=None, *, ranking_score=None):
@@ -33,7 +33,8 @@ def _run(prepared, settings, context, checkpoint, observed=None):
 
     d = prepared.reference.copy() if observed is None else observed
     pipeline._run_qiao_controls(prepared, d, None, None, settings, context,
-                               record, tables, checkpoint)
+                               record, tables, checkpoint,
+                               on_progress=on_progress)
     return records, tables
 
 
@@ -48,7 +49,9 @@ def test_second_run_resumes_candidates_and_final_despite_runtime_and_other_model
         return original(*args, **kwargs)
 
     monkeypatch.setattr(qiao, "fit_qiao", spy)
-    first, first_tables = _run(prepared, settings, context, tmp_path)
+    events = []
+    first, first_tables = _run(
+        prepared, settings, context, tmp_path, on_progress=events.append)
     count = len(calls)
     assert count >= 6  # Two candidates and one final refit per response objective.
     changed = replace(settings, n_jobs=32, run_random_forest=False,
@@ -68,6 +71,14 @@ def test_second_run_resumes_candidates_and_final_despite_runtime_and_other_model
     # Raw squared scores, not clipped probabilities, are delivered to ranking.
     assert first["Qiao-squared"]["extra"]["probability_transform"] == "clip_linear_score"
     assert all(row["selection_metric"] == "observed_log_loss" for row in first_tables["tuning"])
+    candidate_starts = [event for event in events
+                        if event["event"] == "candidate_start"]
+    assert len(candidate_starts) == 4
+    assert all(event["cache_status"] == "unknown" for event in candidate_starts)
+    assert all(event["stage"] == "qiao_candidate" for event in candidate_starts)
+    refit_starts = [event for event in events if event["event"] == "refit_start"]
+    assert len(refit_starts) == 2
+    assert all(event["cache_status"] == "unknown" for event in refit_starts)
 
 
 def test_interruption_preserves_the_first_completed_candidate_attempt(tmp_path, monkeypatch):

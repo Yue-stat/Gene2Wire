@@ -30,7 +30,7 @@ from .evaluation import evaluate_detection_calibration, evaluate_predictions
 from .io import atomic_json, atomic_npz, jsonable
 from .observation import make_observation_design, thin_reference
 from .protocol import Settings, fingerprint, scenarios, source_hash
-from .progress import ProgressRelay
+from .progress import PhaseProgress, ProgressRelay
 from .supervision import compile_training_bundle
 
 
@@ -899,97 +899,165 @@ def _run_scenario_group(tasks, settings, checkpoint_dir, export_path, fit_versio
         group_writer({"event": "task_group_complete"})
 
 
+def _prepare_execution_identity(datasets, settings, *, progress, progress_interval):
+    """Validate, prepare, and hash every declared dataset/view and fold."""
+    identity_units = 1 + len(datasets) * (settings.n_outer_folds + 1)
+    contexts, metadata, input_identities = [], [], []
+    is_simulation = all(
+        dataset.metadata.get("independent_unit") == "generated_dataset"
+        for dataset in datasets
+    )
+    deferred_feature_preparation = False
+    with PhaseProgress(
+        "feature preparation and run identity", enabled=progress,
+        interval=progress_interval, total=identity_units, unit="hash units",
+        detail="source tree fingerprint",
+    ) as identity_phase:
+        code_hash = source_hash()
+        identity_phase.advance()
+        for dataset in datasets:
+            experiment_context = dataset.metadata.get("experiment_context", {})
+            coordinates = ", ".join(
+                f"{short}={experiment_context[name]}"
+                for name, short in (
+                    ("gene_requested_coverage", "gene"),
+                    ("target_requested_coverage", "target"),
+                    ("panel_seed", "panel_seed"),
+                ) if experiment_context.get(name) is not None
+            )
+            dataset_label = (dataset.name if not coordinates else
+                             f"{dataset.name} [{coordinates}]")
+            identity_phase.set_detail(f"{dataset_label}: validate and split")
+            dataset.validate()
+            folds = dataset.split_builder(settings.n_outer_folds, settings.seed)
+            visits = np.zeros(len(dataset.cell_ids), int)
+            for fold in folds:
+                visits[fold.test_rows] += 1
+            if len(folds) != settings.n_outer_folds or not np.all(visits == 1):
+                raise ValueError("Requested outer CV must test every cell exactly once")
+            reps = ([int(dataset.metadata["experiment_repetition"])]
+                    if "experiment_repetition" in dataset.metadata else
+                    ([int(dataset.metadata["repetition"])] if is_simulation
+                     else range(settings.n_repetitions)))
+            defer_dataset = dataset.metadata.get("experiment_context", {}).get(
+                "experiment") in {"gene_overlap", "measurement_degradation"}
+            deferred_feature_preparation |= defer_dataset
+            fold_inputs = []
+            for fold in folds:
+                identity_phase.set_detail(
+                    f"{dataset_label}: fold {fold.outer_fold + 1}/{len(folds)} "
+                    "features and hashes")
+                prepared = _prepare(dataset, fold, settings)
+                fold_inputs.append({"fold": fold.outer_fold,
+                    "train_rows": sha256_array(np.asarray(fold.train_rows)),
+                    "validation_rows": sha256_array(np.asarray(fold.validation_rows)),
+                    "test_rows": sha256_array(np.asarray(fold.test_rows)),
+                    "train_X": sha256_array(prepared.train_features.X),
+                    "refit_X": sha256_array(prepared.refit_features.X),
+                    "train_nuisance": (
+                        None if prepared.train_features.X_nuisance is None else
+                        sha256_array(prepared.train_features.X_nuisance)),
+                    "refit_nuisance": (
+                        None if prepared.refit_features.X_nuisance is None else
+                        sha256_array(prepared.refit_features.X_nuisance)),
+                    "nuisance_names": list(prepared.train_features.nuisance_names),
+                    "train_Y": (
+                        None if prepared.train_features.Y_target is None else
+                        sha256_array(prepared.train_features.Y_target)),
+                    "refit_Y": (
+                        None if prepared.refit_features.Y_target is None else
+                        sha256_array(prepared.refit_features.Y_target)),
+                })
+                scheduled = (DeferredPreparedFold(dataset, fold)
+                             if defer_dataset else prepared)
+                contexts.extend((scheduled, repetition) for repetition in reps)
+                if defer_dataset:
+                    # Release the full-N matrices from the identity pass before
+                    # preparing the next view/fold. Cached units never
+                    # materialize them again; pending units do so in workers.
+                    del prepared
+                identity_phase.advance()
+            identity_phase.set_detail(
+                f"{dataset_label}: dataset and evaluation hashes")
+            input_identities.append({"name": dataset.name,
+                "repetition": dataset.metadata.get(
+                    "experiment_repetition", dataset.metadata.get("repetition")),
+                "experiment_context": dataset.metadata.get("experiment_context", {}),
+                # Scenario declarations are scientific inputs, not
+                # reporting-only metadata. Include the canonical declaration
+                # in the run identity so changed schedules cannot share
+                # completed-unit summaries.
+                "declared_scenarios": dataset.metadata.get("measurement_scenarios"),
+                "model_seed": dataset.metadata.get("model_seed"),
+                "model_allowlist": dataset.metadata.get("model_allowlist"),
+                "evaluation": None if dataset.evaluation is None else {
+                    "reference": sha256_array(dataset.evaluation.reference),
+                    "source_measured": sha256_array(dataset.evaluation.source_measured),
+                    "groups": sha256_array(np.asarray(
+                        dataset.evaluation.groups, dtype=str)),
+                    "masks": {str(f): sha256_array(m)
+                              for f, m in dataset.evaluation.masks.items()}},
+                "measurement_evaluation": (
+                    None if dataset.measurement_evaluation is None else {
+                        "reference": sha256_array(
+                            dataset.measurement_evaluation.reference),
+                        "source_measured": sha256_array(
+                            dataset.measurement_evaluation.source_measured),
+                        "assays": sha256_array(np.asarray(
+                            dataset.measurement_evaluation.assays, dtype=str)),
+                    }),
+                "training_measured": (
+                    None if dataset.training_measured is None else
+                    sha256_array(dataset.training_measured)),
+                "virtual_assays": (
+                    None if dataset.virtual_assays is None else
+                    sha256_array(np.asarray(dataset.virtual_assays, dtype=str))),
+                "observation_plan": (
+                    None if dataset.observation_plan is None else
+                    dataset.observation_plan.identity()),
+                "sharing_strength": dataset.metadata.get("sharing_strength"),
+                "reference": sha256_array(dataset.reference),
+                "measured": sha256_array(dataset.measured),
+                "cell_ids": sha256_array(np.asarray(dataset.cell_ids, dtype=str)),
+                "target_ids": sha256_array(np.asarray(dataset.target_ids, dtype=str)),
+                "groups": {name: sha256_array(np.asarray(values, dtype=str))
+                           for name, values in dataset.groups.items()},
+                "natural_observed": (
+                    None if dataset.natural_observed is None else
+                    sha256_array(dataset.natural_observed)),
+                "technical_score": (
+                    None if dataset.technical_score is None else
+                    sha256_array(dataset.technical_score)),
+                "fold_inputs": fold_inputs,
+            })
+            metadata.append({
+                "name": dataset.name,
+                "n_cells": len(dataset.cell_ids),
+                "n_targets": len(dataset.target_ids),
+                "reference_hash": sha256_array(dataset.reference),
+                "measured_hash": sha256_array(dataset.measured),
+                "training_measured_hash": (
+                    None if dataset.training_measured is None else
+                    sha256_array(dataset.training_measured)),
+                "metadata": {k: v for k, v in dataset.metadata.items()
+                             if not isinstance(v, np.ndarray)},
+            })
+            identity_phase.advance()
+        identity_phase.set_summary(
+            f"prepared {len(contexts)} view/fold/repetition contexts; "
+            f"deferred pending feature materialization={deferred_feature_preparation}")
+    return (code_hash, contexts, metadata, input_identities, is_simulation,
+            deferred_feature_preparation)
+
+
 def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
              progress_interval=60., progress_level="summary", worker_status=None,
-             export_name=None, supplementary_tables=None, manifest_extra=None):
-    code_hash = source_hash()
-    contexts = []
-    metadata = []
-    input_identities = []
-    is_simulation = all(d.metadata.get("independent_unit") == "generated_dataset" for d in datasets)
-    deferred_feature_preparation = False
-    for dataset in datasets:
-        dataset.validate()
-        folds = dataset.split_builder(settings.n_outer_folds, settings.seed)
-        visits = np.zeros(len(dataset.cell_ids), int)
-        for fold in folds:
-            visits[fold.test_rows] += 1
-        if len(folds) != settings.n_outer_folds or not np.all(visits == 1):
-            raise ValueError("Requested outer CV must test every cell exactly once")
-        reps = ([int(dataset.metadata["experiment_repetition"])]
-                if "experiment_repetition" in dataset.metadata else
-                ([int(dataset.metadata["repetition"])] if is_simulation
-                 else range(settings.n_repetitions)))
-        defer_dataset = dataset.metadata.get("experiment_context", {}).get(
-            "experiment") in {"gene_overlap", "measurement_degradation"}
-        deferred_feature_preparation |= defer_dataset
-        fold_inputs = []
-        for fold in folds:
-            prepared = _prepare(dataset, fold, settings)
-            fold_inputs.append({"fold": fold.outer_fold,
-                "train_rows": sha256_array(np.asarray(fold.train_rows)),
-                "validation_rows": sha256_array(np.asarray(fold.validation_rows)),
-                "test_rows": sha256_array(np.asarray(fold.test_rows)),
-                "train_X": sha256_array(prepared.train_features.X),
-                "refit_X": sha256_array(prepared.refit_features.X),
-                "train_nuisance": (None if prepared.train_features.X_nuisance is None else
-                                     sha256_array(prepared.train_features.X_nuisance)),
-                "refit_nuisance": (None if prepared.refit_features.X_nuisance is None else
-                                     sha256_array(prepared.refit_features.X_nuisance)),
-                "nuisance_names": list(prepared.train_features.nuisance_names),
-                "train_Y": None if prepared.train_features.Y_target is None else sha256_array(prepared.train_features.Y_target),
-                "refit_Y": None if prepared.refit_features.Y_target is None else sha256_array(prepared.refit_features.Y_target)})
-            scheduled = (DeferredPreparedFold(dataset, fold)
-                         if defer_dataset else prepared)
-            contexts.extend((scheduled, repetition) for repetition in reps)
-            if defer_dataset:
-                # Release the full-N matrices from the identity pass before
-                # preparing the next view/fold.  Cached units never materialize
-                # them again; pending units build them inside active workers.
-                del prepared
-        input_identities.append({"name": dataset.name,
-            "repetition": dataset.metadata.get("experiment_repetition", dataset.metadata.get("repetition")),
-            "experiment_context": dataset.metadata.get("experiment_context", {}),
-            # Scenario declarations are scientific inputs, not reporting-only
-            # metadata.  In particular, measurement-degradation anchors and
-            # control switches can change this schedule without changing any
-            # feature or label array.  Include the canonical declaration in
-            # the run identity so those runs cannot share an export directory
-            # or completed-unit summaries.
-            "declared_scenarios": dataset.metadata.get("measurement_scenarios"),
-            "model_seed": dataset.metadata.get("model_seed"),
-            "model_allowlist": dataset.metadata.get("model_allowlist"),
-            "evaluation": None if dataset.evaluation is None else {
-                "reference": sha256_array(dataset.evaluation.reference),
-                "source_measured": sha256_array(dataset.evaluation.source_measured),
-                "groups": sha256_array(np.asarray(dataset.evaluation.groups, dtype=str)),
-                "masks": {str(f): sha256_array(m) for f, m in dataset.evaluation.masks.items()}},
-            "measurement_evaluation": None if dataset.measurement_evaluation is None else {
-                "reference": sha256_array(dataset.measurement_evaluation.reference),
-                "source_measured": sha256_array(dataset.measurement_evaluation.source_measured),
-                "assays": sha256_array(np.asarray(dataset.measurement_evaluation.assays, dtype=str)),
-            },
-            "training_measured": (None if dataset.training_measured is None
-                                  else sha256_array(dataset.training_measured)),
-            "virtual_assays": (None if dataset.virtual_assays is None else
-                               sha256_array(np.asarray(dataset.virtual_assays, dtype=str))),
-            "observation_plan": (None if dataset.observation_plan is None else
-                                 dataset.observation_plan.identity()),
-            "sharing_strength": dataset.metadata.get("sharing_strength"),
-            "reference": sha256_array(dataset.reference), "measured": sha256_array(dataset.measured),
-            "cell_ids": sha256_array(np.asarray(dataset.cell_ids, dtype=str)),
-            "target_ids": sha256_array(np.asarray(dataset.target_ids, dtype=str)),
-            "groups": {name: sha256_array(np.asarray(values, dtype=str)) for name, values in dataset.groups.items()},
-            "natural_observed": None if dataset.natural_observed is None else sha256_array(dataset.natural_observed),
-            "technical_score": None if dataset.technical_score is None else sha256_array(dataset.technical_score),
-            "fold_inputs": fold_inputs})
-        metadata.append({"name": dataset.name, "n_cells": len(dataset.cell_ids),
-                         "n_targets": len(dataset.target_ids),
-                         "reference_hash": sha256_array(dataset.reference),
-                         "measured_hash": sha256_array(dataset.measured),
-                         "training_measured_hash": (None if dataset.training_measured is None else
-                                                    sha256_array(dataset.training_measured)),
-                         "metadata": {k: v for k, v in dataset.metadata.items() if not isinstance(v, np.ndarray)}})
+             export_name=None, supplementary_tables=None, manifest_extra=None,
+             announce_export=True):
+    (code_hash, contexts, metadata, input_identities, is_simulation,
+     deferred_feature_preparation) = _prepare_execution_identity(
+        datasets, settings, progress=progress,
+        progress_interval=progress_interval)
     manifest = {"protocol": settings.scientific_dict(), "source_hash": code_hash,
                 "datasets": metadata, "input_identities": input_identities,
                 "feature_preparation": ("worker_lazy_after_hash_pass"
@@ -1020,24 +1088,62 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
     # exposes loss rates to the outer process pool without nesting parallelism.
     store = CompactCheckpointStore(Path(checkpoint_dir) / "experiment_units" / run_id)
     results, pending, inventory, evaluation_plan = [], [], [], []
-    for fold_group, (prepared, repetition) in enumerate(contexts):
-        planned_models = _planned_models(prepared, settings)
-        for scenario in _scenarios(prepared, settings):
-            index = len(results)
-            unit_context = {**_source_context(prepared, repetition), **scenario}
-            key = fingerprint({"run_id": run_id, **unit_context})
-            cached = _load_unit_result(store, key, run_id, export_path)
-            model_count = sum(all(row[name] == value for name, value in scenario.items())
-                              for row in planned_models)
-            inventory.append({**unit_context, "work_id": key, "fully_cached": cached is not None,
-                              "planned_model_evaluations": model_count})
-            evaluation_plan.extend({**unit_context, "work_id": key, "model": row["model"],
-                                    "complete_summary_cached": cached is not None}
-                                   for row in planned_models
-                                   if all(row[name] == value for name, value in scenario.items()))
-            results.append(cached)
-            if cached is None:
-                pending.append((index, prepared, repetition, key, unit_context, scenario, fold_group))
+    scenario_units = sum(len(_scenarios(prepared, settings))
+                         for prepared, _ in contexts)
+    cached_scenarios = 0
+    with PhaseProgress(
+        "completed-result cache inventory", enabled=progress,
+        interval=progress_interval, total=scenario_units, unit="scenarios",
+    ) as cache_phase:
+        for fold_group, (prepared, repetition) in enumerate(contexts):
+            planned_models = _planned_models(prepared, settings)
+            for scenario in _scenarios(prepared, settings):
+                index = len(results)
+                unit_context = {**_source_context(prepared, repetition), **scenario}
+                coordinates = []
+                for name, label in (
+                    ("gene_requested_coverage", "gene"),
+                    ("target_requested_coverage", "target"),
+                    ("positive_retention", "retention"),
+                ):
+                    if unit_context.get(name) is not None:
+                        coordinates.append(f"{label}={unit_context[name]}")
+                if (unit_context.get("positive_retention") is None
+                        and scenario.get("loss_rate") is not None):
+                    coordinates.append(f"loss/FNR={scenario['loss_rate']}")
+                coordinate_text = ", ".join(coordinates)
+                if coordinate_text:
+                    coordinate_text += ", "
+                cache_phase.set_detail(
+                    f"{prepared.name}, repetition {repetition}, fold "
+                    f"{unit_context.get('outer_fold')}, {scenario.get('analysis')}, "
+                    f"{coordinate_text}"
+                    f"mechanism={scenario.get('mechanism')}")
+                key = fingerprint({"run_id": run_id, **unit_context})
+                # This validates the compact summary and SHA256-checks every
+                # prediction/audit dependency before declaring the unit reusable.
+                cached = _load_unit_result(store, key, run_id, export_path)
+                model_count = sum(all(row[name] == value for name, value in scenario.items())
+                                  for row in planned_models)
+                inventory.append({**unit_context, "work_id": key,
+                                  "fully_cached": cached is not None,
+                                  "planned_model_evaluations": model_count})
+                evaluation_plan.extend({**unit_context, "work_id": key,
+                                        "model": row["model"],
+                                        "complete_summary_cached": cached is not None}
+                                       for row in planned_models
+                                       if all(row[name] == value
+                                              for name, value in scenario.items()))
+                results.append(cached)
+                if cached is None:
+                    pending.append((index, prepared, repetition, key, unit_context,
+                                    scenario, fold_group))
+                else:
+                    cached_scenarios += 1
+                cache_phase.advance()
+        cache_phase.set_summary(
+            f"{cached_scenarios} reusable scenario summaries; "
+            f"{len(pending)} require fit-level checks or processing")
     planned_model_count = sum(row["planned_model_evaluations"] for row in inventory)
     if len(evaluation_plan) != planned_model_count or pd.DataFrame(evaluation_plan).duplicated(
         ["work_id", "model"]).any():
@@ -1078,59 +1184,111 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
         for group_results in new_results:
             for index, result in group_results:
                 results[index] = result
-    names = results[0].keys()
-    tables = {name: pd.DataFrame([row for result in results for row in result[name]]) for name in names}
-    tables.update(supplementary_tables or {})
-    tables["checkpoint_inventory"] = pd.DataFrame(inventory)
-    tables["model_evaluation_plan"] = pd.DataFrame(evaluation_plan)
-    accounting = [{**row, "accounting": "restored_results"} for row in evaluation_plan
-                  if row["complete_summary_cached"]]
-    tables["model_cache_accounting"] = pd.DataFrame(accounting + relay.model_accounting)
-    expected_units = {(row["work_id"], row["model"]) for row in evaluation_plan}
-    processed_units = [(row["work_id"], row["model"])
-                       for row in accounting + relay.model_accounting]
-    if (len(processed_units) != relay.done_units or len(set(processed_units)) != len(processed_units)
-        or not set(processed_units).issubset(expected_units)):
-        raise ValueError("Processed model units do not match the exported progress plan")
-    tables["progress_events"] = pd.DataFrame(relay.rows)
-    if len(datasets) == 1 and datasets[0].natural_observed is not None:
-        data = datasets[0]
-        standard = (data.natural_observed * data.measured).sum(axis=0)
-        reference = (data.reference * data.measured).sum(axis=0)
-        tables["paired_audit"] = pd.DataFrame({"target": data.target_ids,
-            "standard_positive_count": standard, "reference_positive_count": reference,
-            "amplification_only_positive_count": reference-standard,
-            "relative_detection": np.divide(standard, reference,
-                out=np.full(len(reference), np.nan), where=reference > 0)})
-    _summarize(tables, simulation=is_simulation)
-    from .reporting import joint_selection_diagnostics
-    tables["joint_selection_diagnostics"] = joint_selection_diagnostics(tables)
-    for name, table in tables.items():
-        _atomic_csv(table, export_path / f"{name}.csv")
-    manifest.update(completed=True, status="complete_with_failures" if len(tables["failures"]) else "complete",
-                    failed_calibration_units=len(tables["failures"]),
-                    planned_model_evaluations=planned_model_count,
-                    completed_model_evaluations=relay.done_units,
-                    cached_model_evaluations=cached_model_count,
-                    reused_fit_model_evaluations=relay.reused_fit_units,
-                    new_or_mixed_model_evaluations=relay.new_or_mixed_units,
-                    unknown_fit_model_evaluations=relay.unknown_units,
-                    metric_rows=len(tables["metrics"]), table_files=[f"{name}.csv" for name in tables])
-    atomic_json(manifest, export_path / "manifest.json")
-    # Worker JSONL files are only a transient transport. Their normalized
-    # contents now exist in progress_events.csv and the completed manifest has
-    # been committed, so retaining a fresh UUID directory after every rerun
-    # would duplicate diagnostics. If aggregation/export failed above, this
-    # cleanup is never reached and the raw events remain available. Cleanup is
-    # best-effort because a filesystem race must not invalidate completed
-    # scientific outputs.
-    try:
-        for event_file in event_dir.glob("*.jsonl"):
-            event_file.unlink()
-        event_dir.rmdir()
-    except OSError:
-        pass
-    print(f"All results exported to: {export_path}")
+    names = tuple(results[0].keys())
+    has_paired_audit = len(datasets) == 1 and datasets[0].natural_observed is not None
+    consolidation_steps = len(names) + 3 + int(has_paired_audit)
+    tables = {}
+    with PhaseProgress(
+        "result consolidation", enabled=progress, interval=progress_interval,
+        total=consolidation_steps, unit="steps",
+    ) as consolidation_phase:
+        for name in names:
+            consolidation_phase.set_detail(f"combine {name} rows")
+            tables[name] = pd.DataFrame(
+                [row for result in results for row in result[name]])
+            consolidation_phase.advance()
+        consolidation_phase.set_detail("attach measurement audit tables")
+        tables.update(supplementary_tables or {})
+        consolidation_phase.advance()
+        consolidation_phase.set_detail("checkpoint and model-accounting tables")
+        tables["checkpoint_inventory"] = pd.DataFrame(inventory)
+        tables["model_evaluation_plan"] = pd.DataFrame(evaluation_plan)
+        accounting = [{**row, "accounting": "restored_results"}
+                      for row in evaluation_plan if row["complete_summary_cached"]]
+        tables["model_cache_accounting"] = pd.DataFrame(
+            accounting + relay.model_accounting)
+        expected_units = {(row["work_id"], row["model"]) for row in evaluation_plan}
+        processed_units = [(row["work_id"], row["model"])
+                           for row in accounting + relay.model_accounting]
+        if (len(processed_units) != relay.done_units
+                or len(set(processed_units)) != len(processed_units)
+                or not set(processed_units).issubset(expected_units)):
+            raise ValueError("Processed model units do not match the exported progress plan")
+        consolidation_phase.advance()
+        consolidation_phase.set_detail("normalize worker progress events")
+        tables["progress_events"] = pd.DataFrame(relay.rows)
+        consolidation_phase.advance()
+        if has_paired_audit:
+            consolidation_phase.set_detail("paired standard/amplified assay audit")
+            data = datasets[0]
+            standard = (data.natural_observed * data.measured).sum(axis=0)
+            reference = (data.reference * data.measured).sum(axis=0)
+            tables["paired_audit"] = pd.DataFrame({"target": data.target_ids,
+                "standard_positive_count": standard, "reference_positive_count": reference,
+                "amplification_only_positive_count": reference-standard,
+                "relative_detection": np.divide(standard, reference,
+                    out=np.full(len(reference), np.nan), where=reference > 0)})
+            consolidation_phase.advance()
+        consolidation_phase.set_summary(
+            f"assembled {len(tables)} raw and audit tables")
+
+    with PhaseProgress(
+        "summary and diagnostic tables", enabled=progress,
+        interval=progress_interval, total=2, unit="steps",
+    ) as summary_phase:
+        summary_phase.set_detail("fold/repetition aggregation and confidence intervals")
+        _summarize(tables, simulation=is_simulation)
+        summary_phase.advance()
+        summary_phase.set_detail("PU-Joint selection diagnostics")
+        from .reporting import joint_selection_diagnostics
+        tables["joint_selection_diagnostics"] = joint_selection_diagnostics(tables)
+        summary_phase.advance()
+        summary_phase.set_summary(f"{len(tables)} tables ready for export")
+
+    with PhaseProgress(
+        "CSV export", enabled=progress, interval=progress_interval,
+        total=len(tables), unit="tables",
+    ) as export_phase:
+        for name, table in tables.items():
+            export_phase.set_detail(f"{name}.csv ({len(table)} rows)")
+            _atomic_csv(table, export_path / f"{name}.csv")
+            export_phase.advance()
+        export_phase.set_summary(f"wrote {len(tables)} CSV files")
+
+    with PhaseProgress(
+        "core export finalization", enabled=progress,
+        interval=progress_interval, total=2, unit="steps",
+    ) as final_phase:
+        final_phase.set_detail("commit completed manifest")
+        manifest.update(
+            completed=True,
+            status="complete_with_failures" if len(tables["failures"]) else "complete",
+            failed_calibration_units=len(tables["failures"]),
+            planned_model_evaluations=planned_model_count,
+            completed_model_evaluations=relay.done_units,
+            cached_model_evaluations=cached_model_count,
+            reused_fit_model_evaluations=relay.reused_fit_units,
+            new_or_mixed_model_evaluations=relay.new_or_mixed_units,
+            unknown_fit_model_evaluations=relay.unknown_units,
+            metric_rows=len(tables["metrics"]),
+            table_files=[f"{name}.csv" for name in tables],
+        )
+        atomic_json(manifest, export_path / "manifest.json")
+        final_phase.advance()
+        final_phase.set_detail("remove normalized worker event transport files")
+        # Worker JSONL files are only a transient transport. Their normalized
+        # contents now exist in progress_events.csv and the completed manifest
+        # has been committed. On an earlier failure, raw events remain.
+        try:
+            for event_file in event_dir.glob("*.jsonl"):
+                event_file.unlink()
+            event_dir.rmdir()
+        except OSError:
+            pass
+        final_phase.advance()
+        final_phase.set_summary("manifest committed; transient event cleanup attempted")
+    if announce_export:
+        print(f"All results exported to: {export_path}", flush=True)
     if len(tables["failures"]):
         print(f"Calibration not estimable in {len(tables['failures'])} units; see failures.csv. Do not omit these from reporting.")
     return Artifacts(tables, export_path, manifest)
@@ -1291,6 +1449,14 @@ def _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
         for index, candidate in enumerate(candidates):
             candidate_started = time.monotonic()
             config = {**candidate, "objective": objective}
+            if on_progress is not None:
+                # The exact checkpoint key requires hashing the sliced Qiao
+                # inputs inside cached_fit. Report the work conservatively
+                # instead of claiming either a hit or a new optimizer run.
+                on_progress({"event": "candidate_start", "model": name,
+                             "index": index + 1, "total": len(candidates),
+                             "stage": "qiao_candidate", "config": config,
+                             "cache_status": "unknown"})
             probability, _, diagnostics = cached_fit("candidate", train_features,
                                                      train, validation, config)
             q = np.clip(probability[validation_mask], 1e-7, 1 - 1e-7)
@@ -1313,7 +1479,7 @@ def _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
         refit_started = time.monotonic()
         if on_progress is not None:
             on_progress({"event": "refit_start", "model": name, "stage": "refit",
-                         "config": dict(best[1])})
+                         "config": dict(best[1]), "cache_status": "unknown"})
         prediction, ranking_score, diagnostics = cached_fit("final", refit_features,
                                                            dev, test, best[1])
         if on_progress is not None:

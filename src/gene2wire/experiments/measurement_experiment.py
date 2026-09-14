@@ -31,6 +31,7 @@ from .measurement_design import (
     row_panel_mask,
 )
 from .pipeline import Artifacts, _atomic_csv, _execute, slug
+from .progress import PhaseProgress
 from .protocol import Settings, fingerprint
 
 
@@ -811,7 +812,8 @@ def _add_heatmap_contrasts(artifacts: Artifacts) -> None:
         _atomic_csv(artifacts.tables[name], artifacts.export_dir / f"{name}.csv")
 
 
-def _prediction_units(artifacts: Artifacts):
+def _prediction_units(artifacts: Artifacts, *, context_filter=None,
+                      on_prediction_file=None):
     """Yield saved predictions with their evaluation-only unit context."""
     metrics = artifacts.tables.get("metrics", pd.DataFrame())
     model_lookup = {
@@ -823,17 +825,26 @@ def _prediction_units(artifacts: Artifacts):
         return
     for audit_path in sorted(units.glob("*/audit.json")):
         context = json.loads(audit_path.read_text())
-        for path in sorted(audit_path.parent.glob("*_predictions.npz")):
+        paths = sorted(audit_path.parent.glob("*_predictions.npz"))
+        if context_filter is not None and not context_filter(context):
+            if on_prediction_file is not None:
+                on_prediction_file(len(paths))
+            continue
+        for path in paths:
             stem = path.name[:-len("_predictions.npz")]
             model = model_lookup.get(stem)
             if model is None:
+                if on_prediction_file is not None:
+                    on_prediction_file()
                 continue
             with np.load(path, allow_pickle=False) as archive:
                 arrays = {name: archive[name].copy() for name in archive.files}
             yield context, model, arrays
+            if on_prediction_file is not None:
+                on_prediction_file()
 
 
-def _add_panel_stability(artifacts: Artifacts) -> None:
+def _add_panel_stability(artifacts: Artifacts, *, on_prediction_file=None) -> None:
     """Compute same-cell prediction SD across nested panel seeds."""
     columns = [
         "dataset", "sharing_strength", "repetition",
@@ -845,10 +856,13 @@ def _add_panel_stability(artifacts: Artifacts) -> None:
         "n_common_native_pairs",
     ]
     collected: dict[tuple, dict[int, dict[tuple[str, str], float]]] = {}
-    for context, model, arrays in _prediction_units(artifacts) or ():
+    def relevant(context):
+        return "coverage_heatmap" in str(context.get("condition_roles", ""))
+
+    for context, model, arrays in _prediction_units(
+            artifacts, context_filter=relevant,
+            on_prediction_file=on_prediction_file) or ():
         roles = str(context.get("condition_roles", ""))
-        if "coverage_heatmap" not in roles:
-            continue
         required = {"prediction", "cell_ids", "target_ids", "source_measured"}
         if not required.issubset(arrays):
             continue
@@ -952,7 +966,8 @@ def _add_panel_stability(artifacts: Artifacts) -> None:
                 artifacts.export_dir / "panel_stability.csv")
 
 
-def _add_projection_budget_recall(artifacts: Artifacts) -> None:
+def _add_projection_budget_recall(artifacts: Artifacts, *,
+                                  on_prediction_file=None) -> None:
     """Pool OOF standard negatives and rank the same fraction per target."""
     budgets = (0.01, 0.05, 0.10, 0.20)
     columns = [
@@ -969,10 +984,13 @@ def _add_projection_budget_recall(artifacts: Artifacts) -> None:
         "amplification_confirmed_recall", "ranking_source", "aggregation",
     ]
     pooled: dict[tuple[str, int, str], dict] = {}
-    for context, model, arrays in _prediction_units(artifacts) or ():
-        if (context.get("mechanism") != "natural"
-                or "natural_recovery" not in str(context.get("condition_roles", ""))):
-            continue
+    def relevant(context):
+        return (context.get("mechanism") == "natural"
+                and "natural_recovery" in str(context.get("condition_roles", "")))
+
+    for context, model, arrays in _prediction_units(
+            artifacts, context_filter=relevant,
+            on_prediction_file=on_prediction_file) or ():
         required = {"prediction", "reference", "observed", "source_measured",
                     "cell_ids", "target_ids"}
         if not required.issubset(arrays):
@@ -1082,16 +1100,40 @@ def _add_projection_budget_recall(artifacts: Artifacts) -> None:
                 artifacts.export_dir / "projection_budget_recall_per_target.csv")
 
 
-def _finish(artifacts: Artifacts) -> Artifacts:
-    _add_heatmap_contrasts(artifacts)
-    _add_panel_stability(artifacts)
-    _add_projection_budget_recall(artifacts)
-    files = set(artifacts.manifest.get("table_files", ()))
-    files.update({"heatmap_baseline_selection.csv", "heatmap_contrasts.csv",
-                  "panel_stability.csv", "projection_budget_recall.csv",
-                  "projection_budget_recall_per_target.csv"})
-    artifacts.manifest["table_files"] = sorted(files)
-    atomic_json(artifacts.manifest, artifacts.export_dir / "manifest.json")
+def _finish(artifacts: Artifacts, *, progress=True,
+            progress_interval=60.0) -> Artifacts:
+    """Create measurement-only outputs after the shared pipeline tables."""
+    units = artifacts.export_dir / "units"
+    prediction_files = sum(
+        1 for audit_path in units.glob("*/audit.json")
+        for _ in audit_path.parent.glob("*_predictions.npz"))
+    with PhaseProgress(
+        "measurement derived tables", enabled=progress,
+        interval=progress_interval, total=2 + 2 * prediction_files,
+        unit="work units",
+    ) as phase:
+        phase.set_detail("heatmap baseline selection and contrasts")
+        _add_heatmap_contrasts(artifacts)
+        phase.advance()
+        phase.set_detail(
+            f"cross-panel stability scan ({prediction_files} prediction files)")
+        _add_panel_stability(artifacts, on_prediction_file=phase.advance)
+        phase.set_detail(
+            f"Projection-TAG recovery scan ({prediction_files} prediction files)")
+        _add_projection_budget_recall(
+            artifacts, on_prediction_file=phase.advance)
+        phase.set_detail("final measurement manifest")
+        files = set(artifacts.manifest.get("table_files", ()))
+        files.update({"heatmap_baseline_selection.csv", "heatmap_contrasts.csv",
+                      "panel_stability.csv", "projection_budget_recall.csv",
+                      "projection_budget_recall_per_target.csv"})
+        artifacts.manifest["table_files"] = sorted(files)
+        atomic_json(artifacts.manifest, artifacts.export_dir / "manifest.json")
+        phase.advance()
+        phase.set_summary(
+            f"scanned {prediction_files} prediction files for each derived diagnostic; "
+            "measurement-specific CSVs and manifest are complete")
+    print(f"All results exported to: {artifacts.export_dir}", flush=True)
     return artifacts
 
 
@@ -1111,21 +1153,35 @@ def run_measurement_experiment(
     if dataset.metadata.get("independent_unit") == "generated_dataset":
         raise ValueError("Use run_measurement_simulation_experiments for simulation")
     views, audits = [], []
-    for panel_seed in range(config.n_panel_seeds):
-        current, tables = build_measurement_views(
-            dataset, settings, config, repetition=panel_seed,
-            panel_seed=panel_seed)
-        views.extend(current)
-        audits.append(tables)
+    with PhaseProgress(
+        "measurement mask construction", enabled=progress,
+        interval=progress_interval, total=config.n_panel_seeds + 1,
+        unit="steps",
+    ) as phase:
+        for panel_seed in range(config.n_panel_seeds):
+            phase.set_detail(
+                f"{dataset.name}, panel seed {panel_seed + 1}/{config.n_panel_seeds}")
+            current, tables = build_measurement_views(
+                dataset, settings, config, repetition=panel_seed,
+                panel_seed=panel_seed)
+            views.extend(current)
+            audits.append(tables)
+            phase.advance()
+        phase.set_detail("combine outcome-blind mask audit tables")
+        supplementary_tables = _combine_tables(audits)
+        phase.advance()
+        phase.set_summary(f"constructed {len(views)} experiment views")
     artifacts = _execute(
         views, settings, checkpoint_dir, export_dir,
         progress=progress, progress_interval=progress_interval,
         progress_level=progress_level, worker_status=worker_status,
         export_name=slug(dataset.name) + "_measurement_degradation",
-        supplementary_tables=_combine_tables(audits),
+        supplementary_tables=supplementary_tables,
         manifest_extra=_manifest(config),
+        announce_export=False,
     )
-    return _finish(artifacts)
+    return _finish(artifacts, progress=progress,
+                   progress_interval=progress_interval)
 
 
 def run_measurement_simulation_experiments(
@@ -1155,27 +1211,43 @@ def run_measurement_simulation_experiments(
     options["truth_uses_location"] = settings.use_location
     Path(raw_cache_dir).mkdir(parents=True, exist_ok=True)
     views, audits = [], []
-    for strength in strengths:
-        for repetition in range(settings.n_repetitions):
-            dataset = generate_simulation(
-                repetition, strength, seed=settings.seed, **options)
-            for panel_seed in range(config.n_panel_seeds):
-                current, tables = build_measurement_views(
-                    dataset, settings, config, repetition=repetition,
-                    panel_seed=panel_seed)
-                views.extend(current)
-                audits.append(tables)
+    mask_units = len(strengths) * settings.n_repetitions * config.n_panel_seeds
+    with PhaseProgress(
+        "simulation and measurement mask construction", enabled=progress,
+        interval=progress_interval, total=mask_units + 1, unit="steps",
+    ) as phase:
+        for strength in strengths:
+            for repetition in range(settings.n_repetitions):
+                dataset = generate_simulation(
+                    repetition, strength, seed=settings.seed, **options)
+                for panel_seed in range(config.n_panel_seeds):
+                    phase.set_detail(
+                        f"sharing={strength:g}, repetition {repetition + 1}/"
+                        f"{settings.n_repetitions}, panel seed {panel_seed + 1}/"
+                        f"{config.n_panel_seeds}")
+                    current, tables = build_measurement_views(
+                        dataset, settings, config, repetition=repetition,
+                        panel_seed=panel_seed)
+                    views.extend(current)
+                    audits.append(tables)
+                    phase.advance()
+        phase.set_detail("combine outcome-blind mask audit tables")
+        supplementary_tables = _combine_tables(audits)
+        phase.advance()
+        phase.set_summary(f"constructed {len(views)} experiment views")
     artifacts = _execute(
         views, settings, checkpoint_dir, export_dir,
         progress=progress, progress_interval=progress_interval,
         progress_level=progress_level, worker_status=worker_status,
         export_name="simulation_measurement_degradation",
-        supplementary_tables=_combine_tables(audits),
+        supplementary_tables=supplementary_tables,
         manifest_extra={**_manifest(config),
                         "simulation_sharing_strengths": strengths,
                         "simulation_options": options},
+        announce_export=False,
     )
-    return _finish(artifacts)
+    return _finish(artifacts, progress=progress,
+                   progress_interval=progress_interval)
 
 
 def preview_measurement_experiment(

@@ -20,6 +20,108 @@ from .io import jsonable
 from .workers import worker_capacity
 
 
+class PhaseProgress:
+    """Report progress for serial orchestration work around model execution.
+
+    ``ProgressRelay`` accounts for model evaluations after the worker pool has
+    started.  Some scientifically necessary orchestration can also take
+    minutes: preparing/hash-identifying fold features, validating completed
+    summaries, consolidating result rows, and exporting derived tables.  This
+    reporter makes those phases visible without turning every item into a log
+    line.  Its background heartbeat also remains useful when one item itself is
+    slow.
+    """
+
+    def __init__(self, name, *, enabled=True, interval=60., total=None,
+                 unit="items", detail=None):
+        if not 0 < interval <= 3600:
+            raise ValueError("progress_interval must be positive and at most 3600 seconds")
+        if total is not None and int(total) < 0:
+            raise ValueError("Phase total must be nonnegative")
+        self.name = str(name)
+        self.enabled = bool(enabled)
+        self.interval = float(interval)
+        self.total = None if total is None else int(total)
+        self.unit = str(unit)
+        self.done = 0
+        self.detail = None if detail is None else str(detail)
+        self.summary = None
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+        self.started = self.last_heartbeat = time.monotonic()
+        self.thread = None
+
+    def _count(self):
+        if self.total is None:
+            return f"{self.done} {self.unit}"
+        return f"{self.done}/{self.total} {self.unit}"
+
+    def _status(self, now, *, final=False, interrupted=False):
+        elapsed = max(0., now - self.started)
+        if interrupted:
+            state = "interrupted"
+        elif final:
+            state = "completed"
+        else:
+            state = "running"
+        message = f"[phase] {self.name}: {state} {self._count()}; elapsed {elapsed:.1f}s"
+        if not final and self.detail:
+            message += f"; current {self.detail}"
+        if final and self.summary:
+            message += f"; {self.summary}"
+        print(message, flush=True)
+
+    def set_detail(self, detail):
+        with self.lock:
+            self.detail = None if detail is None else str(detail)
+
+    def advance(self, count=1, *, detail=None):
+        if int(count) < 0:
+            raise ValueError("Phase progress cannot move backwards")
+        with self.lock:
+            self.done += int(count)
+            if self.total is not None and self.done > self.total:
+                raise ValueError("Phase progress exceeded its declared total")
+            if detail is not None:
+                self.detail = str(detail)
+
+    def set_summary(self, summary):
+        with self.lock:
+            self.summary = None if summary is None else str(summary)
+
+    def heartbeat(self, now=None):
+        """Print at most one heartbeat per interval; return if one was printed."""
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            if now - self.last_heartbeat < self.interval:
+                return False
+            if self.enabled:
+                self._status(now)
+            self.last_heartbeat = now
+            return self.enabled
+
+    def _loop(self):
+        while not self.stop.wait(min(.25, self.interval)):
+            self.heartbeat()
+
+    def __enter__(self):
+        if self.enabled:
+            total = "" if self.total is None else f" ({self.total} {self.unit})"
+            print(f"[phase] {self.name}: started{total}", flush=True)
+            self.thread = threading.Thread(target=self._loop, daemon=True)
+            self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop.set()
+        if self.thread is not None:
+            self.thread.join()
+        if self.enabled:
+            with self.lock:
+                self._status(time.monotonic(), final=True,
+                             interrupted=bool(exc and exc[0]))
+
+
 @dataclass(frozen=True)
 class EventWriter:
     path: Path
@@ -90,9 +192,48 @@ class ProgressRelay:
                 bits.append(f"{short}={row[name]}")
         if row.get("analysis"):
             bits.append(str(row["analysis"]))
+        if row.get("mechanism"):
+            bits.append(str(row["mechanism"]))
+        for name, short in (
+            ("gene_requested_coverage", "gene"),
+            ("target_requested_coverage", "target"),
+            ("positive_retention", "retain"),
+        ):
+            if row.get(name) is not None:
+                bits.append(f"{short}={row[name]}")
         if row.get("model"):
             bits.append(str(row["model"]))
         return " | ".join(bits)
+
+    @staticmethod
+    def _active_description(row, label):
+        event = row.get("event")
+        status = row.get("cache_status")
+        cached = status in ("checkpoint", "memory")
+        if event == "candidate_start":
+            activity = (
+                "candidate cache validation/reconstruction" if cached else
+                "candidate optimizer fit/retry" if status == "pending" else
+                "candidate fit/cache work"
+            )
+            if row.get("index") is not None and row.get("total") is not None:
+                activity += f" {row['index']}/{row['total']}"
+            if row.get("stage"):
+                activity += f" ({row['stage']})"
+        elif event == "refit_start":
+            activity = (
+                "refit cache reconstruction" if cached else
+                "final refit optimizer/retry" if status == "pending" else
+                "final refit/cache work"
+            )
+        elif event == "model_start":
+            activity = ("completed-model cache reconstruction" if cached
+                        else "model setup/cache checks")
+        elif event == "unit_start":
+            activity = "worker fold-feature materialization/cache setup"
+        else:
+            activity = "scenario setup/cache checks"
+        return f"{activity}: {label}"
 
     def _accept(self, row):
         self.rows.append(row)
@@ -105,8 +246,12 @@ class ProgressRelay:
             if previous is None or stamp > previous[0]:
                 self.worker_activity[row["pid"]] = (stamp, event == "task_group_start")
         label = self.label(row)
-        if event in ("model_start", "candidate_start", "refit_start", "scenario_start"):
-            self.active[unit] = label
+        if event in ("unit_start", "model_start", "candidate_start",
+                     "refit_start", "scenario_start"):
+            self.active[unit] = {
+                "description": self._active_description(row, label),
+                "timestamp": float(row.get("timestamp", 0.0)),
+            }
         if event in ("candidate_complete", "refit_complete") and row.get("model"):
             model_key = self._event_key(row, include_model=True)
             activity = self.fit_activity.setdefault(model_key, set())
@@ -187,6 +332,13 @@ class ProgressRelay:
             message += f", fit status unknown {self.unknown_units}"
         if self.failed_scenarios:
             message += f"; failed calibration scenarios {len(self.failed_scenarios)}"
+        if self.active and not final:
+            ordered = sorted(
+                self.active.values(), key=lambda item: item["timestamp"], reverse=True)
+            shown = [item["description"] for item in ordered[:2]]
+            message += f"; active tasks {len(ordered)}; current " + " || ".join(shown)
+            if len(ordered) > len(shown):
+                message += f" || +{len(ordered) - len(shown)} more"
         print(message, flush=True)
 
     def heartbeat(self, now=None):

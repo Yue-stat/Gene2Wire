@@ -11,6 +11,7 @@ from gene2wire.experiments.measurement_experiment import (
     _add_heatmap_contrasts,
     _add_panel_stability,
     _add_projection_budget_recall,
+    _finish,
     _information_access,
 )
 from gene2wire.experiments.pipeline import Artifacts, slug
@@ -273,6 +274,48 @@ def test_projection_recovery_rejects_duplicate_oof_pairs(tmp_path):
 
     with pytest.raises(ValueError, match="multiple outer folds"):
         _add_projection_budget_recall(artifacts)
+
+
+def test_measurement_final_message_follows_derived_tables_and_quiet_phases(
+        tmp_path, capsys):
+    artifacts = _artifacts(tmp_path / "visible")
+    _finish(artifacts, progress=True, progress_interval=60.)
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].startswith("[phase] measurement derived tables: started")
+    assert "measurement-specific CSVs and manifest are complete" in lines[-2]
+    assert lines[-1] == f"All results exported to: {artifacts.export_dir}"
+
+    quiet = _artifacts(tmp_path / "quiet")
+    _finish(quiet, progress=False, progress_interval=60.)
+    assert capsys.readouterr().out == f"All results exported to: {quiet.export_dir}\n"
+
+
+def test_derived_scans_count_but_do_not_load_irrelevant_predictions(tmp_path):
+    metrics = pd.DataFrame({"model": ["PU"]})
+    relevant = {
+        "dataset": "real", "sharing_strength": None, "outer_fold": 0,
+        "gene_coverage": 1.0, "target_coverage": 1.0,
+        "positive_retention": .4, "mechanism": "assay_target_sar",
+        "condition_roles": "coverage_heatmap", "repetition": 0,
+        "panel_seed": 0,
+    }
+    _write_unit(
+        tmp_path, "relevant", relevant, "PU",
+        prediction=np.array([[.5]]), source_measured=np.array([[True]]),
+        cell_ids=np.array(["c0"]), target_ids=np.array(["t0"]),
+    )
+    irrelevant_dir = tmp_path / "units" / "irrelevant"
+    irrelevant_dir.mkdir(parents=True)
+    (irrelevant_dir / "audit.json").write_text(json.dumps({
+        "dataset": "real", "mechanism": "scar", "condition_roles": "full_control",
+    }))
+    # A context filter must skip this payload before opening it.
+    (irrelevant_dir / "PU_predictions.npz").write_bytes(b"not an npz")
+    artifacts = _artifacts(tmp_path, metrics=metrics)
+    scanned = []
+    _add_panel_stability(artifacts, on_prediction_file=lambda count=1: scanned.append(count))
+    assert sum(scanned) == 2
+    assert artifacts.tables["panel_stability"].empty
 
 
 def test_new_comparator_information_access_matches_implemented_target_inputs():

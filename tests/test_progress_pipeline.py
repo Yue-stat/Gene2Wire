@@ -5,7 +5,7 @@ import numpy as np
 from gene2wire.experiments.datasets.simulation import generate_simulation
 from gene2wire.experiments.pipeline import run_experiment
 from gene2wire.experiments.protocol import Settings
-from gene2wire.experiments.progress import ProgressRelay
+from gene2wire.experiments.progress import PhaseProgress, ProgressRelay
 from gene2wire.models import UnifiedPUModel
 
 
@@ -22,10 +22,18 @@ def test_whole_unit_inventory_and_missing_export_recovery(tmp_path, capsys):
                   worker_status=worker_snapshots.append)
     first = run_experiment(data, settings, **kwargs)
     output = capsys.readouterr().out
+    assert "[phase] feature preparation and run identity: started" in output
+    assert "[phase] completed-result cache inventory: started" in output
     assert 'verified result summaries 0/18' in output
     assert 'unchecked does not mean uncached' in output
     assert 'finished units 18/18' in output
     assert '[start]' not in output and '[done]' not in output and '[trial]' not in output
+    assert "[phase] result consolidation: started" in output
+    assert "[phase] summary and diagnostic tables: started" in output
+    assert "[phase] CSV export: started" in output
+    assert "[phase] core export finalization: completed" in output
+    assert output.rfind("[phase] core export finalization: completed") < output.rfind(
+        "All results exported to:")
     assert not first.tables['checkpoint_inventory']['fully_cached'].any()
     events = first.tables['progress_events']
     assert (events['event'] == 'unit_complete').sum() == 3
@@ -118,6 +126,70 @@ def test_summary_final_and_disabled_output(tmp_path, capsys):
         relay.writer('x', work_id='x')({'event': 'model_complete', 'model': 'PU'})
     assert capsys.readouterr().out == ''
     assert relay.done_units == 1 and len(relay.rows) == 1
+
+
+def test_phase_progress_has_counts_timing_heartbeat_and_quiet_mode(capsys):
+    with patch("gene2wire.experiments.progress.time.monotonic", return_value=100.):
+        with PhaseProgress("cache inventory", total=2, unit="scenarios") as phase:
+            phase.advance(detail="fold 0")
+            phase.advance(detail="fold 1")
+            phase.set_summary("2 reusable summaries")
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == "[phase] cache inventory: started (2 scenarios)"
+    assert "completed 2/2 scenarios; elapsed 0.0s; 2 reusable summaries" in lines[-1]
+
+    heartbeat = PhaseProgress("feature hashes", interval=60., total=3, unit="folds")
+    heartbeat.started = heartbeat.last_heartbeat = 100.
+    heartbeat.advance(detail="SPIDER-Seq fold 1")
+    assert not heartbeat.heartbeat(159.)
+    assert heartbeat.heartbeat(160.)
+    output = capsys.readouterr().out
+    assert "running 1/3 folds; elapsed 60.0s" in output
+    assert "current SPIDER-Seq fold 1" in output
+
+    with PhaseProgress("quiet", enabled=False, total=1) as quiet:
+        quiet.advance()
+    assert capsys.readouterr().out == ""
+
+    try:
+        with PhaseProgress("failing", total=1) as failing:
+            failing.set_detail("bad fold")
+            raise RuntimeError("expected")
+    except RuntimeError as error:
+        assert str(error) == "expected"
+    assert failing.thread is not None and not failing.thread.is_alive()
+    assert "[phase] failing: interrupted 0/1 items" in capsys.readouterr().out
+
+
+def test_summary_heartbeat_names_fit_or_cache_reconstruction(tmp_path, capsys):
+    relay = ProgressRelay(tmp_path, total_units=2, interval=60.)
+    relay.started = relay.last_heartbeat = 100.
+    first = relay.writer(
+        "first", work_id="first", dataset="Projection-TAGs", repetition=1,
+        outer_fold=2, analysis="primary", mechanism="assay_target_sar",
+        gene_requested_coverage=.7, target_requested_coverage=.7,
+        positive_retention=.4,
+    )
+    second = relay.writer(
+        "second", work_id="second", dataset="Projection-TAGs", repetition=0,
+        outer_fold=1, analysis="primary", mechanism="assay_target_sar",
+    )
+    first({"event": "candidate_start", "model": "GenEML-adapted",
+           "index": 7, "total": 32, "stage": "tuning",
+           "cache_status": "pending"})
+    second({"event": "candidate_start", "model": "PU-Joint",
+            "index": 12, "total": 32, "stage": "penalty_refinement",
+            "cache_status": "checkpoint"})
+    relay.drain()
+    assert relay.heartbeat(160.)
+    output = capsys.readouterr().out
+    assert "active tasks 2" in output
+    assert "candidate optimizer fit/retry 7/32 (tuning)" in output
+    assert "candidate cache validation/reconstruction 12/32" in output
+    assert "Projection-TAGs | rep=1 | fold=2 | primary | assay_target_sar" in output
+    assert "gene=0.7 | target=0.7 | retain=0.4 | GenEML-adapted" in output
+    assert "candidate fit/cache work" in ProgressRelay._active_description(
+        {"event": "candidate_start", "cache_status": "unknown"}, "Qiao-ID-logit")
 
 
 def test_default_real_plan_runs_identical_fifteen_models_at_every_primary_rate():
