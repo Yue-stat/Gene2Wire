@@ -17,13 +17,13 @@ V2_DIR = ROOT / "notebooks" / "measurement_degradation"
 V3_DIR = ROOT / "notebooks" / "measurement_degradation_v3"
 
 V2_HASHES = {
-    "barseq_a1.ipynb": "196c68834e278ed5b6b5b7066e8d3dc82771c3a6dbb904c8399744fe8227d488",
-    "barseq_m1.ipynb": "fad5300236366ff4b13c6681bc679b9945e40ec978f7b3a33ed01f08daf3e298",
-    "merge_seq.ipynb": "6dbec2eae3d1f38accc13b72506f64edcc92e08852dccee06dfcd57a3bc72a21",
-    "projection_tags.ipynb": "c920f08311b322c7445498f7f2e247ca8808ea0d1fc1a7e0ddf546f33c0b1f57",
-    "simulation.ipynb": "ee4601ff9222fdf16554a691527fe22801997f17890977659c1d61042d377beb",
-    "spider_seq.ipynb": "71f765792542d54a57598c2729ceb3549a302871150952a0d1c540dadc33e885",
-    "spider_spatial.ipynb": "d4a1a0101b53b97f539e416241f801fbbef0b77ae9ff5d22cf882241a17bdc7a",
+    "barseq_a1.ipynb": "6eb4301ea2511e3dcc37b888d09236c8e10221857cd16aaf5612c2c14fff75bc",
+    "barseq_m1.ipynb": "0d246730aeca1ed5ff56475823900644d53c8336f0593d41c79a747b160e28c0",
+    "merge_seq.ipynb": "9f61c7423d5e184887a0572cb43ee6e11152b1120c10c4e96263a772c92e0f27",
+    "projection_tags.ipynb": "427f4d0afeb433e22038e83f6024330b7fbe817bd545ec5e3b369a0252022280",
+    "simulation.ipynb": "1a3b0229945f20bfd9f05ce8876c4acca1ef336d4ee5e28cab1155d96badc628",
+    "spider_seq.ipynb": "b7b9e398cd9d2f132e3fb0c829c850bf42b46b1a09d11f7baba0853767f262a7",
+    "spider_spatial.ipynb": "cc7d7f1e93c8f839a87575bf8dae6233a398a8eeeec469ca296d75c157e982f4",
 }
 
 
@@ -178,8 +178,8 @@ def test_projection_v3_uses_conditional_h_and_false_positive_aware_metrics():
 
 def test_checked_in_v3_notebooks_match_the_builder_byte_for_byte(tmp_path):
     generated = builder().build(
-        "c1793c386e096b48b91513f244ef6fc24e243025",
-        "abccf031027c0e97ef6d1a8273afa3bb2b2b10fd6cd18f0cc0fcd6dbfcfc7f14",
+        "25e7439d1c15c493714edb1149aee07768bbc3d6",
+        "41aa4a33fead2d3f436d8a88ae62bf9d7777b4a169efbb3a206e58f6966c35d9",
         tmp_path,
         "0914",
     )
