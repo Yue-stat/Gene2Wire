@@ -49,6 +49,13 @@ EXPECTED_NOTEBOOKS = {
     "measurement_degradation_v3/projection_tags.ipynb",
     "measurement_degradation_v3/spider_spatial.ipynb",
     "measurement_degradation_v3/spider_seq.ipynb",
+    "measurement_degradation_v4/simulation.ipynb",
+    "measurement_degradation_v4/barseq_a1.ipynb",
+    "measurement_degradation_v4/barseq_m1.ipynb",
+    "measurement_degradation_v4/merge_seq.ipynb",
+    "measurement_degradation_v4/projection_tags.ipynb",
+    "measurement_degradation_v4/spider_spatial.ipynb",
+    "measurement_degradation_v4/spider_seq.ipynb",
 }
 
 

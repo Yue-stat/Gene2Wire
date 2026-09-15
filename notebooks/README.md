@@ -61,8 +61,11 @@ Builder:
 [`build_measurement_degradation.py`](../scripts/notebooks/build_measurement_degradation.py)
 
 The notebooks retain the existing 15 fitted methods and add three explicitly
-labelled comparators: `GenEML-adapted`,
-`Inductive-PU-MC (ShiftIMC-adapted)`, and `SAR-PU (SAR-EM)`. They display panel,
+labelled comparators: `GenEML-authors-mask`, paper-based
+`Inductive-PU-MC`, and the pinned authors-source SAR-EM kernel executed through
+an adapted current-scikit-learn estimator and outer per-target `SAR-PU`
+wrapper with a centered-orthonormal assay/QC propensity design—not the authors'
+unmodified end-to-end program. They display panel,
 support, censoring, selected-parameter, metric, convergence/failure, runtime,
 and checkpoint diagnostics plus the retention curve, coverage heatmap, and the
 dataset-appropriate recovery or panel-sensitivity figure. They run in the
@@ -90,6 +93,38 @@ log loss from saved OOF prediction arrays without retraining.
 
 Builder:
 [`build_measurement_degradation_v3.py`](../scripts/notebooks/build_measurement_degradation_v3.py)
+
+### Six-model V4 experiments
+
+[`measurement_degradation_v4/`](measurement_degradation_v4/) contains seven
+new runnable experiments. They fit only PU, PU-MIRT, Gene2Wire (internal ID
+`PU-Joint`), GenEML, PU matrix completion, and SAR-PU. The grid uses gene and
+target coverages `(1.0, 0.7, 0.4)` and positive retentions
+`(1.0, 0.8, 0.6, 0.4, 0.2)`. Its complete `3 x 3 x 5` factorial supplies
+literal one-factor gene, target, and positive-label-loss slices plus the
+all-condition harmonic-mean curve. It produces four configurable multi-metric curve
+families and one native `funkyheatmappy` scorecard; it does not create the
+legacy full-model curves or gene-by-target contrast heatmap.
+
+The line-plot cells expose their metric tuple first and compare exactly the two
+requested model sets. The funkyheatmap cell separately exposes its metric
+tuple and compares exactly Gene2Wire, GenEML, PU matrix completion, and SAR-PU.
+Every metric is converted to higher-is-better utility (losses are negated),
+then min-max scaled within sharing strength, physical condition, and metric.
+Blue `funkyrect` glyphs therefore run from a small circle at the minimum to a
+square-like maximum, with no number printed inside. Requested/theoretical
+coverage labels are used; realized integer coverage remains in audit tables.
+The scorecard contains the nine one-factor physical conditions once; the full
+factorial is summarized by the combined line rather than duplicated as columns.
+All six models share the same splits, known measurement mask, observed labels,
+and evaluation scope. Method-specific authorized inputs are disclosed, and a
+paired-calibration exposure estimate is supplied only to estimators designed
+to consume it. Hidden Recall@H is restricted to fitted-panel test entries with
+`D=0`; its measured-entry, unlabeled-candidate, and hidden-positive supports are
+exported with the metric.
+
+Builder:
+[`build_measurement_degradation_v4.py`](../scripts/notebooks/build_measurement_degradation_v4.py)
 
 ## Gene-panel overlap
 

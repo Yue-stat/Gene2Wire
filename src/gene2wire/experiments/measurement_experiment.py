@@ -30,9 +30,15 @@ from .measurement_design import (
     panel_design_tables,
     row_panel_mask,
 )
-from .pipeline import Artifacts, _atomic_csv, _execute, slug
+from .pipeline import (
+    Artifacts,
+    _apply_model_allowlist,
+    _atomic_csv,
+    _execute,
+    slug,
+)
 from .progress import PhaseProgress
-from .protocol import Settings, fingerprint
+from .protocol import MODEL_ORDER, Settings, fingerprint
 
 
 # Fast canonical grid.  The 100% control remains literal full coverage; the
@@ -71,6 +77,8 @@ class MeasurementConfig:
     include_matched_uniform: bool = True
     include_natural_recovery: bool = True
     n_panel_seeds: int = 2
+    schedule: str = "legacy"
+    model_allowlist: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         genes = _probability_grid(self.gene_coverages, "gene_coverages")
@@ -99,11 +107,35 @@ class MeasurementConfig:
                 or not isinstance(self.n_panel_seeds, (int, np.integer))
                 or int(self.n_panel_seeds) < 1):
             raise ValueError("n_panel_seeds must be a positive integer")
+        schedule = str(self.schedule)
+        if schedule not in {"legacy", "v4"}:
+            raise ValueError("schedule must be either 'legacy' or 'v4'")
+        model_allowlist = self.model_allowlist
+        if model_allowlist is not None:
+            if isinstance(model_allowlist, (str, bytes)):
+                raise TypeError(
+                    "model_allowlist must be a sequence of model names, not a string"
+                )
+            model_allowlist = tuple(map(str, model_allowlist))
+            if (not model_allowlist
+                    or any(not model for model in model_allowlist)
+                    or len(set(model_allowlist)) != len(model_allowlist)):
+                raise ValueError(
+                    "model_allowlist must contain distinct nonempty model names"
+                )
+            unknown = sorted(set(model_allowlist).difference(MODEL_ORDER))
+            if unknown:
+                raise ValueError(
+                    "model_allowlist contains unknown core model IDs: "
+                    + ", ".join(unknown)
+                )
         object.__setattr__(self, "gene_coverages", genes)
         object.__setattr__(self, "target_coverages", targets)
         object.__setattr__(self, "retentions", retentions)
         object.__setattr__(self, "assay_ids", assays)
         object.__setattr__(self, "n_panel_seeds", int(self.n_panel_seeds))
+        object.__setattr__(self, "schedule", schedule)
+        object.__setattr__(self, "model_allowlist", model_allowlist)
 
 
 @dataclass(frozen=True)
@@ -297,13 +329,38 @@ def _condition_registry(config: MeasurementConfig, *, include_natural: bool):
         registry.setdefault(key, set()).add(str(role))
 
     add(1.0, 1.0, 1.0, "assay_target_sar", "full_control")
-    for retention in config.retentions:
-        add(config.anchor_gene_coverage, config.anchor_target_coverage,
-            retention, "assay_target_sar", "retention_curve")
-    for gene in config.gene_coverages:
-        for target in config.target_coverages:
-            add(gene, target, config.anchor_retention,
-                "assay_target_sar", "coverage_heatmap")
+    if config.schedule == "legacy":
+        for retention in config.retentions:
+            add(config.anchor_gene_coverage, config.anchor_target_coverage,
+                retention, "assay_target_sar", "retention_curve")
+        for gene in config.gene_coverages:
+            for target in config.target_coverages:
+                add(gene, target, config.anchor_retention,
+                    "assay_target_sar", "coverage_heatmap")
+    else:
+        # V4 fits the complete declared factorial once.  The three one-factor
+        # curves are literal slices through its all-full control: positive-label
+        # loss varies only retention, gene coverage varies only genes, and
+        # target coverage varies only targets.  The combined curve consumes the
+        # complete factorial and maps every physical condition to its declared
+        # retained-measurement harmonic mean.
+        for gene in config.gene_coverages:
+            for target in config.target_coverages:
+                for retention in config.retentions:
+                    add(gene, target, retention,
+                        "assay_target_sar", "combined_mask_curve")
+                    if (_contains((gene,), 1.0)
+                            and _contains((target,), 1.0)):
+                        add(gene, target, retention,
+                            "assay_target_sar", "positive_label_loss_only")
+                    if (_contains((target,), 1.0)
+                            and _contains((retention,), 1.0)):
+                        add(gene, target, retention,
+                            "assay_target_sar", "gene_coverage_only")
+                    if (_contains((gene,), 1.0)
+                            and _contains((retention,), 1.0)):
+                        add(gene, target, retention,
+                            "assay_target_sar", "target_coverage_only")
     if config.include_matched_uniform:
         add(config.anchor_gene_coverage, config.anchor_target_coverage,
             config.anchor_retention, "scar", "matched_uniform_control")
@@ -332,7 +389,13 @@ def _panel_audit(prefix, dimension, family) -> dict[str, pd.DataFrame]:
     return result
 
 
-def _information_access(prefix, use_target_features: bool) -> pd.DataFrame:
+def _information_access(
+    prefix,
+    use_target_features: bool,
+    *,
+    scheduled_models: Sequence[str] | None = None,
+    scheduled_only: bool = False,
+) -> pd.DataFrame:
     from .qiao import qiao_model_names
 
     rows = []
@@ -357,14 +420,72 @@ def _information_access(prefix, use_target_features: bool) -> pd.DataFrame:
     add("RF-mixed", "paired_reference+observed", "none", True, True, "cell_features")
     for model in qiao_model_names(use_target_features):
         add(model, "observed", "none", False, False, target_input)
-    # The current GenEML/SAR wrappers model target identity and assay-target
-    # exposure directly; only ShiftIMC consumes optional target descriptors.
-    add("GenEML-adapted", "observed", "model_estimated_assay_target", False, False,
-        "target_identity")
+    # The authors-source GenEML mask port preserves the public implementation's
+    # single global exposure probability per target.  SAR models an
+    # assay-target propensity in its outer per-target wrapper; only ShiftIMC
+    # consumes optional target descriptors.
+    add("GenEML-authors-mask", "observed", "model_estimated_global_target",
+        False, False, "target_identity")
     add("Inductive-PU-MC", "observed", "paired_estimated", True, False, target_input)
     add("SAR-PU", "observed", "model_estimated_assay_target", False, False,
         "target_identity")
-    return pd.DataFrame(rows)
+    result = pd.DataFrame(rows)
+    result["training_inputs"] = "declared cell/target inputs + known W"
+    geneml = result["model"].eq("GenEML-authors-mask")
+    result.loc[geneml, "training_inputs"] = (
+        "cell features X + observed labels S + known measurement mask W"
+    )
+    sar = result["model"].eq("SAR-PU")
+    result.loc[sar, "training_inputs"] = (
+        "cell features X + observed labels S + known measurement mask W + "
+        "outcome-blind per-target centered-orthonormal assay/QC propensity design"
+    )
+    if scheduled_models is None:
+        result["scheduled"] = True
+    else:
+        scheduled = set(map(str, scheduled_models))
+        unknown = sorted(scheduled.difference(result["model"]))
+        if unknown:
+            raise ValueError(
+                "Scheduled models lack information-access declarations: "
+                + ", ".join(unknown)
+            )
+        result["scheduled"] = result["model"].isin(scheduled)
+    if scheduled_only:
+        result = result.loc[result["scheduled"]].reset_index(drop=True)
+    return result
+
+
+def _scheduled_measurement_models(
+    settings: Settings, model_allowlist: Sequence[str] | None
+) -> tuple[str, ...]:
+    """Return the union of model IDs actually scheduled in a primary view."""
+
+    core = _apply_model_allowlist(settings.models(), model_allowlist)
+    names = [model.name for model in core]
+    if (settings.run_information_controls
+            and settings.supervision_profile != "assay_only"):
+        names.extend((
+            "Reference-only", "Reference+PU", "Reference+PU-MIRT",
+            "Reference+PU-Joint",
+        ))
+    if settings.run_random_forest:
+        names.extend((
+            "RF-observed", "RF-reference", "RF-mixed",
+        ) if settings.supervision_profile != "assay_only" else (
+            "RF-observed",
+        ))
+    if settings.run_qiao:
+        from .qiao import qiao_model_names
+
+        names.extend(qiao_model_names(settings.use_target_features))
+    if settings.run_pu_comparators:
+        names.extend((
+            "GenEML-authors-mask", "Inductive-PU-MC", "SAR-PU",
+        ))
+    if len(set(names)) != len(names):
+        raise RuntimeError("Measurement model schedule contains duplicate IDs")
+    return tuple(names)
 
 
 def _combine_tables(collection: Sequence[Mapping[str, pd.DataFrame]]):
@@ -441,6 +562,24 @@ def build_measurement_views(
     prefix = {"dataset": dataset.name, "panel_seed": panel_seed,
               "data_repetition": data_repetition,
               "sharing_strength": dataset.metadata.get("sharing_strength")}
+    inherited_allowlist = dataset.metadata.get("model_allowlist")
+    if inherited_allowlist is not None:
+        inherited_allowlist = tuple(map(str, inherited_allowlist))
+    if (config.model_allowlist is not None
+            and inherited_allowlist is not None
+            and config.model_allowlist != inherited_allowlist):
+        raise ValueError(
+            "MeasurementConfig.model_allowlist conflicts with the source dataset"
+        )
+    model_allowlist = (
+        config.model_allowlist
+        if config.model_allowlist is not None
+        else inherited_allowlist
+    )
+    scheduled_models = _scheduled_measurement_models(
+        settings, model_allowlist
+    )
+
     tables = {
         **_panel_audit(prefix, "gene", gene_family),
         **_panel_audit(prefix, "target", target_family),
@@ -450,7 +589,11 @@ def build_measurement_views(
             "stratum": strata, "stratum_kind": stratum_kind,
         }),
         "information_access": _information_access(
-            prefix, settings.use_target_features),
+            prefix,
+            settings.use_target_features,
+            scheduled_models=scheduled_models,
+            scheduled_only=config.schedule == "v4",
+        ),
     }
     registry = _condition_registry(
         config, include_natural=dataset.natural_observed is not None)
@@ -515,6 +658,17 @@ def build_measurement_views(
             {**context, "source_gene_pool_size": len(dataset.gene_names)},
             n_gene_components=dataset.metadata.get("n_gene_components"),
         )
+        view_metadata = {
+            **dataset.metadata,
+            "experiment_repetition": repetition,
+            "model_seed": data_repetition,
+            "experiment_context": context,
+            "measurement_scenarios": tuple(schedule),
+            "measurement_stratum_kind": stratum_kind,
+            "measurement_design_reads_outcomes": False,
+        }
+        if model_allowlist is not None:
+            view_metadata["model_allowlist"] = model_allowlist
         view = replace(
             dataset,
             feature_builder=features,
@@ -528,15 +682,7 @@ def build_measurement_views(
                 source_measured=native,
                 assays=assays,
             ),
-            metadata={
-                **dataset.metadata,
-                "experiment_repetition": repetition,
-                "model_seed": data_repetition,
-                "experiment_context": context,
-                "measurement_scenarios": tuple(schedule),
-                "measurement_stratum_kind": stratum_kind,
-                "measurement_design_reads_outcomes": False,
-            },
+            metadata=view_metadata,
         )
         view.validate()
         views.append(view)
@@ -660,14 +806,18 @@ def _manifest(config: MeasurementConfig) -> dict:
         "positive_censoring": "fold-local per-target assay-heterogeneous logistic retention",
         "matched_control": "uniform censoring exactly matched to heterogeneous retained training positives",
         "headline_scope": "fixed W_native outer-test reference for every condition",
-        "comparator_contract": "same splits, masks, inputs and candidate budget; no evaluation truth in fitting",
+        "comparator_contract": (
+            "same splits, measurement masks, and evaluation scope; "
+            "method-specific authorized inputs and predeclared candidate budgets "
+            "are disclosed; no evaluation truth in fitting"
+        ),
     }
 
 
 _HEATMAP_COMPARISON_MODEL = "PU-Joint"
 _HEATMAP_BASELINE_CANDIDATES = (
     "PU",
-    "GenEML-adapted",
+    "GenEML-authors-mask",
     "Inductive-PU-MC",
     "SAR-PU",
 )
@@ -1103,6 +1253,28 @@ def _add_projection_budget_recall(artifacts: Artifacts, *,
 def _finish(artifacts: Artifacts, *, progress=True,
             progress_interval=60.0) -> Artifacts:
     """Create measurement-only outputs after the shared pipeline tables."""
+    measurement_protocol = artifacts.manifest.get("measurement_protocol", {})
+    if measurement_protocol.get("schedule") == "v4":
+        # V4 deliberately removes the legacy gene-by-target heatmap,
+        # cross-panel sensitivity figure, and natural-recovery curve.  Those
+        # diagnostics require two complete passes over every saved prediction
+        # file and can make an otherwise completed run appear to hang.  The V4
+        # notebook derives all requested curves and funkyheatmap cells directly
+        # from per_repetition.csv, so no prediction rescan is needed here.
+        with PhaseProgress(
+            "measurement V4 finalization", enabled=progress,
+            interval=progress_interval, total=1, unit="step",
+        ) as phase:
+            phase.set_detail("final manifest; no legacy prediction rescan")
+            atomic_json(artifacts.manifest, artifacts.export_dir / "manifest.json")
+            phase.advance()
+            phase.set_summary(
+                "V4 tables and manifest are complete; skipped legacy heatmap, "
+                "panel-stability, and natural-recovery scans"
+            )
+        print(f"All results exported to: {artifacts.export_dir}", flush=True)
+        return artifacts
+
     units = artifacts.export_dir / "units"
     prediction_files = sum(
         1 for audit_path in units.glob("*/audit.json")

@@ -190,6 +190,17 @@ def test_summary_heartbeat_names_fit_or_cache_reconstruction(tmp_path, capsys):
     assert "gene=0.7 | target=0.7 | retain=0.4 | GenEML-adapted" in output
     assert "candidate fit/cache work" in ProgressRelay._active_description(
         {"event": "candidate_start", "cache_status": "unknown"}, "Qiao-ID-logit")
+    target_activity = ProgressRelay._active_description(
+        {
+            "event": "target_start",
+            "target_index": 4,
+            "target_total": 7,
+            "target_id": "SC",
+            "stage": "refit",
+        },
+        "Projection-TAGs | SAR-PU",
+    )
+    assert "SAR-PU target optimizer fit 4/7 (SC) [refit]" in target_activity
 
 
 def test_default_real_plan_runs_identical_fifteen_models_at_every_primary_rate():

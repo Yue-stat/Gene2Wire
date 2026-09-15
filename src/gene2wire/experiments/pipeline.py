@@ -461,6 +461,44 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                 from .block_evaluation import evaluate_block_predictions
                 spec = prepared.measurement_evaluation
                 fit_w = _fit_measured(prepared)
+                hidden_recall_summary = {}
+                hidden_recovery_support = {}
+                if semantics == "reference":
+                    # Block scoring intentionally treats structurally unmeasured
+                    # entries as reference-only outcomes, so it has no D=0
+                    # recovery endpoint.  Hidden recovery is nevertheless
+                    # identified on the fitted panel.  Compute it with the
+                    # shared PU evaluator and attach only its recall fields to
+                    # the native-reference summary below; all other block
+                    # metrics retain their original evaluation masks.
+                    hidden_evaluated = evaluate_predictions(
+                        spec.reference[test],
+                        observed[test],
+                        fit_w[test],
+                        prediction,
+                        test_e,
+                        probability_semantics="reference",
+                        train_reference_prevalence=prior,
+                        target_ids=prepared.target_ids,
+                    )
+                    hidden_recall_summary = {
+                        key: value
+                        for key, value in hidden_evaluated["summary"].items()
+                        if "hidden_recall_at_h" in key
+                    }
+                    fit_test_w = np.asarray(fit_w[test], dtype=bool)
+                    hidden_candidates = fit_test_w & (
+                        np.asarray(observed[test]) == 0
+                    )
+                    hidden_recovery_support = {
+                        "hidden_recovery_n_measured": int(fit_test_w.sum()),
+                        "hidden_recovery_n_unlabeled_candidates": int(
+                            hidden_candidates.sum()
+                        ),
+                        "hidden_recovery_n_hidden_positives": int(
+                            np.asarray(spec.reference[test])[hidden_candidates].sum()
+                        ),
+                    }
                 scopes = {
                     "native_reference": np.asarray(spec.source_measured[test], dtype=bool),
                     "on_panel": np.asarray(fit_w[test], dtype=bool),
@@ -475,8 +513,30 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
                         target_ids=prepared.target_ids, groups=spec.assays[test],
                         ranking_score=ranking_score,
                         train_reference_prevalence=prior)
-                    evaluation_prefix = {**prefix, "evaluation_scope": scope}
-                    tables["metrics"].append({**evaluation_prefix, **evaluated["summary"]})
+                    reports_hidden_recovery = (
+                        semantics == "reference" and scope == "native_reference"
+                    )
+                    evaluation_prefix = {
+                        **prefix,
+                        "evaluation_scope": scope,
+                        # The ordinary block metrics on this row use the native
+                        # reference mask. Hidden Recall@H instead uses fitted-panel
+                        # entries with D=0, so export that distinct support rather
+                        # than implying that it was scored on native_reference.
+                        "hidden_recovery_scope": (
+                            "training_panel_unlabeled"
+                            if reports_hidden_recovery
+                            else "not_applicable"
+                        ),
+                    }
+                    summary = evaluated["summary"]
+                    if reports_hidden_recovery:
+                        summary = {
+                            **summary,
+                            **hidden_recall_summary,
+                            **hidden_recovery_support,
+                        }
+                    tables["metrics"].append({**evaluation_prefix, **summary})
                     for key in ("per_target", "reliability", "per_group"):
                         tables[key].extend({**evaluation_prefix, **row}
                                            for row in evaluated[key])
@@ -593,13 +653,9 @@ def _run_fold(prepared, repetition, settings, checkpoint_dir, export_dir, code_h
             # ablation arms are capped at exactly K.
             available_features = min(available_features, int(declared_rank_cap))
         tuning = settings.tuning_config(available_features, nt)
-        models = settings.models()
-        model_allowlist = prepared.metadata.get("model_allowlist")
-        if model_allowlist is not None:
-            allowed = set(map(str, model_allowlist))
-            models = tuple(model for model in models if model.name in allowed)
-            if not models:
-                raise ValueError("model_allowlist removed every configured model")
+        models = _apply_model_allowlist(
+            settings.models(), prepared.metadata.get("model_allowlist")
+        )
         lowrank_feature_groups = tuple(
             prepared.metadata.get("model_lowrank_feature_groups", ())
         )
@@ -757,7 +813,7 @@ def _atomic_csv(frame, destination):
 _GROUP_COLUMNS = ["dataset", "sharing_strength", "analysis", "mechanism", "loss_rate",
                   "calibration_fraction", "calibration_spec", "model", "probability_semantics",
                   "experiment", "group_mode", "training_panel", "training_block_fraction",
-                  "evaluation_scope", "block_fraction", "panel_design", "arm",
+                  "evaluation_scope", "hidden_recovery_scope", "block_fraction", "panel_design", "arm",
                   "requested_overlap", "actual_overlap", "panel_size",
                   "gene_requested_coverage", "gene_coverage",
                   "gene_overlap", "target_requested_coverage", "target_coverage",
@@ -775,7 +831,27 @@ def _summarize(tables, *, simulation):
     groups = [c for c in _GROUP_COLUMNS if c in metrics]
     # Equal fold weights within repetition; the independent simulation unit is
     # the generated dataset. Fold*repeat is never the sample size of its CI.
-    per_rep = metrics.groupby(groups + ["repetition"], dropna=False, observed=True)[value_cols].mean().reset_index()
+    fold_groups = metrics.groupby(
+        groups + ["repetition"], dropna=False, observed=True
+    )
+    per_rep = fold_groups[value_cols].mean()
+    # These fields are literal support counts, not fold-level estimands. Outer
+    # test folds partition a repetition, so sum them while preserving NaN for
+    # the explicitly not-applicable rows.
+    hidden_support = [
+        name
+        for name in (
+            "hidden_recovery_n_measured",
+            "hidden_recovery_n_unlabeled_candidates",
+            "hidden_recovery_n_hidden_positives",
+        )
+        if name in value_cols
+    ]
+    if hidden_support:
+        per_rep.loc[:, hidden_support] = fold_groups[hidden_support].sum(
+            min_count=1
+        )
+    per_rep = per_rep.reset_index()
     tables["per_repetition"] = per_rep
     tables["aggregate"] = per_rep.groupby(groups, dropna=False, observed=True)[value_cols].mean().reset_index()
     if simulation:
@@ -801,16 +877,42 @@ def _random_forest_roles(settings):
     return roles[:1] if settings.supervision_profile == "assay_only" else roles
 
 
+def _apply_model_allowlist(models, model_allowlist):
+    """Apply a declared core-model set without silently dropping any ID."""
+
+    models = tuple(models)
+    if model_allowlist is None:
+        return models
+    declared = tuple(map(str, model_allowlist))
+    if (not declared or len(set(declared)) != len(declared)):
+        raise ValueError(
+            "model_allowlist must contain distinct core model IDs"
+        )
+    available = {model.name for model in models}
+    unknown = sorted(set(declared).difference(available))
+    if unknown:
+        raise ValueError(
+            "model_allowlist contains unavailable core model IDs: "
+            + ", ".join(unknown)
+        )
+    allowed = set(declared)
+    selected = tuple(model for model in models if model.name in allowed)
+    if {model.name for model in selected} != allowed:
+        raise RuntimeError(
+            "planned core model set does not equal model_allowlist declaration"
+        )
+    return selected
+
+
 def _planned_models(prepared, settings):
     """Model evaluations per fold/repetition, before any outcome is examined."""
     rows = []
+    core_models = _apply_model_allowlist(
+        settings.models(), prepared.metadata.get("model_allowlist")
+    )
     for scenario in _scenarios(prepared, settings):
-        allowlist = prepared.metadata.get("model_allowlist")
-        names = [m.name for m in settings.models()
+        names = [m.name for m in core_models
                  if m.pu or not scenario["analysis"].startswith("calibration")]
-        if allowlist is not None:
-            allowed = set(map(str, allowlist))
-            names = [name for name in names if name in allowed]
         if scenario["analysis"] == "primary":
             if settings.run_information_controls and settings.supervision_profile != "assay_only":
                 names += ["Reference-only", "Reference+PU", "Reference+PU-MIRT", "Reference+PU-Joint"]
@@ -820,7 +922,9 @@ def _planned_models(prepared, settings):
                 from .qiao import qiao_model_names
                 names += list(qiao_model_names(settings.use_target_features))
             if settings.run_pu_comparators:
-                names += ["GenEML-adapted", "Inductive-PU-MC", "SAR-PU"]
+                names += [
+                    "GenEML-authors-mask", "Inductive-PU-MC", "SAR-PU"
+                ]
         rows.extend({**scenario, "model": name} for name in names)
     return rows
 
@@ -1050,6 +1154,22 @@ def _prepare_execution_identity(datasets, settings, *, progress, progress_interv
             deferred_feature_preparation)
 
 
+def _verified_pu_comparator_sources() -> dict[str, dict[str, str]]:
+    """Freshly verify every vendored comparator source snapshot.
+
+    This helper is intentionally called both before run-level cache inventory
+    and inside comparator workers before candidate/refit cache inventory.
+    """
+
+    from .geneml_authors import verify_geneml_vendor
+    from .sarpu_authors import verify_sarpu_vendor
+
+    return {
+        "GenEML-authors-mask": dict(verify_geneml_vendor()),
+        "SAR-PU": dict(verify_sarpu_vendor()),
+    }
+
+
 def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
              progress_interval=60., progress_level="summary", worker_status=None,
              export_name=None, supplementary_tables=None, manifest_extra=None,
@@ -1058,8 +1178,16 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
      deferred_feature_preparation) = _prepare_execution_identity(
         datasets, settings, progress=progress,
         progress_interval=progress_interval)
+    # Verify vendored comparator bytes before even looking up a completed
+    # scenario summary.  Candidate/refit verification alone is insufficient:
+    # a fully cached scenario would otherwise bypass comparator imports/fits.
+    comparator_source_hashes = (
+        _verified_pu_comparator_sources()
+        if settings.run_pu_comparators else {}
+    )
     manifest = {"protocol": settings.scientific_dict(), "source_hash": code_hash,
                 "datasets": metadata, "input_identities": input_identities,
+                "verified_comparator_sources": comparator_source_hashes,
                 "feature_preparation": ("worker_lazy_after_hash_pass"
                                         if deferred_feature_preparation else "eager"),
                 "uncertainty_unit": "generated_dataset" if is_simulation else "descriptive_fold_and_mask_repeat",
@@ -1067,7 +1195,9 @@ def _execute(datasets, settings, checkpoint_dir, export_dir, *, progress=True,
                              for package in ("numpy", "scipy", "pandas", "scikit-learn", "joblib", "threadpoolctl")}}
                 }
     run_id = fingerprint({"protocol": settings.scientific_dict(), "source_hash": code_hash,
-                          "input_identities": input_identities, "software": manifest["software"]})
+                          "input_identities": input_identities,
+                          "verified_comparator_sources": comparator_source_hashes,
+                          "software": manifest["software"]})
     fit_version = code_hash + ":" + fingerprint(manifest["software"])
     export_path = Path(export_dir) / (export_name or ("simulation_0908" if is_simulation else slug(datasets[0].name) + "_0908")) / run_id
     manifest.update(manifest_extra or {})
@@ -1514,10 +1644,13 @@ def _run_qiao_controls(prepared, observed, tuning_e, final_e, settings, context,
 
 def _run_pu_comparators(prepared, observed, tuning_e, final_e, settings, context,
                         record, tables, checkpoint_dir=None, on_progress=None):
-    """Tune/refit the three predeclared PU comparators on identical inputs.
+    """Tune/refit PU comparators on shared splits with declared input access.
 
-    GenEML and SAR-EM estimate contextual exposure from observed PU labels and
-    outcome-independent assay/target design.  Inductive-PU-MC receives the same
+    The GenEML comparator is a Python-3 port of the pinned authors' source
+    with an explicit known-W exclusion patch.
+    SAR-PU calls the pinned authors' SAR-EM kernel once per target after an
+    outer known-W row restriction.  Inductive-PU-MC is an explicitly
+    paper-based, mask-adapted ShiftIMC reimplementation and receives the same
     paired-calibration exposure as the Gene2Wire PU models.  Completed fits are
     independently checkpointed; evaluation reference values are never inputs
     to either the fit or its checkpoint identity.
@@ -1527,21 +1660,35 @@ def _run_pu_comparators(prepared, observed, tuning_e, final_e, settings, context
     from ..candidate_design import select_balanced_candidates
     from ..checkpoint import CompactArrayCheckpointStore, unit_key
     from ..config import ModelConfig
+    from .geneml_authors import (
+        GENEML_AUTHORS_PROVENANCE,
+        GenEMLAuthorsMaskFit,
+        fit_geneml_authors_mask,
+    )
     from .pu_comparators import (
-        AssayTargetPropensityEncoder,
-        GenEMLFit,
-        SAREMFit,
+        PerTargetAssayPropensityEncoder,
         ShiftIMCFit,
-        fit_geneml_adapted,
-        fit_sar_em,
         fit_shift_imc_adapted,
     )
+    from .sarpu_authors import (
+        SARPU_AUTHORS_PROVENANCE,
+        SARPUAuthorsFit,
+        fit_sarpu_authors,
+    )
+
+    # Direct calls to this worker helper (and spawned worker processes) must
+    # enforce the same source-integrity boundary as the run-level cache.
+    verified_source_hashes = _verified_pu_comparator_sources()
 
     train = np.asarray(prepared.fold.train_rows, dtype=int)
     validation = np.asarray(prepared.fold.validation_rows, dtype=int)
     test = np.asarray(prepared.fold.test_rows, dtype=int)
     development = np.sort(np.r_[train, validation])
     fit_w = _fit_measured(prepared)
+    train_w = np.asarray(fit_w[train])
+    validation_w = np.asarray(fit_w[validation])
+    development_w = np.asarray(fit_w[development])
+    test_w = np.asarray(fit_w[test])
     labels = np.asarray(
         prepared.virtual_assays if prepared.virtual_assays is not None
         else prepared.platform if prepared.platform is not None
@@ -1550,15 +1697,77 @@ def _run_pu_comparators(prepared, observed, tuning_e, final_e, settings, context
     )
     target_ids = tuple(map(str, prepared.target_ids))
 
-    def propensity(rows, encoder):
-        return encoder.transform(labels[rows], target_ids)
+    propensity_qc = (
+        None
+        if prepared.technical_score is None
+        else np.asarray(prepared.technical_score, dtype=float)[:, None]
+    )
+    propensity_qc_names = () if propensity_qc is None else ("technical_score",)
 
-    train_encoder = AssayTargetPropensityEncoder.fit(labels[train], target_ids)
-    refit_encoder = AssayTargetPropensityEncoder.fit(labels[development], target_ids)
-    train_phi = propensity(train, train_encoder)
-    validation_phi = propensity(validation, train_encoder)
-    development_phi = propensity(development, refit_encoder)
-    test_phi = propensity(test, refit_encoder)
+    def propensity(rows, encoder, required_mask):
+        return encoder.transform(
+            labels[rows],
+            target_ids,
+            None if propensity_qc is None else propensity_qc[rows],
+            required_mask=required_mask,
+        )
+
+    train_encoder = PerTargetAssayPropensityEncoder.fit(
+        labels[train],
+        target_ids,
+        train_w,
+        None if propensity_qc is None else propensity_qc[train],
+        propensity_qc_names,
+    )
+    refit_encoder = PerTargetAssayPropensityEncoder.fit(
+        labels[development],
+        target_ids,
+        development_w,
+        None if propensity_qc is None else propensity_qc[development],
+        propensity_qc_names,
+    )
+    # Fitted/development W support defines each target-specific SAR propensity
+    # schema.  Validation and test assay levels are checked only where their
+    # corresponding W entry is actually used; off-panel exposure predictions
+    # remain irrelevant and may retain the all-zero contrast placeholder.
+    train_phi = propensity(train, train_encoder, train_w)
+    development_phi = propensity(
+        development, refit_encoder, development_w
+    )
+    validation_phi_error = None
+    test_phi_error = None
+    try:
+        validation_phi = propensity(
+            validation, train_encoder, validation_w
+        )
+    except ValueError as error:
+        validation_phi = None
+        validation_phi_error = error
+    try:
+        test_phi = propensity(test, refit_encoder, test_w)
+    except ValueError as error:
+        test_phi = None
+        test_phi_error = error
+
+    def unseen_propensity_support(rows, encoder, required_mask):
+        row_assays = labels[rows]
+        required_mask = np.asarray(required_mask, dtype=bool)
+        required_count = 0
+        nonrequired_count = 0
+        for target, levels in enumerate(encoder.target_assay_levels):
+            unseen = ~np.isin(row_assays, levels)
+            required_count += int(np.sum(unseen & required_mask[:, target]))
+            nonrequired_count += int(np.sum(unseen & ~required_mask[:, target]))
+        return required_count, nonrequired_count
+
+    validation_unseen_required, validation_unseen_off_panel = (
+        unseen_propensity_support(
+            validation, train_encoder, validation_w
+        )
+    )
+    test_unseen_required, test_unseen_off_panel = unseen_propensity_support(
+        test, refit_encoder, test_w
+    )
 
     train_x = np.asarray(prepared.train_features.X[train], dtype=float)
     validation_x = np.asarray(prepared.train_features.X[validation], dtype=float)
@@ -1566,8 +1775,6 @@ def _run_pu_comparators(prepared, observed, tuning_e, final_e, settings, context
     test_x = np.asarray(prepared.refit_features.X[test], dtype=float)
     train_s, validation_s = np.asarray(observed[train]), np.asarray(observed[validation])
     development_s = np.asarray(observed[development])
-    train_w, validation_w = np.asarray(fit_w[train]), np.asarray(fit_w[validation])
-    development_w = np.asarray(fit_w[development])
     train_target = (prepared.train_features.Y_target
                     if settings.use_target_features else None)
     refit_target = (prepared.refit_features.Y_target
@@ -1603,17 +1810,20 @@ def _run_pu_comparators(prepared, observed, tuning_e, final_e, settings, context
             model_configs, min(budget, len(model_configs)))
         return tuple(rows[model_configs.index(candidate)] for candidate in selected)
 
+    # The public GenEML program fixes lam_u=lam_v=1e-3 and exposes lam_w as
+    # the feature-map penalty.  Tune only rank and lam_w; do not reintroduce
+    # the contextual-exposure penalty grid from our legacy clean-room model.
     geneml_rows = [
-        {"rank": rank, "l2_u": penalty, "l2_v": penalty,
-         "l2_map": penalty, "l2_exposure": penalty}
+        {"rank": rank, "lam_u": 1e-3, "lam_v": 1e-3,
+         "lam_w": penalty}
         for rank in ranks
-        if rank <= min(train_x.shape[1] + 1, development_x.shape[1] + 1,
+        if rank <= min(train_x.shape[1], development_x.shape[1],
                        len(target_ids))
         for penalty in penalties
     ]
     geneml_candidates = balanced(geneml_rows, [
         ModelConfig(name="GenEML-grid", kind="lowrank", rank=row["rank"],
-                    shared_l2=row["l2_u"])
+                    shared_l2=row["lam_w"])
         for row in geneml_rows
     ])
 
@@ -1633,18 +1843,13 @@ def _run_pu_comparators(prepared, observed, tuning_e, final_e, settings, context
         for row in shift_rows
     ])
 
-    sar_rows = [
-        {"l2_classifier": classifier, "l2_propensity": propensity_penalty}
-        for classifier in penalties for propensity_penalty in penalties
-    ]
-    sar_candidates = balanced(sar_rows, [
-        ModelConfig(name="SAR-grid", kind="joint", rank=1,
-                    shared_l2=row["l2_classifier"],
-                    residual_l2=row["l2_propensity"])
-        for row in sar_rows
-    ])
+    # The authors' SAR-EM implementation exposes fixed LogisticRegressionPU
+    # defaults rather than the two-penalty grid used by our former clean-room
+    # adaptation.  Keep one predeclared candidate instead of silently tuning a
+    # different estimator under the authors-code label.
+    sar_candidates = ({},)
     specifications = (
-        ("GenEML-adapted", geneml_candidates),
+        ("GenEML-authors-mask", geneml_candidates),
         ("Inductive-PU-MC", shift_candidates),
         ("SAR-PU", sar_candidates),
     )
@@ -1658,15 +1863,37 @@ def _run_pu_comparators(prepared, observed, tuning_e, final_e, settings, context
         Path(checkpoint_dir) / "pu_comparators"))
     versions = {
         package: importlib.metadata.version(package)
-        for package in ("numpy", "scipy")
+        for package in ("numpy", "scipy", "scikit-learn")
     }
     code_hash = source_hash()
     cell_ids = np.asarray(prepared.cell_ids, dtype=str)
     target_id_array = np.asarray(target_ids, dtype=str)
     fit_classes = {
-        "GenEMLFit": GenEMLFit,
+        "GenEMLAuthorsMaskFit": GenEMLAuthorsMaskFit,
         "ShiftIMCFit": ShiftIMCFit,
-        "SAREMFit": SAREMFit,
+        "SARPUAuthorsFit": SARPUAuthorsFit,
+    }
+    implementation_provenance = {
+        "GenEML-authors-mask": {
+            **dict(GENEML_AUTHORS_PROVENANCE),
+            "verified_vendor_sha256": verified_source_hashes[
+                "GenEML-authors-mask"
+            ],
+            "paper": "https://proceedings.mlr.press/v70/jain17a.html",
+        },
+        "Inductive-PU-MC": {
+            "authors_code": False,
+            "implementation_variant": (
+                "paper-based ShiftIMC-inspired sigmoid factorization + known-W "
+                "mask + canonical target-ID identity"
+            ),
+            "source_repository": None,
+            "paper": "https://proceedings.mlr.press/v37/hsiehb15.html",
+        },
+        "SAR-PU": {
+            **dict(SARPU_AUTHORS_PROVENANCE),
+            "verified_vendor_sha256": verified_source_hashes["SAR-PU"],
+        },
     }
 
     def checkpoint_coordinates(name, phase, config, seed, options, inputs):
@@ -1676,6 +1903,7 @@ def _run_pu_comparators(prepared, observed, tuning_e, final_e, settings, context
             "inputs": {key: sha256_array(value)
                        for key, value in sorted(inputs.items())},
             "source": code_hash, "versions": versions,
+            "implementation_provenance": implementation_provenance[name],
         })
         key = unit_key(task="pu_comparator_fit", model=name,
                        phase=phase, identity=identity)
@@ -1762,44 +1990,62 @@ def _run_pu_comparators(prepared, observed, tuning_e, final_e, settings, context
         if on_progress is not None:
             on_progress({"event": "model_start", "model": name})
 
-        if name == "GenEML-adapted":
-            tolerance = max(settings.tolerance, 1e-5)
-            candidate_options = {"maxiter": settings.maxiter, "tolerance": tolerance}
-            refit_options = {"maxiter": settings.retry_maxiter, "tolerance": tolerance}
-            candidate_inputs = {
-                **common_candidate_inputs, "propensity_design": train_phi,
-                "propensity_feature_names": np.asarray(
-                    train_encoder.feature_names, dtype=str),
+        if name == "GenEML-authors-mask":
+            # The scalar hyperparameters follow the public source. Full-batch
+            # execution is our explicit adapter (not an authors' default): it
+            # avoids silently discarding a partial last batch and prevents
+            # target-empty W minibatches after measurement-mask exclusion.
+            candidate_options = {
+                "batch_size": None,
+                "num_epochs": 10,
+                "pg_iters": 1,
+                "lr_alpha": 0.6,
+                "lr_tau": 0.55,
+                "init_mu_a": 1.0,
+                "init_mu_b": 1.0,
+                "init_std": 1e-2,
+                "init_w": 1e-2,
+                "normalize_features": True,
             }
-            refit_inputs = {
-                **common_refit_inputs, "propensity_design": development_phi,
-                "propensity_feature_names": np.asarray(
-                    refit_encoder.feature_names, dtype=str),
-            }
+            refit_options = dict(candidate_options)
+            candidate_inputs = dict(common_candidate_inputs)
+            refit_inputs = dict(common_refit_inputs)
 
             def fit_candidate(config, seed):
-                return fit_geneml_adapted(
-                    train_x, train_s, train_w, train_phi, **config,
+                return fit_geneml_authors_mask(
+                    train_x, train_s, train_w, **config,
                     **candidate_options, seed=seed)
 
             def candidate_probability(fitted):
-                return fitted.predict_observed(validation_x, validation_phi)
+                return fitted.predict_observed(validation_x)
 
             def fit_refit(config, seed):
-                return fit_geneml_adapted(
+                return fit_geneml_authors_mask(
                     development_x, development_s, development_w,
-                    development_phi, **config, **refit_options, seed=seed)
+                    **config, **refit_options, seed=seed)
 
             def final_probabilities(fitted):
                 return (fitted.predict_reference(test_x),
-                        fitted.predict_exposure(test_x, test_phi))
+                        fitted.predict_exposure(test_x))
 
             metadata = {
                 "comparator_source": "Jain-Modhe-Rai-2017",
-                "adapted": True, "underlying_method": "GenEML",
-                "adaptation_note": "known-W contextual-exposure Python3 point-EM",
+                **implementation_provenance[name],
+                "adapted": True,
+                "underlying_method": "GenEML authors-source Python 3 port",
+                "adaptation_note": (
+                    "pinned authors' source equations; Python 3/NumPy port; "
+                    "known-W exclusion; full-batch adapter"
+                ),
                 "target_input_kind": "known_target_identity",
-                "information_access": "observed labels; assay-target propensity design",
+                "information_access": (
+                    "cell features X; observed labels S; known measurement "
+                    "mask W; one learned global exposure per target"
+                ),
+                "training_inputs": (
+                    "cell features X + observed labels S + known measurement mask W"
+                ),
+                "uses_known_measurement_mask": True,
             }
         elif name == "Inductive-PU-MC":
             candidate_options = {
@@ -1818,26 +2064,34 @@ def _run_pu_comparators(prepared, observed, tuning_e, final_e, settings, context
             def fit_candidate(config, seed):
                 return fit_shift_imc_adapted(
                     train_x, train_s, train_w, tuning_e[train], train_target,
-                    **config, **candidate_options, seed=seed)
+                    target_ids=target_ids, **config, **candidate_options, seed=seed)
 
             def candidate_probability(fitted):
                 return fitted.predict_observed(
-                    validation_x, tuning_e[validation], train_target)
+                    validation_x, tuning_e[validation], train_target,
+                    target_ids=target_ids)
 
             def fit_refit(config, seed):
                 return fit_shift_imc_adapted(
                     development_x, development_s, development_w,
                     final_e[development], refit_target, **config,
-                    **refit_options, seed=seed)
+                    target_ids=target_ids, **refit_options, seed=seed)
 
             def final_probabilities(fitted):
-                return (fitted.predict_reference(test_x, refit_target),
+                return (fitted.predict_reference(
+                            test_x, refit_target, target_ids=target_ids),
                         np.asarray(final_e[test], dtype=float))
 
             metadata = {
                 "comparator_source": "Hsieh-Natarajan-Dhillon-2015",
-                "adapted": True, "underlying_method": "ShiftIMC-adapted",
-                "adaptation_note": "known-W entry-specific-e sigmoid factorization",
+                **implementation_provenance[name],
+                "adapted": True,
+                "underlying_method": "ShiftIMC-inspired paper-based reimplementation",
+                "adaptation_note": (
+                    "known-W exclusion; entry-specific e; sigmoid score; "
+                    "factorized nuclear-norm surrogate; target-ID-keyed full-rank "
+                    "identity without a redundant target intercept"
+                ),
                 "target_input_kind": (
                     "target_features" if train_target is not None
                     else "known_target_identity"),
@@ -1845,54 +2099,120 @@ def _run_pu_comparators(prepared, observed, tuning_e, final_e, settings, context
                     "observed labels; estimated paired-calibration exposure"),
             }
         else:
-            window = max(2, min(10, settings.maxiter))
+            window = 10
             candidate_options = {
-                "maxiter": max(window, settings.maxiter),
-                "tolerance": max(settings.tolerance, 1e-4),
+                "max_its": max(window + 2, settings.maxiter),
+                "slope_eps": 1e-4,
+                "ll_eps": 1e-4,
                 "convergence_window": window,
-                "inner_maxiter": max(20, min(200, settings.maxiter)),
+                "refit_classifier": True,
             }
             refit_options = {
-                "maxiter": max(window, settings.retry_maxiter),
-                "tolerance": max(settings.tolerance, 1e-4),
+                "max_its": max(window + 2, settings.retry_maxiter),
+                "slope_eps": 1e-4,
+                "ll_eps": 1e-4,
                 "convergence_window": window,
-                "inner_maxiter": max(20, min(200, settings.retry_maxiter)),
+                "refit_classifier": True,
             }
             candidate_inputs = {
                 **common_candidate_inputs, "propensity_design": train_phi,
-                "propensity_feature_names": np.asarray(
-                    train_encoder.feature_names, dtype=str),
+                "propensity_schema": np.asarray(
+                    train_encoder.schema_labels, dtype=str),
+                "propensity_active_counts": np.asarray(
+                    train_encoder.active_feature_counts, dtype=np.int64),
             }
             refit_inputs = {
                 **common_refit_inputs, "propensity_design": development_phi,
-                "propensity_feature_names": np.asarray(
-                    refit_encoder.feature_names, dtype=str),
+                "propensity_schema": np.asarray(
+                    refit_encoder.schema_labels, dtype=str),
+                "propensity_active_counts": np.asarray(
+                    refit_encoder.active_feature_counts, dtype=np.int64),
             }
 
             def fit_candidate(config, seed):
-                return fit_sar_em(
+                if validation_phi_error is not None:
+                    raise ValueError(
+                        "SAR-PU validation propensity support failed: "
+                        f"{validation_phi_error}"
+                    )
+                return fit_sarpu_authors(
                     train_x, train_s, train_w, train_phi, **config,
-                    **candidate_options, seed=seed)
+                    **candidate_options, seed=seed, target_ids=target_ids,
+                    on_progress=(
+                        None if on_progress is None else
+                        lambda event: on_progress({
+                            **event, "model": name, "stage": "tuning"
+                        })
+                    ),
+                )
 
             def candidate_probability(fitted):
+                if validation_phi is None:
+                    raise RuntimeError(
+                        "SAR-PU validation propensity design is unavailable"
+                    )
                 return fitted.predict_observed(validation_x, validation_phi)
 
             def fit_refit(config, seed):
-                return fit_sar_em(
+                if test_phi_error is not None:
+                    raise ValueError(
+                        "SAR-PU test propensity support failed: "
+                        f"{test_phi_error}"
+                    )
+                return fit_sarpu_authors(
                     development_x, development_s, development_w,
-                    development_phi, **config, **refit_options, seed=seed)
+                    development_phi, **config, **refit_options, seed=seed,
+                    target_ids=target_ids,
+                    on_progress=(
+                        None if on_progress is None else
+                        lambda event: on_progress({
+                            **event, "model": name, "stage": "refit"
+                        })
+                    ),
+                )
 
             def final_probabilities(fitted):
+                if test_phi is None:
+                    raise RuntimeError(
+                        "SAR-PU test propensity design is unavailable"
+                    )
                 return (fitted.predict_reference(test_x),
                         fitted.predict_exposure(test_x, test_phi))
 
             metadata = {
-                "comparator_source": "Bekker-Davis-2018",
-                "adapted": False, "underlying_method": "SAR-EM",
-                "adaptation_note": "faithful SAR-EM over measured cell-target dyads",
+                "comparator_source": "Bekker-Robberechts-Davis-2019",
+                **implementation_provenance[name],
+                "adapted": True,
+                "underlying_method": (
+                    "pinned authors' SAR-EM kernel with adapted estimator/wrapper"
+                ),
+                "adaptation_note": (
+                    "pinned authors' EM kernel; sklearn compatibility model; "
+                    "outer per-target known-W row restriction; outcome-blind "
+                    "full-rank centered-orthonormal assay/QC propensity design"
+                ),
                 "target_input_kind": "known_target_identity",
                 "information_access": (
-                    "observed labels only; assay-target propensity design"),
+                    "observed labels; cell X; known W; outcome-blind per-target "
+                    "centered-orthonormal assay/QC propensity design"),
+                "training_inputs": (
+                    "cell features X + observed labels S + known measurement "
+                    "mask W + outcome-blind per-target centered-orthonormal "
+                    "assay/QC propensity design"
+                ),
+                "uses_known_measurement_mask": True,
+                "propensity_unseen_level_policy": (
+                    "fail on W-supported rows; all-zero contrast placeholder "
+                    "only on unused off-panel rows"
+                ),
+                "validation_unseen_required_entries": (
+                    validation_unseen_required
+                ),
+                "validation_unseen_off_panel_entries": (
+                    validation_unseen_off_panel
+                ),
+                "test_unseen_required_entries": test_unseen_required,
+                "test_unseen_off_panel_entries": test_unseen_off_panel,
             }
 
         candidate_seeds = [
@@ -1934,6 +2254,12 @@ def _run_pu_comparators(prepared, observed, tuning_e, final_e, settings, context
                     candidate_inputs,
                     lambda config=config, seed=seed: fit_candidate(config, seed),
                 )
+                convergence = getattr(fitted, "converged", None)
+                if convergence is not None and not bool(convergence):
+                    raise RuntimeError(
+                        f"{name} candidate completed with finite values but "
+                        "did not converge and is ineligible for selection"
+                    )
                 loss = observed_loss(candidate_probability(fitted))
                 elapsed = time.monotonic() - candidate_started
                 row = {
@@ -2030,6 +2356,12 @@ def _run_pu_comparators(prepared, observed, tuning_e, final_e, settings, context
                 refit_options, refit_inputs,
                 lambda: fit_refit(selected_config, refit_seed),
             )
+            convergence = getattr(final, "converged", None)
+            if convergence is not None and not bool(convergence):
+                raise RuntimeError(
+                    f"{name} refit completed with finite values but did not "
+                    "converge; predictions are not exportable"
+                )
             prediction, model_e = final_probabilities(final)
             refit_elapsed = time.monotonic() - refit_started
         except Exception as error:

@@ -191,9 +191,57 @@ two-by-two configuration is intended for rapid result inspection, not formal
 superiority confidence intervals; formal runs must increase independent data
 repetitions without treating nested panel seeds or folds as independent units.
 
+### V4 six-model schedule and figures
+
+The runnable V4 notebooks use a separate predeclared schedule and checkpoint
+namespace. Positive retention is `(1, 0.8, 0.6, 0.4, 0.2)` and gene/target
+coverage remain `(1, 0.7, 0.4)`. The physical schedule is the complete
+`3 x 3 x 5 = 45` gene-coverage by target-coverage by positive-retention
+factorial, with every physical condition fitted once. The positive-label-loss
+curve is the `gene=target=1` slice, the gene-only curve is the
+`target=retention=1` slice, and the target-only curve is the
+`gene=retention=1` slice. Thus “only” means that the other two measurement
+mechanisms are genuinely at their full controls. The combined line uses all 45
+conditions and
+
+```text
+H = 3 / (1 / gene_coverage + 1 / target_coverage + 1 / positive_retention)
+```
+
+as its theoretical retained-measurement coordinate. Requested values, rather
+than rounded realized panel fractions, appear on axes and condition labels;
+both remain available in the exported audit tables.
+
+Only six model IDs are scheduled: `PU`, `PU-MIRT`, `PU-Joint`,
+`GenEML-authors-mask`, `Inductive-PU-MC`, and `SAR-PU`. V4 plots relabel
+`PU-Joint` as **Gene2Wire**, `GenEML-authors-mask` as **GenEML**, and
+`Inductive-PU-MC` as **PU matrix completion**. Its two line-plot sets contain
+exactly `(PU, PU-MIRT, Gene2Wire)` and
+`(Gene2Wire, GenEML, PU matrix completion)`. Each plot cell begins with an
+editable metric tuple covering AUPRC, AUROC, log loss, Brier score, and hidden
+recall. No V4 full-model curve or gene-by-target contrast heatmap is produced.
+
+The native `funkyheatmappy` scorecard contains exactly Gene2Wire, GenEML, PU
+matrix completion, and SAR-PU. It shows each of the nine one-factor physical
+conditions once: five positive-retention conditions (including the all-full
+control), two non-full gene-only conditions, and two non-full target-only
+conditions. The full factorial remains in the combined harmonic-mean line and
+is not duplicated into an unreadable scorecard. For raw metric value `m`,
+define utility `u=m`
+for higher-is-better metrics and `u=-m` for losses. Within each
+`(sharing strength, physical condition, metric)` comparison, the displayed
+value is `(u-min(u))/(max(u)-min(u))`; exact ties receive `0.5` and unavailable
+values stay missing. Thus every non-tied finite column has an exact minimum and
+maximum among the four displayed models. A single blue `funkyrect` encodes the
+result without text: low values are circles and values approaching one become
+square-like. The normalized values are saved beside the raw metric values in
+the V4 scorecard CSV.
+
 ## Models and information access
 
-All 15 retained fitted methods from the current notebooks remain enabled:
+The catalog below describes the canonical (non-V4) measurement-degradation
+family. V4 schedules exactly the six-model subset declared above. All 15
+retained fitted methods from the canonical notebooks remain enabled:
 
 1. Logistic, MIRT, Joint, PU, PU-MIRT, and PU-Joint;
 2. Reference-only, Reference+PU, Reference+PU-MIRT, and Reference+PU-Joint;
@@ -206,16 +254,24 @@ total. Their report labels disclose the adaptations:
 
 | Notebook label | Implemented adaptation | Information used |
 |---|---|---|
-| `GenEML-adapted` | Python 3 point-EM equations, known-`W` exclusion, and contextual assay-target exposure | observed labels and outcome-independent assay-target design |
-| `Inductive-PU-MC (ShiftIMC-adapted)` | bounded sigmoid prediction, known-`W` exclusion, entry-specific estimated exposure, and a factorized nuclear-norm surrogate rather than exact convex ShiftIMC | observed labels, cell inputs, optional declared target inputs, and paired-calibration exposure estimates |
-| `SAR-PU (SAR-EM)` | target-specific logistic outcome classifiers plus one shared dyadic logistic propensity model | observed labels and outcome-independent assay-target propensity design; no clean labels or true propensity |
+| `GenEML-authors-mask` | pinned authors-source Python-3 port with known-`W` exclusion and a full-batch adapter; it does **not** execute the unmodified Python-2 authors' program, and full-batch execution is a Gene2Wire adaptation; the exposure remains one global probability per target | cell features `X`, observed labels `S`, and known measurement mask `W`; no clean labels, contextual propensity, or paired-calibration exposure |
+| `Inductive-PU-MC (paper-based)` | ShiftIMC-inspired bounded sigmoid prediction, known-`W` exclusion, entry-specific estimated exposure, and a factorized nuclear-norm surrogate; not a verified authors' solver | observed labels, cell inputs, optional declared target inputs, and paired-calibration exposure estimates |
+| `SAR-PU (authors' SAR-EM kernel + adapted wrapper)` | pinned authors' binary SAR-EM kernel, called separately per target after excluding its `W=0` rows, through an adapted current-scikit-learn estimator and an outer per-target wrapper; this does **not** execute the authors' unmodified end-to-end program | cell features `X`, observed labels `S`, known measurement mask `W`, and an outcome-independent per-target centered-orthonormal assay/QC propensity design; no clean labels, paired-calibration exposure estimate, or true propensity |
 
 All methods within a fold/scenario receive the same split, `W_fit`, observed
-labels, input panels, authorized paired-calibration rows, and evaluation scope.
+labels, and evaluation scope. Method-specific authorized inputs are disclosed
+in the manifest and selected/tuning rows. The paired-calibration exposure
+estimate is passed only to estimators designed to consume it; GenEML and
+SAR-PU instead estimate exposure under their own declared models. No test
+reference outcome or simulation truth is supplied to fitting or selection.
 The three comparators are tuned on measured validation entries with observed
 log loss for `q=e*p`; no test reference or simulation propensity selects a
 configuration. Duplicate comparator configurations are removed and each added
-comparator's search is capped at 32 genuine candidates. `Logistic-rescaled`,
+comparator's search is capped at 32 genuine candidates. GenEML fixes the
+authors' `lam_u=lam_v=1e-3` defaults and tunes rank plus `lam_w`; its public
+per-target exposure semantics are preserved. SAR-PU uses the authors' fixed
+logistic defaults as one candidate rather than tuning the two penalties of the
+former clean-room adaptation. `Logistic-rescaled`,
 when defined, is a post-hoc prediction and is not counted as a nineteenth fit.
 
 PU-Joint and Joint use the explicit `rank_top2_total_ratio` strategy: an adaptive
@@ -249,7 +305,10 @@ The audit surface includes:
   number and fraction of unsupported relationships, with every unsupported
   training gene-target pair exported explicitly (validation/test retain the
   compact summary without duplicating large pair-level tables);
-- requested, expected, and realized retention; hidden-positive counts;
+- requested, expected, and realized retention; Hidden Recall@H on fitted-panel
+  outer-test entries with `D=0` (exported as
+  `hidden_recovery_scope=training_panel_unlabeled`), together with the measured-
+  entry, unlabeled-candidate, and hidden-positive support counts;
   target-specific intercepts; pooled fallbacks; estimated/true propensity
   diagnostics where truth is legitimately available; and matched-uniform
   retained-count checks;
@@ -271,7 +330,7 @@ The primary figures are:
    positive retention fixed at their anchors;
 4. a zero-centered gene-coverage by target-coverage heatmap of
    `Brier(fixed external baseline) - Brier(PU-Joint)`. The external candidate
-   set is PU, GenEML-adapted, Inductive-PU-MC, and SAR-PU; a baseline is eligible
+   set is PU, GenEML-authors-mask, Inductive-PU-MC, and SAR-PU; a baseline is eligible
    only with converged development results on the complete grid and is frozen
    once for the whole heatmap. PU-MIRT is a structural ablation of PU-Joint and
    neither proposed-family model is a baseline candidate; and

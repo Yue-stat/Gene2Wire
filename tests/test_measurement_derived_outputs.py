@@ -290,6 +290,33 @@ def test_measurement_final_message_follows_derived_tables_and_quiet_phases(
     assert capsys.readouterr().out == f"All results exported to: {quiet.export_dir}\n"
 
 
+def test_v4_finalization_skips_removed_legacy_prediction_scans(tmp_path, capsys):
+    artifacts = _artifacts(
+        tmp_path / "v4",
+        manifest={"measurement_protocol": {"schedule": "v4"}},
+    )
+    unit = artifacts.export_dir / "units" / "unreadable"
+    unit.mkdir(parents=True)
+    (unit / "audit.json").write_text("not valid json")
+    (unit / "PU_predictions.npz").write_bytes(b"not a valid archive")
+
+    _finish(artifacts, progress=True, progress_interval=60.0)
+
+    output = capsys.readouterr().out
+    assert "measurement V4 finalization" in output
+    assert "skipped legacy heatmap" in output
+    assert output.rstrip().endswith(f"All results exported to: {artifacts.export_dir}")
+    for legacy in (
+        "heatmap_baseline_selection",
+        "heatmap_contrasts",
+        "panel_stability",
+        "projection_budget_recall",
+        "projection_budget_recall_per_target",
+    ):
+        assert legacy not in artifacts.tables
+        assert not (artifacts.export_dir / f"{legacy}.csv").exists()
+
+
 def test_derived_scans_count_but_do_not_load_irrelevant_predictions(tmp_path):
     metrics = pd.DataFrame({"model": ["PU"]})
     relevant = {
@@ -321,5 +348,8 @@ def test_derived_scans_count_but_do_not_load_irrelevant_predictions(tmp_path):
 def test_new_comparator_information_access_matches_implemented_target_inputs():
     table = _information_access({}, use_target_features=True).set_index("model")
     assert table.loc["Inductive-PU-MC", "target_input"] == "declared_target_features"
-    assert table.loc["GenEML-adapted", "target_input"] == "target_identity"
+    assert table.loc["GenEML-authors-mask", "target_input"] == "target_identity"
+    assert table.loc[
+        "GenEML-authors-mask", "exposure_source"
+    ] == "model_estimated_global_target"
     assert table.loc["SAR-PU", "target_input"] == "target_identity"

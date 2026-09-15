@@ -229,6 +229,15 @@ class ProgressRelay:
         elif event == "model_start":
             activity = ("completed-model cache reconstruction" if cached
                         else "model setup/cache checks")
+        elif event == "target_start":
+            activity = "SAR-PU target optimizer fit"
+            if (row.get("target_index") is not None
+                    and row.get("target_total") is not None):
+                activity += f" {row['target_index']}/{row['target_total']}"
+            if row.get("target_id") is not None:
+                activity += f" ({row['target_id']})"
+            if row.get("stage"):
+                activity += f" [{row['stage']}]"
         elif event == "unit_start":
             activity = "worker fold-feature materialization/cache setup"
         else:
@@ -247,6 +256,7 @@ class ProgressRelay:
                 self.worker_activity[row["pid"]] = (stamp, event == "task_group_start")
         label = self.label(row)
         if event in ("unit_start", "model_start", "candidate_start",
+                     "target_start",
                      "refit_start", "scenario_start"):
             self.active[unit] = {
                 "description": self._active_description(row, label),
@@ -313,6 +323,13 @@ class ProgressRelay:
         elif event == "candidate_complete" and self.level == "trial":
             print(f"[trial] {label} {row.get('index')}/{row.get('total')}; "
                   f"{row.get('cache_status')}{elapsed}", flush=True)
+        elif event == "target_complete" and self.level == "trial":
+            print(
+                f"[target] {label} "
+                f"{row.get('target_index')}/{row.get('target_total')} "
+                f"({row.get('target_id')}); fitted{elapsed}",
+                flush=True,
+            )
 
     @classmethod
     def _event_key(cls, row, *, include_model=False):

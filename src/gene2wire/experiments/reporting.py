@@ -404,7 +404,7 @@ def compact_summaries(tables: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataFr
 
 _IMPORTANT_MODELS = ("PU", "PU-MIRT", "PU-Joint", "Reference+PU-Joint")
 _MEASUREMENT_MODELS = (
-    "PU", "PU-MIRT", "PU-Joint", "GenEML-adapted",
+    "PU", "PU-MIRT", "PU-Joint", "GenEML-authors-mask",
     "Inductive-PU-MC", "SAR-PU", "Reference+PU-Joint",
 )
 _PU_MODELS = _IMPORTANT_MODELS[:3]

@@ -10,10 +10,19 @@ import pandas as pd
 from gene2wire.experiments.contracts import ExperimentDataset, FeatureSet, Fold
 from gene2wire.experiments.measurement_experiment import (
     MeasurementConfig,
+    _manifest,
     build_measurement_views,
 )
 from gene2wire.experiments import pipeline
 from gene2wire.experiments.protocol import Settings
+
+
+def test_manifest_discloses_method_specific_comparator_inputs_and_budgets():
+    contract = _manifest(MeasurementConfig())["comparator_contract"]
+    assert "same splits, measurement masks, and evaluation scope" in contract
+    assert "method-specific authorized inputs" in contract
+    assert "predeclared candidate budgets" in contract
+    assert "same splits, masks, inputs and candidate budget" not in contract
 
 
 def _dataset() -> ExperimentDataset:
@@ -99,6 +108,8 @@ def test_fast_measurement_defaults_are_the_declared_protocol_grid():
         config.anchor_retention,
     ) == (0.7, 0.7, 0.4)
     assert config.n_panel_seeds == 2
+    assert config.schedule == "legacy"
+    assert config.model_allowlist is None
 
 
 def _full_config() -> MeasurementConfig:
@@ -125,6 +136,23 @@ def _small_grid_config() -> MeasurementConfig:
         include_matched_uniform=True,
         include_natural_recovery=False,
     )
+
+
+def _v4_grid_config(**updates) -> MeasurementConfig:
+    values = dict(
+        gene_coverages=(1.0, 0.5),
+        target_coverages=(1.0, 0.5),
+        retentions=(1.0, 0.5),
+        anchor_gene_coverage=0.5,
+        anchor_target_coverage=0.5,
+        anchor_retention=0.5,
+        include_matched_uniform=False,
+        include_natural_recovery=False,
+        schedule="v4",
+        model_allowlist=("PU", "PU-MIRT", "PU-Joint"),
+    )
+    values.update(updates)
+    return MeasurementConfig(**values)
 
 
 def _view(views, gene_coverage, target_coverage):
@@ -383,6 +411,103 @@ def test_condition_registry_deduplicates_coordinates_and_merges_roles():
             pipeline._fit_measured(prepared), view.training_measured)
 
 
+def test_v4_schedule_has_literal_one_factor_slices_and_full_factorial_combined():
+    settings = _settings()
+    views, tables = build_measurement_views(
+        _dataset(), settings, _v4_grid_config(), repetition=0)
+    scenarios = tables["measurement_scenarios"]
+    assert len(views) == 4
+    assert len(scenarios) == 8
+
+    roles = {
+        (
+            row.gene_requested_coverage,
+            row.target_requested_coverage,
+            row.positive_retention,
+        ): set(row.condition_roles.split("+"))
+        for row in scenarios.itertuples(index=False)
+    }
+    assert roles[(1.0, 1.0, 1.0)] == {
+        "combined_mask_curve", "full_control", "gene_coverage_only",
+        "positive_label_loss_only", "target_coverage_only",
+    }
+    assert roles[(1.0, 1.0, 0.5)] == {
+        "combined_mask_curve", "positive_label_loss_only",
+    }
+    assert roles[(0.5, 1.0, 1.0)] == {
+        "combined_mask_curve", "gene_coverage_only",
+    }
+    assert roles[(1.0, 0.5, 1.0)] == {
+        "combined_mask_curve", "target_coverage_only",
+    }
+    assert roles[(0.5, 1.0, 0.5)] == {"combined_mask_curve"}
+    assert roles[(1.0, 0.5, 0.5)] == {"combined_mask_curve"}
+    assert roles[(0.5, 0.5, 0.5)] == {"combined_mask_curve"}
+    assert not scenarios["condition_roles"].str.contains(
+        "coverage_heatmap|retention_curve", regex=True).any()
+
+
+def test_measurement_model_allowlist_propagates_and_filters_core_plan():
+    settings = _settings()
+    views, _ = build_measurement_views(
+        _dataset(), settings, _v4_grid_config(), repetition=0)
+    for view in views:
+        assert tuple(view.metadata["model_allowlist"]) == (
+            "PU", "PU-MIRT", "PU-Joint",
+        )
+        prepared = pipeline._prepare(
+            view, view.split_builder(2, 0)[0], settings)
+        assert {
+            row["model"] for row in pipeline._planned_models(prepared, settings)
+        } == {"PU", "PU-MIRT", "PU-Joint"}
+
+
+def test_measurement_config_rejects_invalid_v4_controls():
+    for updates in (
+        {"schedule": "unknown"},
+        {"model_allowlist": ()},
+        {"model_allowlist": ("PU", "PU")},
+        {"model_allowlist": ("PU", "")},
+        {"model_allowlist": ("PU", "PU-Jiont")},
+    ):
+        with np.testing.assert_raises(ValueError):
+            _v4_grid_config(**updates)
+    with np.testing.assert_raises(TypeError):
+        _v4_grid_config(model_allowlist="PU")
+
+
+def test_configured_allowlist_cannot_silently_replace_dataset_allowlist():
+    dataset = replace(
+        _dataset(), metadata={
+            **_dataset().metadata,
+            "model_allowlist": ("PU",),
+        },
+    )
+    with np.testing.assert_raises_regex(ValueError, "conflicts"):
+        build_measurement_views(
+            dataset, _settings(), _v4_grid_config(), repetition=0)
+
+
+def test_v4_planned_models_and_information_audit_equal_declared_six():
+    settings = _settings(run_pu_comparators=True)
+    views, audit = build_measurement_views(
+        _dataset(), settings, _v4_grid_config(), repetition=0
+    )
+    expected = {
+        "PU", "PU-MIRT", "PU-Joint", "GenEML-authors-mask",
+        "Inductive-PU-MC", "SAR-PU",
+    }
+    information = audit["information_access"]
+    assert set(information["model"]) == expected
+    assert information["scheduled"].eq(True).all()
+    prepared = pipeline._prepare(
+        views[0], views[0].split_builder(2, 0)[0], settings
+    )
+    assert {
+        row["model"] for row in pipeline._planned_models(prepared, settings)
+    } == expected
+
+
 def test_declared_measurement_scenarios_are_part_of_run_identity(tmp_path):
     """Changing only the scenario schedule must select a new export run."""
 
@@ -502,11 +627,13 @@ def test_primary_plan_retains_fifteen_methods_and_adds_exactly_three_comparators
     names = [row["model"] for row in pipeline._planned_models(prepared, settings)]
     assert len(names) == 18
     assert len(set(names)) == 18
-    assert {"PU-Joint", "GenEML-adapted", "Inductive-PU-MC", "SAR-PU"}.issubset(names)
+    assert {
+        "PU-Joint", "GenEML-authors-mask", "Inductive-PU-MC", "SAR-PU"
+    }.issubset(names)
 
 
 def test_comparator_wrapper_reports_requested_public_names_and_probabilities():
-    settings = _settings(run_pu_comparators=True, maxiter=20, retry_maxiter=20)
+    settings = _settings(run_pu_comparators=True, maxiter=500, retry_maxiter=500)
     views, _ = build_measurement_views(
         _dataset(), settings, _full_config(), repetition=0)
     fold = views[0].split_builder(2, 0)[0]
@@ -526,11 +653,38 @@ def test_comparator_wrapper_reports_requested_public_names_and_probabilities():
          "positive_retention": 1.0, "panel_id": "full"},
         record, tables,
     )
-    expected = {"GenEML-adapted", "Inductive-PU-MC", "SAR-PU"}
+    expected = {"GenEML-authors-mask", "Inductive-PU-MC", "SAR-PU"}
     assert {item[0] for item in records} == expected
     assert {row["model"] for row in tables["selected"]} == expected
     assert {row["model"] for row in tables["tuning"]} == expected
     assert not tables["failures"]
+    selected = {row["model"]: row for row in tables["selected"]}
+    assert selected["SAR-PU"]["authors_code"] is False
+    assert selected["SAR-PU"]["authors_source"] is True
+    assert (
+        selected["SAR-PU"]["executes_unmodified_authors_code"] is False
+    )
+    assert selected["SAR-PU"]["uses_unmodified_authors_em_kernel"] is True
+    assert "per-target centered-orthonormal" in (
+        selected["SAR-PU"]["training_inputs"]
+    )
+    assert selected["SAR-PU"]["source_commit"] == (
+        "6e4fc3d8c84ac3512669a4e36ffcb5086f5b42a7"
+    )
+    assert selected["GenEML-authors-mask"]["authors_code"] is False
+    assert selected["GenEML-authors-mask"]["authors_source"] is True
+    assert (
+        selected["GenEML-authors-mask"][
+            "executes_unmodified_authors_code"
+        ] is False
+    )
+    assert "known measurement mask W" in (
+        selected["GenEML-authors-mask"]["training_inputs"]
+    )
+    assert selected["GenEML-authors-mask"]["source_commit"] == (
+        "f6c08c8f3c69a009b565955231509633eda611d1"
+    )
+    assert selected["Inductive-PU-MC"]["authors_code"] is False
     for _, prediction, semantics, sensitivity, _ in records:
         assert prediction.shape == (len(fold.test_rows), len(prepared.target_ids))
         assert np.isfinite(prediction).all() and ((0 <= prediction) & (prediction <= 1)).all()
@@ -612,3 +766,130 @@ def test_tiny_fold_uses_training_mask_but_scores_fixed_native_reference(
         selected = metrics.loc[metrics["evaluation_scope"].eq(scope)]
         assert selected["n_evaluated"].eq(expected).all()
     assert expected_counts["native_reference"] > expected_counts["on_panel"]
+
+    # Measurement block metrics gain hidden-positive recall only on the
+    # native-reference summary.  With full positive retention there are no
+    # hidden positives, so the endpoint is explicitly undefined rather than
+    # being reported as zero.
+    for row in tables["metrics"]:
+        if (row["evaluation_scope"] == "native_reference"
+                and row["probability_semantics"] == "reference"):
+            assert "hidden_recall_at_h" in row
+            assert np.isnan(row["hidden_recall_at_h"])
+            assert np.isnan(row["macro_hidden_recall_at_h"])
+            assert row["n_targets_hidden_recall_at_h"] == 0
+            assert row["hidden_recovery_scope"] == (
+                "training_panel_unlabeled"
+            )
+            assert row["hidden_recovery_n_measured"] == int(on_panel.sum())
+            assert row["hidden_recovery_n_unlabeled_candidates"] == int(
+                (on_panel & ~dataset.reference[test]).sum()
+            )
+            assert row["hidden_recovery_n_hidden_positives"] == 0
+        else:
+            assert "hidden_recall_at_h" not in row
+            assert row["hidden_recovery_scope"] == "not_applicable"
+            assert "hidden_recovery_n_measured" not in row
+
+    # The scope is grouping metadata, while support counts remain numeric and
+    # survive the fold-to-repetition export.  Not-applicable rows stay NaN.
+    summarized = {"metrics": metrics.copy()}
+    pipeline._summarize(summarized, simulation=False)
+    per_repetition = summarized["per_repetition"]
+    applicable = per_repetition.loc[
+        per_repetition["hidden_recovery_scope"].eq(
+            "training_panel_unlabeled"
+        )
+    ]
+    assert not applicable.empty
+    assert applicable["hidden_recovery_n_measured"].eq(
+        int(on_panel.sum())
+    ).all()
+    not_applicable = per_repetition.loc[
+        per_repetition["hidden_recovery_scope"].eq("not_applicable")
+    ]
+    assert not_applicable["hidden_recovery_n_measured"].isna().all()
+
+
+def test_measurement_hidden_recall_is_finite_only_for_reference_native_rows(
+        tmp_path, monkeypatch):
+    dataset = _dataset()
+    config = MeasurementConfig(
+        gene_coverages=(1.0,),
+        target_coverages=(1.0,),
+        retentions=(1.0, 0.5),
+        anchor_gene_coverage=1.0,
+        anchor_target_coverage=1.0,
+        anchor_retention=0.5,
+        include_matched_uniform=False,
+        include_natural_recovery=False,
+    )
+    settings = _settings()
+    views, _ = build_measurement_views(
+        dataset, settings, config, repetition=0)
+    view = _view(views, 1.0, 1.0)
+    fold = view.split_builder(2, 0)[0]
+    prepared = pipeline._prepare(view, fold, settings)
+    scenario = next(
+        item for item in pipeline._scenarios(prepared, settings)
+        if item["positive_retention"] == 0.5)
+
+    def fake_grid(**kwargs):
+        predictions = np.full(
+            (len(kwargs["test_X"]), kwargs["train"].n_targets), 0.35)
+        records = {
+            model.name: SimpleNamespace(
+                fitted=SimpleNamespace(config=model),
+                latent_probability=predictions.copy(),
+                summary=lambda name=model.name: {
+                    "model": name, "tuning_trials": 0
+                },
+                tuning=SimpleNamespace(trials=[]),
+            )
+            for model in kwargs["models"]
+        }
+        return SimpleNamespace(models=records)
+
+    monkeypatch.setattr(pipeline, "run_model_grid", fake_grid)
+    tables = pipeline._run_fold(
+        prepared, 0, settings,
+        tmp_path / "checkpoints", tmp_path / "exports", "test-code",
+        scenario=scenario,
+    )
+
+    applicable_rows = []
+    for row in tables["metrics"]:
+        expected = (
+            row["probability_semantics"] == "reference"
+            and row["evaluation_scope"] == "native_reference"
+        )
+        if expected:
+            assert np.isfinite(row["hidden_recall_at_h"])
+            assert np.isfinite(row["macro_hidden_recall_at_h"])
+            assert row["n_targets_hidden_recall_at_h"] > 0
+            assert row["hidden_recovery_scope"] == (
+                "training_panel_unlabeled"
+            )
+            assert row["hidden_recovery_n_measured"] > 0
+            assert (
+                row["hidden_recovery_n_unlabeled_candidates"]
+                >= row["hidden_recovery_n_hidden_positives"]
+                > 0
+            )
+            applicable_rows.append(row)
+        else:
+            assert "hidden_recall_at_h" not in row
+            assert row["hidden_recovery_scope"] == "not_applicable"
+            assert "hidden_recovery_n_hidden_positives" not in row
+
+    # Every reference-probability model is evaluated on the same hidden-label
+    # support; the model changes the ranking, never the denominator.
+    support = {
+        (
+            row["hidden_recovery_n_measured"],
+            row["hidden_recovery_n_unlabeled_candidates"],
+            row["hidden_recovery_n_hidden_positives"],
+        )
+        for row in applicable_rows
+    }
+    assert len(support) == 1

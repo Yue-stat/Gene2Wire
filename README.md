@@ -76,8 +76,14 @@ Seven output-cleared entry points live under
 [`notebooks/measurement_degradation/`](notebooks/measurement_degradation/):
 simulation, BARseq A1, BARseq M1, MERGE-seq, Projection-TAGs, SPIDER spatial,
 and SPIDER-Seq. They retain the current 15 fitted methods and add
-`GenEML-adapted`, `Inductive-PU-MC (ShiftIMC-adapted)`, and
-`SAR-PU (SAR-EM)`. Artificial target-panel exclusions remain missing through
+`GenEML-authors-mask`, an authors-source Python-3/known-measurement-mask port
+that does not execute the unmodified Python-2 authors' program;
+paper-based `Inductive-PU-MC`; and the pinned authors' `SAR-PU` EM kernel,
+executed through an adapted current-scikit-learn estimator and an outer
+per-target measurement-mask wrapper with an outcome-blind,
+centered-orthonormal assay/QC propensity design. This is not the authors' unmodified
+end-to-end program. Artificial
+target-panel exclusions remain missing through
 `W_fit = W_native & B[assay,target]`, while headline test metrics use the same
 fixed native reference scope for every condition. These notebooks are intended
 for the source-pinned local/OnDemand Python environment; no Colab copies are
@@ -127,6 +133,22 @@ AUPRC curve with log loss, and adds key/full funkyheatmap-style summaries.
 Projection-TAGs also derives false-positive-aware amplification-recovery metrics
 from the saved OOF arrays. Missing explicit exports fail closed rather than
 starting a fit.
+
+The runnable six-model V4 family lives in
+[`notebooks/measurement_degradation_v4/`](notebooks/measurement_degradation_v4/).
+It uses positive retentions `(1, .8, .6, .4, .2)`, fits only PU, PU-MIRT,
+Gene2Wire, GenEML, PU matrix completion, and SAR-PU, and replaces the legacy
+full-model and gene-by-target figures with configurable five-metric curves and
+a native blue `funkyheatmappy` scorecard. Literal one-factor slices and the
+combined harmonic-mean curve are derived from the complete `3 x 3 x 5`
+measurement factorial. Simulation scorecard values are
+normalized separately inside each sharing strength. Public plots call
+`PU-Joint` **Gene2Wire** while exports retain the internal ID for provenance.
+All six models share the same splits, known measurement mask, observed labels,
+and evaluation scope. Method-specific authorized inputs are disclosed; the
+paired-calibration exposure estimate is supplied only to estimators designed
+to consume it. V4 hidden recall ranks fitted-panel test entries with `D=0` and
+exports the measured-entry, unlabeled-candidate, and hidden-positive supports.
 
 In simulation, the default `truth_uses_location = USE_LOCATION` controls the
 generated projection signal as well as predictor inputs. Gene-only simulation

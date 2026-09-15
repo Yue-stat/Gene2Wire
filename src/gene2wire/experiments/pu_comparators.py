@@ -20,11 +20,11 @@ contract is more general than the original papers:
     and factorized nuclear-norm surrogate are adaptations of the paper's linear,
     box-constrained estimator.
 
-``SAR-EM``
-    A multi-target wrapper around the logistic SAR-EM algorithm of Bekker and
-    Davis (SDM 2018).  Outcome classifiers are target-specific; one propensity
-    regression can contain target, assay, assay-by-target, and declared QC
-    covariates.  It uses observed PU labels only.
+``SAR-EM-adapted`` (legacy)
+    A historical clean-room multi-target adaptation.  It is retained as a
+    low-level compatibility API but is not the SAR-PU benchmark implementation:
+    the measurement pipeline uses the pinned authors' kernel through
+    :mod:`gene2wire.experiments.sarpu_authors`.
 
 Every tuner selects a configuration by measured-entry observed-label log loss.
 The returned fits expose reference probability ``p``, exposure ``e`` (when the
@@ -86,7 +86,7 @@ def _labels(observed: Any, measured: Any, n_rows: int) -> tuple[Array, BoolArray
 
 def _propensity_array(value: Any | None, shape: tuple[int, int]) -> Array:
     if value is None:
-        # Reference-coded target effects.  The fitting functions add an
+        # Target-identity-coded propensity effects.  The fitting functions add an
         # unpenalized intercept, giving one global exposure per target.
         n_rows, n_targets = shape
         result = np.zeros((n_rows, n_targets, max(0, n_targets - 1)), dtype=np.float64)
@@ -280,6 +280,274 @@ class AssayTargetPropensityEncoder:
         )
         if result.shape[2] != len(self.feature_names):
             raise RuntimeError("internal propensity feature-name mismatch")
+        return result
+
+
+@dataclass(frozen=True)
+class PerTargetAssayPropensityEncoder:
+    """Outcome-blind propensity designs for independent binary SAR fits.
+
+    The authors' SAR-PU routine fits one binary model at a time. Feeding a
+    slice of :class:`AssayTargetPropensityEncoder` to such a fit is incorrect:
+    target main effects become duplicate intercepts and assay-by-target terms
+    duplicate assay main effects. This encoder instead learns a separate
+    centered-orthonormal assay/QC schema on the measured rows of every target.
+
+    The returned tensor is padded to a common third dimension so it retains
+    the public ``(cell, target, feature)`` wrapper API. Active columns are
+    always packed first. Padding is identically zero and the SAR wrapper
+    removes it (and defensively removes any other linearly dependent column)
+    before calling the upstream optimizer.
+    """
+
+    assay_levels: tuple[str, ...]
+    target_ids: tuple[str, ...]
+    row_covariate_names: tuple[str, ...]
+    target_assay_levels: tuple[tuple[str, ...], ...]
+    target_qc_indices: tuple[tuple[int, ...], ...]
+    row_center: Array
+    row_scale: Array
+    n_features: int
+
+    @staticmethod
+    def _assay_contrast_basis(n_levels: int) -> Array:
+        """Return a deterministic Helmert basis for the centered level space.
+
+        The columns are orthonormal and orthogonal to the all-ones vector.
+        Consequently, relabeling/reordering assay categories changes the design
+        only by an orthogonal rotation, leaving an L2-penalized fit invariant.
+        """
+
+        if n_levels < 1:
+            return np.empty((0, 0), dtype=np.float64)
+        basis = np.zeros((n_levels, n_levels - 1), dtype=np.float64)
+        for column in range(n_levels - 1):
+            count = column + 1
+            scale = np.sqrt(count * (count + 1.0))
+            basis[:count, column] = 1.0 / scale
+            basis[count, column] = -count / scale
+        return basis
+
+    @classmethod
+    def _assay_design(
+        cls,
+        assay_ids: Sequence[Any],
+        levels: Sequence[str],
+    ) -> Array:
+        assays = tuple(map(str, assay_ids))
+        fitted_levels = tuple(map(str, levels))
+        if not fitted_levels:
+            return np.empty((len(assays), 0), dtype=np.float64)
+        lookup = {level: index for index, level in enumerate(fitted_levels)}
+        basis = cls._assay_contrast_basis(len(fitted_levels))
+        result = np.zeros((len(assays), basis.shape[1]), dtype=np.float64)
+        for row, assay in enumerate(assays):
+            position = lookup.get(assay)
+            if position is not None:
+                result[row] = basis[position]
+        return result
+
+    @classmethod
+    def fit(
+        cls,
+        assay_ids: Sequence[Any],
+        target_ids: Sequence[Any],
+        measured: Any,
+        row_covariates: Any | None = None,
+        row_covariate_names: Sequence[Any] = (),
+    ) -> "PerTargetAssayPropensityEncoder":
+        assays = np.asarray(tuple(map(str, assay_ids)), dtype=object)
+        targets = tuple(map(str, target_ids))
+        if assays.ndim != 1 or len(assays) == 0:
+            raise ValueError("assay_ids must be a nonempty one-dimensional sequence")
+        if not targets or len(set(targets)) != len(targets):
+            raise ValueError("target_ids must be nonempty and unique")
+        raw_measured = np.asarray(measured)
+        if raw_measured.shape != (len(assays), len(targets)):
+            raise ValueError("measured must align with assay_ids and target_ids")
+        if not np.all(np.isin(raw_measured, (0, 1))):
+            raise ValueError("measured must be binary")
+        included = raw_measured.astype(bool)
+
+        if row_covariates is None:
+            covariates = np.empty((len(assays), 0), dtype=np.float64)
+        else:
+            covariates = _array2d(
+                row_covariates, "row_covariates", allow_zero_columns=True
+            )
+            if len(covariates) != len(assays):
+                raise ValueError("row_covariates must align with assay_ids")
+        names = tuple(map(str, row_covariate_names))
+        if len(names) != covariates.shape[1] or len(set(names)) != len(names):
+            raise ValueError("row_covariate_names must be unique and align with columns")
+
+        centers = np.zeros((len(targets), covariates.shape[1]), dtype=np.float64)
+        scales = np.ones_like(centers)
+        target_levels: list[tuple[str, ...]] = []
+        target_qc: list[tuple[int, ...]] = []
+        feature_counts: list[int] = []
+        for target in range(len(targets)):
+            rows = included[:, target]
+            if not np.any(rows):
+                # Keep an aligned zero-width schema. The downstream authors'
+                # wrapper will report this target as unsupported without
+                # preventing unrelated comparators from running.
+                target_levels.append(())
+                target_qc.append(())
+                feature_counts.append(0)
+                continue
+            levels = tuple(sorted(set(map(str, assays[rows]))))
+            target_levels.append(levels)
+            assay_design = cls._assay_design(assays[rows], levels)
+            base = np.column_stack(
+                (np.ones(int(rows.sum()), dtype=np.float64), assay_design)
+            )
+            base_rank = int(np.linalg.matrix_rank(base))
+            if base_rank != base.shape[1]:
+                raise RuntimeError(
+                    "centered-orthonormal assay design is not full rank"
+                )
+
+            if covariates.shape[1]:
+                target_values = covariates[rows]
+                centers[target] = target_values.mean(axis=0)
+                raw_scale = target_values.std(axis=0)
+                scales[target] = np.where(raw_scale < 1e-12, 1.0, raw_scale)
+                standardized = (target_values - centers[target]) / scales[target]
+            else:
+                standardized = np.empty((int(rows.sum()), 0), dtype=np.float64)
+
+            # Preserve declared QC order and retain a column only when it adds
+            # an estimable direction beyond the intercept and assay contrasts.
+            # This decision uses W and covariates only, never PU outcomes.
+            selected: list[int] = []
+            working = base
+            rank = base_rank
+            for column in range(standardized.shape[1]):
+                proposed = np.column_stack((working, standardized[:, column]))
+                proposed_rank = int(np.linalg.matrix_rank(proposed))
+                if proposed_rank == rank + 1:
+                    selected.append(column)
+                    working = proposed
+                    rank = proposed_rank
+            target_qc.append(tuple(selected))
+            feature_counts.append(len(levels) - 1 + len(selected))
+
+        return cls(
+            assay_levels=tuple(sorted(set(map(str, assays)))),
+            target_ids=targets,
+            row_covariate_names=names,
+            target_assay_levels=tuple(target_levels),
+            target_qc_indices=tuple(target_qc),
+            row_center=centers,
+            row_scale=scales,
+            n_features=max(feature_counts, default=0),
+        )
+
+    @property
+    def active_feature_counts(self) -> tuple[int, ...]:
+        return tuple(
+            max(0, len(levels) - 1) + len(qc)
+            for levels, qc in zip(self.target_assay_levels, self.target_qc_indices)
+        )
+
+    @property
+    def feature_names_by_target(self) -> tuple[tuple[str, ...], ...]:
+        return tuple(
+            tuple(
+                "assay_centered_orthonormal_v1"
+                + canonical_json(levels)
+                + f"::{column}"
+                for column in range(max(0, len(levels) - 1))
+            )
+            + tuple(self.row_covariate_names[index] for index in qc)
+            for levels, qc in zip(self.target_assay_levels, self.target_qc_indices)
+        )
+
+    @property
+    def feature_names(self) -> tuple[str, ...]:
+        """Stable tensor-slot names; semantic names are target-specific."""
+        return tuple(
+            f"per_target_propensity_slot={index}" for index in range(self.n_features)
+        )
+
+    @property
+    def schema_labels(self) -> tuple[tuple[str, ...], ...]:
+        """Rectangular target-specific schema for checkpoint identities."""
+        return tuple(
+            names
+            + tuple("<padding>" for _ in range(self.n_features - len(names)))
+            for names in self.feature_names_by_target
+        )
+
+    def transform(
+        self,
+        assay_ids: Sequence[Any],
+        target_ids: Sequence[Any],
+        row_covariates: Any | None = None,
+        *,
+        required_mask: Any | None = None,
+    ) -> Array:
+        assays = np.asarray(tuple(map(str, assay_ids)), dtype=object)
+        targets = tuple(map(str, target_ids))
+        if assays.ndim != 1:
+            raise ValueError("assay_ids must be one-dimensional")
+        if targets != self.target_ids:
+            raise ValueError("target_ids must match the fitted propensity schema exactly")
+        if required_mask is None:
+            # Preserve the strict legacy transform contract when the caller
+            # supplies no row/target support information. Callers that know W
+            # can permit wholly off-support rows by passing required_mask.
+            unknown = sorted(set(map(str, assays)).difference(self.assay_levels))
+            if unknown:
+                raise ValueError(f"unknown assay levels: {unknown}")
+            required = np.zeros((len(assays), len(targets)), dtype=bool)
+        else:
+            raw_required = np.asarray(required_mask)
+            if raw_required.shape != (len(assays), len(targets)):
+                raise ValueError(
+                    "required_mask must align with assay_ids and target_ids"
+                )
+            if not np.all(np.isin(raw_required, (0, 1))):
+                raise ValueError("required_mask must be binary")
+            required = raw_required.astype(bool)
+        if self.row_covariate_names:
+            covariates = _array2d(row_covariates, "row_covariates")
+            if covariates.shape != (len(assays), len(self.row_covariate_names)):
+                raise ValueError("row_covariates do not match the fitted propensity schema")
+        else:
+            if row_covariates is not None and np.asarray(row_covariates).size:
+                raise ValueError("row_covariates were supplied to a schema without them")
+            covariates = np.empty((len(assays), 0), dtype=np.float64)
+
+        result = np.zeros(
+            (len(assays), len(targets), self.n_features), dtype=np.float64
+        )
+        for target, (levels, qc_indices) in enumerate(
+            zip(self.target_assay_levels, self.target_qc_indices)
+        ):
+            unseen_required = required[:, target] & ~np.isin(assays, levels)
+            if np.any(unseen_required):
+                missing = sorted(set(map(str, assays[unseen_required])))
+                raise ValueError(
+                    "required assay levels were unseen on fitted W support for "
+                    f"target {self.target_ids[target]!r}: {missing}"
+                )
+            position = 0
+            assay_design = self._assay_design(assays, levels)
+            if assay_design.shape[1]:
+                stop = position + assay_design.shape[1]
+                result[:, target, position:stop] = assay_design
+                position = stop
+            if qc_indices:
+                standardized = (
+                    covariates - self.row_center[target]
+                ) / self.row_scale[target]
+                for column in qc_indices:
+                    result[:, target, position] = standardized[:, column]
+                    position += 1
+            if position != self.active_feature_counts[target]:
+                raise RuntimeError("internal per-target propensity schema mismatch")
         return result
 
 
@@ -602,13 +870,40 @@ def shift_imc_unbiased_entry_loss(
     return p**2 + (s / e) * (1 - 2 * p)
 
 
-def _target_design(value: Any | None, n_targets: int) -> tuple[Array, str]:
+def _target_ids(
+    value: Sequence[Any] | None,
+    n_targets: int,
+) -> tuple[str, ...]:
+    identifiers = (
+        tuple(map(str, range(n_targets)))
+        if value is None
+        else tuple(map(str, value))
+    )
+    if len(identifiers) != n_targets or len(set(identifiers)) != n_targets:
+        raise ValueError("target_ids must be unique and align with target columns")
+    return identifiers
+
+
+def _target_design(
+    value: Any | None,
+    n_targets: int,
+    target_ids: Sequence[Any] | None = None,
+) -> tuple[Array, str, bool, tuple[str, ...]]:
+    identifiers = _target_ids(target_ids, n_targets)
     if value is None:
-        return np.eye(n_targets, dtype=np.float64), "known_target_identity"
+        # A positional identity assigns random initialization rows to arbitrary
+        # input-column positions.  Key the basis columns by stable target IDs
+        # instead.  The one-hot basis is already full rank, so adding a target-
+        # side intercept would create the redundant [1, I] parameterization.
+        levels = tuple(sorted(identifiers))
+        lookup = {identifier: index for index, identifier in enumerate(levels)}
+        result = np.zeros((n_targets, n_targets), dtype=np.float64)
+        result[np.arange(n_targets), [lookup[item] for item in identifiers]] = 1.0
+        return result, "known_target_identity", False, identifiers
     target = _array2d(value, "target_design")
     if target.shape[0] != n_targets:
         raise ValueError("target_design must align with target columns")
-    return target, "target_features"
+    return target, "target_features", True, identifiers
 
 
 @dataclass(frozen=True)
@@ -617,6 +912,8 @@ class ShiftIMCFit:
     target_loading: Array
     target_design: Array
     target_input_kind: str
+    target_ids: tuple[str, ...]
+    augment_target_intercept: bool
     rank: int
     l2: float
     n_features: int
@@ -630,25 +927,68 @@ class ShiftIMCFit:
     def model_name(self) -> str:
         return "ShiftIMC-adapted"
 
-    def predict_reference(self, X: Any, target_design: Any | None = None) -> Array:
+    def predict_reference(
+        self,
+        X: Any,
+        target_design: Any | None = None,
+        target_ids: Sequence[Any] | None = None,
+    ) -> Array:
         x = _array2d(X, "X")
         if x.shape[1] != self.n_features:
             raise ValueError("prediction X does not match the fitted feature count")
         if target_design is None:
-            target = self.target_design
+            if target_ids is None:
+                target = self.target_design
+            elif self.target_input_kind == "known_target_identity":
+                requested_values = tuple(target_ids)
+                requested = _target_ids(requested_values, len(requested_values))
+                if set(requested) != set(self.target_ids):
+                    raise ValueError(
+                        "identity target_ids must match the fitted target set"
+                    )
+                levels = tuple(sorted(self.target_ids))
+                lookup = {
+                    identifier: index for index, identifier in enumerate(levels)
+                }
+                target = np.zeros((len(requested), len(levels)), dtype=np.float64)
+                target[
+                    np.arange(len(requested)),
+                    [lookup[item] for item in requested],
+                ] = 1.0
+            else:
+                requested = _target_ids(target_ids, len(self.target_ids))
+                # JSON checkpoint restoration materializes tuples as lists.
+                # Compare canonical tuples so an otherwise identical restored
+                # feature-design fit does not reject aligned target IDs.
+                if requested != tuple(self.target_ids):
+                    raise ValueError(
+                        "target feature prediction requires an aligned target_design"
+                    )
+                target = self.target_design
         else:
             target = _array2d(target_design, "target_design")
             if target.shape[1] != self.target_design.shape[1]:
                 raise ValueError("prediction target design does not match fitted columns")
+            if target_ids is not None:
+                _target_ids(target_ids, target.shape[0])
+        target_features = (
+            _augment_intercept(target)
+            if self.augment_target_intercept
+            else target
+        )
         score = (_augment_intercept(x) @ self.cell_loading) @ (
-            _augment_intercept(target) @ self.target_loading
+            target_features @ self.target_loading
         ).T
         return expit(score)
 
     def predict_observed(
-        self, X: Any, exposure: Any, target_design: Any | None = None
+        self,
+        X: Any,
+        exposure: Any,
+        target_design: Any | None = None,
+        target_ids: Sequence[Any] | None = None,
     ) -> Array:
-        p = self.predict_reference(X, target_design)
+        p = self.predict_reference(X, target_design, target_ids)
         return p * _prediction_exposure(exposure, p.shape)
 
     def diagnostics(self) -> dict[str, Any]:
@@ -658,6 +998,8 @@ class ShiftIMCFit:
             "rank": self.rank,
             "l2": self.l2,
             "target_input_kind": self.target_input_kind,
+            "target_ids": list(self.target_ids),
+            "augment_target_intercept": self.augment_target_intercept,
             "final_converged": self.converged,
             "final_iterations": self.iterations,
             "final_objective": self.objective_value,
@@ -666,7 +1008,7 @@ class ShiftIMCFit:
             "probability_semantics": "reference_p_with_supplied_exposure",
             "adaptations": (
                 "known-W exclusion|entry-specific e|sigmoid bound|"
-                "factorized nuclear surrogate"
+                "factorized nuclear surrogate|canonical target-ID identity"
             ),
         }
 
@@ -678,6 +1020,7 @@ def fit_shift_imc_adapted(
     exposure: Any,
     target_design: Any | None = None,
     *,
+    target_ids: Sequence[Any] | None = None,
     rank: int = 2,
     l2: float = 1e-2,
     maxiter: int = 500,
@@ -689,8 +1032,11 @@ def fit_shift_imc_adapted(
     x = _array2d(X, "X")
     s, w = _labels(observed, measured, len(x))
     e = _exposure(exposure, s.shape, w)
-    target, target_kind = _target_design(target_design, s.shape[1])
-    xa, ya = _augment_intercept(x), _augment_intercept(target)
+    target, target_kind, augment_target_intercept, fitted_target_ids = _target_design(
+        target_design, s.shape[1], target_ids
+    )
+    xa = _augment_intercept(x)
+    ya = _augment_intercept(target) if augment_target_intercept else target
     rank = _positive_int(rank, "rank")
     if rank > min(xa.shape[1], ya.shape[1], s.shape[1]):
         raise ValueError("rank exceeds the augmented inductive feature cap")
@@ -735,6 +1081,8 @@ def fit_shift_imc_adapted(
         b,
         target.copy(),
         target_kind,
+        fitted_target_ids,
+        augment_target_intercept,
         rank,
         l2,
         x.shape[1],
@@ -765,7 +1113,7 @@ class SAREMFit:
 
     @property
     def model_name(self) -> str:
-        return "SAR-EM"
+        return "SAR-EM-adapted"
 
     def predict_reference(self, X: Any) -> Array:
         x = _array2d(X, "X")
@@ -802,6 +1150,10 @@ class SAREMFit:
             "optimizer_failures": self.optimizer_failures,
             "probability_semantics": "reference_p_with_model_exposure",
             "information_access": "observed labels and declared propensity covariates only",
+            "adaptations": (
+                "clean-room multi-target EM|shared dyadic propensity|"
+                "local-certainty stabilization"
+            ),
         }
 
 
@@ -831,7 +1183,12 @@ def fit_sar_em(
     inner_maxiter: int = 200,
     seed: int = 0,
 ) -> SAREMFit:
-    """Fit logistic SAR-EM without clean labels or true propensities."""
+    """Fit the legacy clean-room SAR-EM adaptation.
+
+    This function is not the authors' implementation and is no longer used by
+    the measurement benchmark.  It remains available for backward-compatible
+    diagnostics only.
+    """
 
     if isinstance(seed, bool) or not isinstance(seed, (int, np.integer)) or int(seed) < 0:
         raise ValueError("seed must be a nonnegative integer")
@@ -988,6 +1345,8 @@ def _tuning_result(
     configs: Sequence[Mapping[str, Any]],
     validation_losses: Sequence[float],
     seeds: Sequence[int],
+    *,
+    require_converged: bool = False,
 ) -> ComparatorTuningResult:
     trials = tuple(
         ComparatorTrial(
@@ -1004,8 +1363,16 @@ def _tuning_result(
             zip(fits, configs, validation_losses, seeds)
         )
     )
+    eligible = [
+        index for index, trial in enumerate(trials)
+        if np.isfinite(trial.validation_observed_log_loss)
+        and (trial.converged or not require_converged)
+    ]
+    if not eligible:
+        qualifier = "converged finite" if require_converged else "finite"
+        raise ValueError(f"{model} has no {qualifier} candidate")
     winner = min(
-        range(len(trials)),
+        eligible,
         key=lambda index: (
             not trials[index].converged,
             trials[index].validation_observed_log_loss,
@@ -1080,6 +1447,7 @@ def tune_shift_imc_adapted(
     *,
     train_target_design: Any | None = None,
     validation_target_design: Any | None = None,
+    target_ids: Sequence[Any] | None = None,
     candidates: Sequence[Mapping[str, Any]] | None = None,
     maxiter: int = 500,
     tolerance: float = 1e-8,
@@ -1093,14 +1461,17 @@ def tune_shift_imc_adapted(
         validation_observed, validation_measured, len(x_validation)
     )
     e_validation = _exposure(validation_exposure, s_validation.shape, w_validation)
-    target, _ = _target_design(train_target_design, np.asarray(train_observed).shape[1])
+    target, _, augment_target_intercept, _ = _target_design(
+        train_target_design, np.asarray(train_observed).shape[1], target_ids
+    )
     if validation_target_design is not None:
         validation_target = _array2d(validation_target_design, "validation_target_design")
         if validation_target.shape != target.shape:
             raise ValueError("training and validation target designs differ")
     else:
         validation_target = None
-    maximum = min(x_train.shape[1] + 1, target.shape[1] + 1, len(target))
+    target_feature_count = target.shape[1] + int(augment_target_intercept)
+    maximum = min(x_train.shape[1] + 1, target_feature_count, len(target))
     if candidates is None:
         ranks = tuple(sorted({1, min(2, maximum), maximum}))
         candidates = tuple(
@@ -1117,16 +1488,22 @@ def tune_shift_imc_adapted(
             train_measured,
             train_exposure,
             train_target_design,
+            target_ids=target_ids,
             **config,
             maxiter=maxiter,
             tolerance=tolerance,
             seed=trial_seed,
         )
-        p = fitted.predict_reference(x_validation, validation_target)
+        p = fitted.predict_reference(
+            x_validation, validation_target, target_ids=target_ids
+        )
         fits.append(fitted)
         losses.append(_observed_log_loss(s_validation, p * e_validation, w_validation))
         seeds.append(trial_seed)
-    return _tuning_result("ShiftIMC-adapted", fits, configs, losses, seeds)
+    return _tuning_result(
+        "ShiftIMC-adapted", fits, configs, losses, seeds,
+        require_converged=True,
+    )
 
 
 def tune_sar_em(
@@ -1186,6 +1563,7 @@ def tune_sar_em(
 
 __all__ = [
     "AssayTargetPropensityEncoder",
+    "PerTargetAssayPropensityEncoder",
     "ComparatorTrial",
     "ComparatorTuningResult",
     "GenEMLFit",

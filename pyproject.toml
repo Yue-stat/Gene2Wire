@@ -22,6 +22,7 @@ experiments = [
   "joblib>=1.3",
   "threadpoolctl>=3.1",
   "matplotlib>=3.8",
+  "funkyheatmappy==0.7.0",
   "rdata==0.11.2; python_version < '3.11'",
   "rdata==1.1.0; python_version >= '3.11'",
   "openpyxl>=3.1",
@@ -34,6 +35,15 @@ notebooks = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"gene2wire._vendor.sarpu" = ["LICENSE", "UPSTREAM.md"]
+"gene2wire._vendor.geneml" = [
+  "LICENSE",
+  "UPSTREAM.md",
+  "README.upstream.md",
+  "*.py2",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

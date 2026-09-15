@@ -188,7 +188,7 @@ measurement_config = MeasurementConfig(
 )
 KEY_MEASUREMENT_MODELS = (
     'PU', 'PU-MIRT', 'PU-Joint',
-    'GenEML-adapted', 'Inductive-PU-MC', 'SAR-PU',
+    'GenEML-authors-mask', 'Inductive-PU-MC', 'SAR-PU',
 )
 
 if SHOW_FULL_DIAGNOSTICS:
@@ -345,8 +345,9 @@ def preflight_measurement(dataset):
         })
     base_candidates = pd.DataFrame(base_candidates)
     display(base_candidates)
-    print('GenEML-adapted, Inductive-PU-MC and SAR-PU use the same candidate-budget ceiling; '
-          'their realized trials and selected parameters are recorded in tuning.csv and selected.csv.')
+    print('GenEML-authors-mask and Inductive-PU-MC are capped by the declared candidate budget; '
+          'SAR-PU uses one authors-default candidate. Realized trials and selected parameters '
+          'are recorded in tuning.csv and selected.csv.')
     print('Masked target entries are excluded from calibration, fitting and validation loss; they are never negatives.')
     print('Gene masking precedes train-only scaling; value, observation-mask and assay-ID blocks distinguish missing from zero.')
     return preview
@@ -989,8 +990,10 @@ def notebook(name: str, commit: str, source_hash: str, date_suffix=None):
 
         PU-Joint and the full retained benchmark suite use the same split, observed masks,
         paired-reference budget and candidate ceiling. This family additionally enables
-        GenEML-adapted, Inductive-PU-MC and SAR-PU. The `-adapted` label is retained until the
-        Python 3 port is validated as implementation-equivalent to the historical GenEML code.
+        GenEML-authors-mask, Inductive-PU-MC and SAR-PU. GenEML is a pinned authors-source
+        Python 3 port with known-`W` exclusion, not an execution of the unmodified Python-2
+        authors' program; SAR-PU calls the pinned authors' SAR-EM kernel
+        per target after excluding `W=0` rows. Inductive-PU-MC remains explicitly paper-based.
         `rank_top2_total_ratio` explicitly screens declared Joint ranks, retains the two best
         distinct converged ranks using development validation, and allocates the remaining
         native budget across total-shrinkage and residual/shared-ratio coordinates."""),

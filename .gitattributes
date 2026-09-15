@@ -1,0 +1,2 @@
+# Vendored snapshots preserve upstream bytes, including historical whitespace.
+src/gene2wire/_vendor/** -whitespace

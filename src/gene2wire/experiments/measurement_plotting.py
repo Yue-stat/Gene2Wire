@@ -23,7 +23,7 @@ KEY_MODELS = (
     "PU",
     "PU-MIRT",
     "PU-Joint",
-    "GenEML-adapted",
+    "GenEML-authors-mask",
     "Inductive-PU-MC",
     "SAR-PU",
 )
@@ -46,7 +46,7 @@ FULL_MODEL_ORDER = (
     "Qiao-ID-logit",
     "Qiao-squared",
     "Qiao-logit",
-    "GenEML-adapted",
+    "GenEML-authors-mask",
     "Inductive-PU-MC",
     "SAR-PU",
 )
@@ -58,7 +58,7 @@ MODEL_COLORS = {
     "PU": "#0072B2",
     "PU-MIRT": "#009E73",
     "PU-Joint": "#D55E00",
-    "GenEML-adapted": "#CC79A7",
+    "GenEML-authors-mask": "#CC79A7",
     "Inductive-PU-MC": "#56B4E9",
     "SAR-PU": "#E69F00",
 }

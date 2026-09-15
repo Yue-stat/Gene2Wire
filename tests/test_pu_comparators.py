@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import inspect
 
 import numpy as np
@@ -11,11 +12,13 @@ from gene2wire.experiments.pipeline import PreparedFold
 from gene2wire.experiments.protocol import Settings
 from gene2wire.experiments.pu_comparators import (
     AssayTargetPropensityEncoder,
+    PerTargetAssayPropensityEncoder,
     fit_geneml_adapted,
     fit_sar_em,
     fit_shift_imc_adapted,
     shift_imc_unbiased_entry_loss,
     tune_geneml_adapted,
+    tune_shift_imc_adapted,
 )
 
 
@@ -62,6 +65,192 @@ def test_propensity_encoder_is_outcome_blind_and_schema_locked() -> None:
     with pytest.raises(ValueError, match="unknown assay"):
         encoder.transform(["A", "A", "D", "A"], ["left", "right"], qc)
     assert "observed" not in inspect.signature(AssayTargetPropensityEncoder.fit).parameters
+
+
+def test_per_target_sar_encoder_is_full_rank_and_target_permutation_equivariant() -> None:
+    assays = np.asarray(["A", "B", "C"] * 6)
+    targets = ("alpha", "beta", "gamma")
+    measured = np.column_stack(
+        (
+            np.isin(assays, ("A", "B")),
+            np.isin(assays, ("B", "C")),
+            assays == "A",
+        )
+    )
+    depth = np.linspace(-2.0, 2.0, len(assays))
+    qc = np.column_stack(
+        (depth, (assays == "B").astype(float), np.ones(len(assays)))
+    )
+    names = ("depth", "duplicate_assay_B", "constant")
+    encoder = PerTargetAssayPropensityEncoder.fit(
+        assays, targets, measured, qc, names
+    )
+    design = encoder.transform(assays, targets, qc)
+
+    assert all(
+        "target=" not in name and ":target" not in name
+        for schema in encoder.feature_names_by_target
+        for name in schema
+    )
+    for target, count in enumerate(encoder.active_feature_counts):
+        rows = measured[:, target]
+        active = design[rows, target, :count]
+        augmented = np.column_stack((np.ones(rows.sum()), active))
+        assert np.linalg.matrix_rank(augmented) == augmented.shape[1]
+        assert not np.any(design[:, target, count:])
+
+    permutation = np.asarray([2, 0, 1])
+    permuted_targets = tuple(targets[index] for index in permutation)
+    permuted_encoder = PerTargetAssayPropensityEncoder.fit(
+        assays, permuted_targets, measured[:, permutation], qc, names
+    )
+    permuted_design = permuted_encoder.transform(assays, permuted_targets, qc)
+    np.testing.assert_allclose(permuted_design, design[:, permutation])
+    assert permuted_encoder.active_feature_counts == tuple(
+        encoder.active_feature_counts[index] for index in permutation
+    )
+    assert permuted_encoder.feature_names_by_target == tuple(
+        encoder.feature_names_by_target[index] for index in permutation
+    )
+    assert "observed" not in inspect.signature(
+        PerTargetAssayPropensityEncoder.fit
+    ).parameters
+
+
+def test_per_target_sar_assay_contrasts_are_relabeling_equivariant_under_l2() -> None:
+    from gene2wire.experiments.sarpu_authors import fit_sarpu_authors
+
+    rng = np.random.default_rng(71)
+    n_rows = 240
+    assays = np.asarray(["A", "B", "C"] * (n_rows // 3))
+    relabeling = {"A": "Z", "B": "A", "C": "B"}
+    relabeled_assays = np.asarray([relabeling[value] for value in assays])
+    targets = ("response",)
+    measured = np.ones((n_rows, 1), dtype=bool)
+
+    encoder = PerTargetAssayPropensityEncoder.fit(assays, targets, measured)
+    relabeled_encoder = PerTargetAssayPropensityEncoder.fit(
+        relabeled_assays, targets, measured
+    )
+    design = encoder.transform(assays, targets)
+    relabeled_design = relabeled_encoder.transform(relabeled_assays, targets)
+
+    # Every deterministic orthonormal basis of the centered K-level space has
+    # the same row kernel. A category relabeling can therefore only rotate the
+    # coefficient coordinates, which preserves an L2 penalty.
+    np.testing.assert_allclose(
+        design[:, 0] @ design[:, 0].T,
+        relabeled_design[:, 0] @ relabeled_design[:, 0].T,
+        rtol=0,
+        atol=5e-15,
+    )
+    basis = PerTargetAssayPropensityEncoder._assay_contrast_basis(3)
+    np.testing.assert_allclose(basis.T @ basis, np.eye(2), rtol=0, atol=5e-15)
+    np.testing.assert_allclose(basis.sum(axis=0), 0.0, rtol=0, atol=5e-15)
+
+    x = rng.normal(size=(n_rows, 2))
+    reference_probability = 1.0 / (
+        1.0 + np.exp(-(x[:, 0] - 0.3 * x[:, 1]))
+    )
+    assay_exposure = {"A": 0.30, "B": 0.55, "C": 0.80}
+    exposure = np.asarray([assay_exposure[value] for value in assays])
+    reference = rng.binomial(1, reference_probability)
+    observed = (reference * rng.binomial(1, exposure))[:, None]
+
+    fitted = fit_sarpu_authors(
+        x,
+        observed,
+        measured,
+        design,
+        target_ids=targets,
+        max_its=100,
+        seed=2,
+    )
+    relabeled_fitted = fit_sarpu_authors(
+        x,
+        observed,
+        measured,
+        relabeled_design,
+        target_ids=targets,
+        max_its=100,
+        seed=2,
+    )
+    assert fitted.converged and relabeled_fitted.converged
+    np.testing.assert_allclose(
+        fitted.predict_reference(x),
+        relabeled_fitted.predict_reference(x),
+        rtol=0,
+        atol=5e-14,
+    )
+    np.testing.assert_allclose(
+        fitted.predict_exposure(x, design),
+        relabeled_fitted.predict_exposure(x, relabeled_design),
+        rtol=0,
+        atol=5e-14,
+    )
+
+
+def test_per_target_sar_encoder_rejects_required_target_unseen_assays() -> None:
+    assays = np.asarray(["A", "B", "C", "A", "B", "C"])
+    targets = ("left", "right")
+    measured = np.column_stack(
+        (np.isin(assays, ("A", "B")), np.isin(assays, ("B", "C")))
+    )
+    encoder = PerTargetAssayPropensityEncoder.fit(assays, targets, measured)
+
+    required = np.zeros_like(measured, dtype=bool)
+    required[assays == "C", 0] = True
+    with pytest.raises(
+        ValueError,
+        match=r"unseen on fitted W support for target 'left'.*C",
+    ):
+        encoder.transform(assays, targets, required_mask=required)
+
+    # A target-unseen level is harmless on rows that the caller declares out
+    # of support; its padded contrast coordinates are never consumed.
+    design = encoder.transform(assays, targets, required_mask=np.zeros_like(measured))
+    np.testing.assert_array_equal(design[assays == "C", 0], 0.0)
+
+    # A globally new assay is also safe only when every corresponding target
+    # entry is explicitly outside the caller's required/support mask.
+    off_support = encoder.transform(
+        ["new-assay"], targets, required_mask=np.zeros((1, len(targets)))
+    )
+    np.testing.assert_array_equal(off_support, 0.0)
+    required_new = np.zeros((1, len(targets)), dtype=bool)
+    required_new[0, 1] = True
+    with pytest.raises(
+        ValueError,
+        match=r"unseen on fitted W support for target 'right'.*new-assay",
+    ):
+        encoder.transform(["new-assay"], targets, required_mask=required_new)
+    with pytest.raises(ValueError, match="unknown assay levels"):
+        encoder.transform(["new-assay"], targets)
+
+    with pytest.raises(ValueError, match="required_mask must align"):
+        encoder.transform(assays, targets, required_mask=required[:, :1])
+    invalid = required.astype(float)
+    invalid[0, 0] = 0.5
+    with pytest.raises(ValueError, match="required_mask must be binary"):
+        encoder.transform(assays, targets, required_mask=invalid)
+
+
+def test_per_target_sar_encoder_represents_zero_support_target_without_crashing() -> None:
+    assays = np.asarray(["A", "B", "A", "B"])
+    targets = ("supported", "unsupported")
+    measured = np.column_stack(
+        (np.ones(len(assays), dtype=bool), np.zeros(len(assays), dtype=bool))
+    )
+
+    encoder = PerTargetAssayPropensityEncoder.fit(
+        assays, targets, measured
+    )
+    design = encoder.transform(
+        assays, targets, required_mask=measured
+    )
+
+    assert encoder.active_feature_counts == (1, 0)
+    np.testing.assert_array_equal(design[:, 1], 0.0)
 
 
 def test_observed_positive_outside_measured_entries_is_rejected() -> None:
@@ -180,6 +369,66 @@ def test_shift_imc_is_deterministic_and_excludes_unmeasured_payload() -> None:
     np.testing.assert_allclose(first.predict_reference(x), second.predict_reference(x))
 
 
+def test_shift_imc_identity_is_target_permutation_equivariant() -> None:
+    rng = np.random.default_rng(105)
+    n_cells, n_targets, n_features = 35, 7, 4
+    x = rng.normal(size=(n_cells, n_features))
+    coefficients = rng.normal(size=(n_features, n_targets))
+    probability = 1.0 / (1.0 + np.exp(-(x @ coefficients)))
+    reference = rng.binomial(1, probability)
+    exposure = rng.uniform(0.2, 0.9, size=(n_cells, n_targets))
+    observed = reference * rng.binomial(1, exposure)
+    measured = rng.random((n_cells, n_targets)) > 0.15
+    observed = np.where(measured, observed, 0)
+    target_ids = tuple(f"target-{index}" for index in range(n_targets))
+    permutation = np.asarray([4, 1, 6, 3, 2, 0, 5])
+    inverse = np.argsort(permutation)
+
+    first = fit_shift_imc_adapted(
+        x,
+        observed,
+        measured,
+        exposure,
+        target_ids=target_ids,
+        rank=2,
+        l2=1e-3,
+        maxiter=1000,
+        seed=12,
+    )
+    second = fit_shift_imc_adapted(
+        x,
+        observed[:, permutation],
+        measured[:, permutation],
+        exposure[:, permutation],
+        target_ids=tuple(target_ids[index] for index in permutation),
+        rank=2,
+        l2=1e-3,
+        maxiter=1000,
+        seed=12,
+    )
+
+    assert first.converged and second.converged
+    assert first.augment_target_intercept is False
+    assert np.linalg.matrix_rank(first.target_design) == n_targets
+    np.testing.assert_allclose(
+        second.predict_reference(x)[:, inverse],
+        first.predict_reference(x),
+        rtol=0,
+        atol=1e-9,
+    )
+    np.testing.assert_allclose(
+        second.objective_value, first.objective_value, rtol=0, atol=1e-12
+    )
+    np.testing.assert_allclose(
+        first.predict_reference(
+            x, target_ids=tuple(target_ids[index] for index in permutation)
+        )[:, inverse],
+        first.predict_reference(x),
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_sar_em_excludes_unmeasured_label_and_propensity_payload() -> None:
     x, observed, measured, _, phi = _small_pu_problem()
     noisy_observed = observed.copy()
@@ -226,6 +475,29 @@ def test_tuner_deduplicates_configs_and_enforces_candidate_budget() -> None:
         )
 
 
+def test_shiftimc_public_tuner_rejects_all_nonconverged_trials(
+    monkeypatch,
+) -> None:
+    from gene2wire.experiments import pu_comparators
+
+    x, observed, measured, exposure, _ = _small_pu_problem()
+    original = pu_comparators.fit_shift_imc_adapted
+
+    def finite_but_nonconverged(*args, **kwargs):
+        return replace(original(*args, **kwargs), converged=False)
+
+    monkeypatch.setattr(
+        pu_comparators, "fit_shift_imc_adapted", finite_but_nonconverged
+    )
+    with pytest.raises(ValueError, match="no converged finite candidate"):
+        tune_shift_imc_adapted(
+            x[:12], observed[:12], measured[:12], exposure[:12],
+            x[12:], observed[12:], measured[12:], exposure[12:],
+            candidates=({"rank": 1, "l2": 0.1},),
+            maxiter=500,
+        )
+
+
 def test_sar_em_requires_support_for_every_target() -> None:
     x, observed, measured, _, _ = _small_pu_problem()
     measured = measured.copy()
@@ -266,7 +538,12 @@ def _prepared_comparator_problem(*, target_features: bool = False) -> PreparedFo
         fold=fold,
         metadata={"model_seed": 0},
         training_measured=measured,
-        virtual_assays=np.asarray(["A", "B", "C"] * 6),
+        # The 3x3 Latin schedule makes every assay estimable for every target
+        # on training W support; the original mod-3 schedule confounded each
+        # target's missing rows with exactly one assay level.
+        virtual_assays=np.asarray(
+            ["A", "B", "C", "B", "C", "A", "C", "A", "B"] * 2
+        ),
     )
 
 
@@ -362,7 +639,9 @@ def test_wrapper_initialization_seeds_do_not_change_with_mask_severity() -> None
 
 def test_wrapper_caps_shift_rank_by_target_descriptor_dimension() -> None:
     prepared = _prepared_comparator_problem(target_features=True)
-    settings = _comparator_settings(use_target_features=True)
+    settings = _comparator_settings(
+        use_target_features=True, maxiter=500, retry_maxiter=500
+    )
     records, tables = _run_comparator_wrapper(prepared, settings)
     assert "Inductive-PU-MC" in records
     assert not [
@@ -380,7 +659,7 @@ def test_wrapper_caps_shift_rank_by_target_descriptor_dimension() -> None:
         row["model"]: row["target_input_kind"] for row in tables["selected"]
     }
     assert selected_inputs["Inductive-PU-MC"] == "target_features"
-    assert selected_inputs["GenEML-adapted"] == "known_target_identity"
+    assert selected_inputs["GenEML-authors-mask"] == "known_target_identity"
     assert selected_inputs["SAR-PU"] == "known_target_identity"
 
 
@@ -390,7 +669,9 @@ def test_wrapper_retains_failed_candidate_and_continues_with_valid_fit(
     from gene2wire.experiments import pu_comparators
 
     prepared = _prepared_comparator_problem(target_features=True)
-    settings = _comparator_settings(use_target_features=True)
+    settings = _comparator_settings(
+        use_target_features=True, maxiter=500, retry_maxiter=500
+    )
     original = pu_comparators.fit_shift_imc_adapted
 
     def fail_rank_one(*args, rank, **kwargs):
@@ -421,8 +702,11 @@ def test_wrapper_retains_failed_candidate_and_continues_with_valid_fit(
         if row["model"] == "Inductive-PU-MC"
     )
     assert selected["rank"] == 2
-    assert selected["underlying_method"] == "ShiftIMC-adapted"
+    assert selected["underlying_method"] == (
+        "ShiftIMC-inspired paper-based reimplementation"
+    )
     assert selected["adapted"] is True
+    assert selected["authors_code"] is False
     shift_events = [
         row["event"] for row in progress
         if row.get("model") == "Inductive-PU-MC"
@@ -438,6 +722,17 @@ def test_wrapper_retains_failed_candidate_and_continues_with_valid_fit(
         if row.get("model") == "Inductive-PU-MC"
         and row["event"] in {"candidate_complete", "refit_complete"}
     )
+    sar_target_events = [
+        row
+        for row in progress
+        if row.get("model") == "SAR-PU"
+        and row["event"] in {"target_start", "target_complete"}
+    ]
+    assert len(sar_target_events) == 4 * len(prepared.target_ids)
+    assert {row["stage"] for row in sar_target_events} == {"tuning", "refit"}
+    assert {
+        row["target_id"] for row in sar_target_events
+    } == set(map(str, prepared.target_ids))
 
 
 def test_wrapper_balances_bounded_candidate_coordinates() -> None:
@@ -447,20 +742,189 @@ def test_wrapper_balances_bounded_candidate_coordinates() -> None:
     _, tables = _run_comparator_wrapper(prepared, settings)
     geneml = [
         row for row in tables["tuning"]
-        if row["model"] == "GenEML-adapted"
+        if row["model"] == "GenEML-authors-mask"
     ]
     assert len(geneml) == 4
     assert {row["rank"] for row in geneml} == {1, 2, 3}
-    assert len({row["l2_u"] for row in geneml}) == 4
+    assert {row["lam_u"] for row in geneml} == {1e-3}
+    assert {row["lam_v"] for row in geneml} == {1e-3}
+    assert len({row["lam_w"] for row in geneml}) == 4
+    assert all(row["authors_code"] is False for row in geneml)
+    assert all(row["authors_source"] is True for row in geneml)
+    assert all(
+        row["executes_unmodified_authors_code"] is False
+        for row in geneml
+    )
+    assert all(
+        row["verified_vendor_sha256"] == row["vendor_sha256"]
+        for row in geneml
+    )
+    assert all(
+        row["implementation_variant"]
+        == "authors-source-python3-measurement-mask-port"
+        for row in geneml
+    )
     sar = [row for row in tables["tuning"] if row["model"] == "SAR-PU"]
-    assert len(sar) == 4
-    assert len({row["l2_classifier"] for row in sar}) == 4
-    assert len({row["l2_propensity"] for row in sar}) == 4
+    assert len(sar) == 1
+    assert "l2_classifier" not in sar[0]
+    assert "l2_propensity" not in sar[0]
+    assert sar[0]["implementation_variant"] == (
+        "authors_sar_em_per_target_measurement_wrapper"
+    )
+    assert sar[0]["authors_code"] is False
+    assert sar[0]["authors_source"] is True
+    assert sar[0]["executes_unmodified_authors_code"] is False
+    assert sar[0]["uses_unmodified_authors_em_kernel"] is True
+    assert sar[0]["verified_vendor_sha256"] == (
+        sar[0]["vendored_source_sha256"]
+    )
+
+
+def test_wrapper_fails_only_sar_for_validation_assay_without_target_support() -> None:
+    prepared = _prepared_comparator_problem()
+    assays = np.asarray(prepared.virtual_assays)
+    train = np.asarray(prepared.fold.train_rows)
+    fit_w = np.asarray(prepared.training_measured, dtype=bool).copy()
+    # Target 0 has only A/B support during candidate fitting, while validation
+    # contains a measured C row. That propensity is not identified and must
+    # not be silently mapped to the all-zero/reference contrast.
+    train_c = train[assays[train] == "C"]
+    fit_w[train_c, 0] = False
+    reference = np.asarray(prepared.reference, dtype=bool).copy()
+    reference[~fit_w] = False
+    prepared = replace(
+        prepared,
+        reference=reference,
+        measured=fit_w,
+        training_measured=fit_w,
+    )
+    settings = _comparator_settings(
+        candidate_budget=1, maxiter=500, retry_maxiter=500
+    )
+
+    records, tables = _run_comparator_wrapper(prepared, settings)
+
+    assert "SAR-PU" not in records
+    assert {"GenEML-authors-mask", "Inductive-PU-MC"}.issubset(records)
+    sar_failure = next(
+        row
+        for row in tables["failures"]
+        if row["model"] == "SAR-PU"
+        and row["stage"] == "pu_comparator_candidate"
+    )
+    assert "validation propensity support failed" in sar_failure["error"]
+    assert "unseen on fitted W support" in sar_failure["error"]
+    sar_trial = next(
+        row for row in tables["tuning"] if row["model"] == "SAR-PU"
+    )
+    assert sar_trial["status"] == "failed"
+    assert sar_trial["validation_unseen_required_entries"] > 0
+    assert "fail on W-supported rows" in sar_trial[
+        "propensity_unseen_level_policy"
+    ]
+
+
+def test_wrapper_fails_only_sar_for_test_assay_without_refit_support() -> None:
+    prepared = _prepared_comparator_problem()
+    assays = np.asarray(prepared.virtual_assays)
+    development = np.sort(
+        np.r_[prepared.fold.train_rows, prepared.fold.validation_rows]
+    )
+    fit_w = np.asarray(prepared.training_measured, dtype=bool).copy()
+    development_c = development[assays[development] == "C"]
+    fit_w[development_c, 0] = False
+    reference = np.asarray(prepared.reference, dtype=bool).copy()
+    reference[~fit_w] = False
+    prepared = replace(
+        prepared,
+        reference=reference,
+        measured=fit_w,
+        training_measured=fit_w,
+    )
+    settings = _comparator_settings(
+        candidate_budget=1, maxiter=500, retry_maxiter=500
+    )
+
+    records, tables = _run_comparator_wrapper(prepared, settings)
+
+    assert "SAR-PU" not in records
+    assert {"GenEML-authors-mask", "Inductive-PU-MC"}.issubset(records)
+    assert any(
+        row["model"] == "SAR-PU"
+        and row["status"] == "complete"
+        for row in tables["tuning"]
+    )
+    sar_failure = next(
+        row
+        for row in tables["failures"]
+        if row["model"] == "SAR-PU"
+        and row["stage"] == "pu_comparator_refit"
+    )
+    assert "test propensity support failed" in sar_failure["error"]
+    assert "unseen on fitted W support" in sar_failure["error"]
+
+
+def test_authors_sar_failure_is_explicit_and_never_uses_legacy_fallback(
+    monkeypatch,
+) -> None:
+    from gene2wire.experiments import pu_comparators, sarpu_authors
+
+    prepared = _prepared_comparator_problem()
+    settings = _comparator_settings(candidate_budget=1)
+
+    def authors_failure(*args, **kwargs):
+        raise sarpu_authors.SARPUAuthorsConvergenceError(
+            "deliberate authors-code nonconvergence"
+        )
+
+    def forbidden_legacy(*args, **kwargs):
+        raise AssertionError("legacy clean-room SAR must not be called")
+
+    monkeypatch.setattr(sarpu_authors, "fit_sarpu_authors", authors_failure)
+    monkeypatch.setattr(pu_comparators, "fit_sar_em", forbidden_legacy)
+    records, tables = _run_comparator_wrapper(prepared, settings)
+
+    assert "SAR-PU" not in records
+    assert not [row for row in tables["selected"] if row["model"] == "SAR-PU"]
+    sar_trials = [row for row in tables["tuning"] if row["model"] == "SAR-PU"]
+    assert len(sar_trials) == 1
+    assert sar_trials[0]["status"] == "failed"
+    assert "deliberate authors-code nonconvergence" in sar_trials[0]["error"]
+    assert any(
+        row["model"] == "SAR-PU" and row["stage"] == "pu_comparator"
+        for row in tables["failures"]
+    )
+
+
+def test_sar_unsupported_class_support_does_not_block_other_comparators() -> None:
+    prepared = _prepared_comparator_problem()
+    reference = np.asarray(prepared.reference, dtype=bool).copy()
+    reference[:, 0] = False
+    prepared = replace(prepared, reference=reference)
+    settings = _comparator_settings(
+        candidate_budget=1, maxiter=500, retry_maxiter=500
+    )
+
+    records, tables = _run_comparator_wrapper(prepared, settings)
+
+    assert "SAR-PU" not in records
+    assert {"GenEML-authors-mask", "Inductive-PU-MC"}.issubset(records)
+    sar_trial = next(
+        row for row in tables["tuning"] if row["model"] == "SAR-PU"
+    )
+    assert sar_trial["status"] == "failed"
+    assert "requires measured positive and unlabeled support" in sar_trial["error"]
+    assert not [
+        row for row in tables["failures"]
+        if row["model"] in {"GenEML-authors-mask", "Inductive-PU-MC"}
+    ]
 
 
 def test_wrapper_resumes_candidate_and_refit_checkpoints(tmp_path) -> None:
     prepared = _prepared_comparator_problem()
-    settings = _comparator_settings(candidate_budget=1)
+    settings = _comparator_settings(
+        candidate_budget=1, maxiter=500, retry_maxiter=500
+    )
     first_progress: list[dict] = []
     _, first = _run_comparator_wrapper(
         prepared, settings, checkpoint_dir=tmp_path, progress=first_progress)
@@ -481,3 +945,105 @@ def test_wrapper_resumes_candidate_and_refit_checkpoints(tmp_path) -> None:
     ]
     assert len(completed) == 3
     assert all(row["cache_status"] == "checkpoint" for row in completed)
+
+
+def test_cached_comparator_restore_still_fails_on_fresh_vendor_verification(
+    tmp_path, monkeypatch,
+) -> None:
+    from gene2wire.experiments import geneml_authors
+
+    prepared = _prepared_comparator_problem()
+    settings = _comparator_settings(
+        candidate_budget=1, maxiter=500, retry_maxiter=500
+    )
+    _run_comparator_wrapper(
+        prepared, settings, checkpoint_dir=tmp_path
+    )
+
+    def reject_changed_source():
+        raise RuntimeError("deliberate fresh GenEML source verification failure")
+
+    monkeypatch.setattr(
+        geneml_authors, "verify_geneml_vendor", reject_changed_source
+    )
+    with pytest.raises(RuntimeError, match="fresh GenEML source verification"):
+        _run_comparator_wrapper(
+            prepared, settings, checkpoint_dir=tmp_path
+        )
+
+
+def test_shiftimc_all_nonconverged_candidates_are_not_selectable(
+    monkeypatch,
+) -> None:
+    from gene2wire.experiments import pu_comparators
+
+    prepared = _prepared_comparator_problem()
+    settings = _comparator_settings(
+        candidate_budget=2, maxiter=500, retry_maxiter=500
+    )
+    original = pu_comparators.fit_shift_imc_adapted
+
+    def force_nonconvergence(*args, **kwargs):
+        fitted = original(*args, **kwargs)
+        return replace(
+            fitted, converged=False,
+            optimizer_message="deliberate finite non-convergence",
+        )
+
+    monkeypatch.setattr(
+        pu_comparators, "fit_shift_imc_adapted", force_nonconvergence
+    )
+    records, tables = _run_comparator_wrapper(prepared, settings)
+    assert "Inductive-PU-MC" not in records
+    assert not [
+        row for row in tables["selected"]
+        if row["model"] == "Inductive-PU-MC"
+    ]
+    trials = [
+        row for row in tables["tuning"]
+        if row["model"] == "Inductive-PU-MC"
+    ]
+    assert trials and all(row["status"] == "failed" for row in trials)
+    failures = [
+        row for row in tables["failures"]
+        if row["model"] == "Inductive-PU-MC"
+    ]
+    assert failures
+    assert any("did not converge" in row["error"] for row in failures)
+
+
+def test_shiftimc_nonconverged_refit_exports_no_prediction(monkeypatch) -> None:
+    from gene2wire.experiments import pu_comparators
+
+    prepared = _prepared_comparator_problem()
+    settings = _comparator_settings(
+        candidate_budget=1, maxiter=500, retry_maxiter=500
+    )
+    original = pu_comparators.fit_shift_imc_adapted
+    n_candidate_rows = len(prepared.fold.train_rows)
+
+    def fail_only_refit(*args, **kwargs):
+        fitted = original(*args, **kwargs)
+        if len(np.asarray(args[0])) > n_candidate_rows:
+            return replace(
+                fitted, converged=False,
+                optimizer_message="deliberate finite refit non-convergence",
+            )
+        return replace(fitted, converged=True)
+
+    monkeypatch.setattr(
+        pu_comparators, "fit_shift_imc_adapted", fail_only_refit
+    )
+    records, tables = _run_comparator_wrapper(prepared, settings)
+    assert "Inductive-PU-MC" not in records
+    assert not [
+        row for row in tables["selected"]
+        if row["model"] == "Inductive-PU-MC"
+    ]
+    refit_failures = [
+        row for row in tables["failures"]
+        if row["model"] == "Inductive-PU-MC"
+        and row["stage"] == "pu_comparator_refit"
+    ]
+    assert len(refit_failures) == 1
+    assert "predictions are not exportable" in refit_failures[0]["error"]

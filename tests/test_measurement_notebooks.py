@@ -183,7 +183,7 @@ def test_every_notebook_enables_all_shared_controls_and_pu_comparators(name):
     assert "bounded_grid_candidates" not in code
     assert "full_joint_candidates" not in code
     for model in (
-        "PU-Joint", "GenEML-adapted", "Inductive-PU-MC", "SAR-PU"
+        "PU-Joint", "GenEML-authors-mask", "Inductive-PU-MC", "SAR-PU"
     ):
         assert model in code
 
