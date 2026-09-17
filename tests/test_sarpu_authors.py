@@ -272,6 +272,10 @@ def test_probability_semantics_and_checkpoint_fields_are_finite_and_json_safe():
     assert diagnostics["executes_unmodified_authors_code"] is False
     assert diagnostics["uses_unmodified_authors_em_kernel"] is True
     assert diagnostics["max_its"] == 300
+    assert diagnostics["retry_max_its"] is None
+    assert diagnostics["target_fit_attempts"] == [1]
+    assert diagnostics["target_retried"] == [False]
+    assert diagnostics["target_max_its"] == [300]
     assert diagnostics["slope_eps"] == pytest.approx(1e-4)
     assert diagnostics["ll_eps"] == pytest.approx(1e-4)
     assert diagnostics["convergence_window"] == 10
@@ -302,6 +306,67 @@ def test_per_target_progress_reports_target_identity_and_completion():
     assert all(event["target_total"] == 1 for event in events)
     assert events[-1]["iterations"] == fitted.target_iterations[0]
     assert events[-1]["elapsed_seconds"] >= 0
+
+
+def test_only_nonconverged_target_is_retried_with_higher_iteration_limit(
+    monkeypatch,
+):
+    x, first_observed, measured_one, first_propensity = _problem(
+        n=120, seed=51
+    )
+    observed = np.column_stack(
+        (first_observed[:, 0], np.roll(first_observed[:, 0], 5))
+    )
+    measured = np.broadcast_to(measured_one, observed.shape).copy()
+    propensity = np.stack(
+        (first_propensity[:, 0], np.roll(first_propensity[:, 0], 7, axis=0)),
+        axis=1,
+    )
+    original = sar._UPSTREAM.pu_learn_sar_em
+    attempted_limits = []
+
+    def force_second_target_retry(*args, max_its, **kwargs):
+        fitted_classifier, fitted_propensity, info = original(
+            *args, max_its=max_its, **kwargs
+        )
+        attempted_limits.append(max_its)
+        if len(attempted_limits) == 2:
+            info = dict(info)
+            info["nb_iterations"] = max_its - 1
+        return fitted_classifier, fitted_propensity, info
+
+    monkeypatch.setattr(
+        sar._UPSTREAM, "pu_learn_sar_em", force_second_target_retry
+    )
+    events = []
+    fitted = sar.fit_sarpu_authors(
+        x,
+        observed,
+        measured,
+        propensity,
+        target_ids=("first", "second"),
+        max_its=300,
+        retry_max_its=600,
+        seed=27,
+        on_progress=events.append,
+    )
+
+    assert attempted_limits == [300, 300, 600]
+    assert fitted.target_fit_attempts.tolist() == [1, 2]
+    assert fitted.target_retried.tolist() == [False, True]
+    assert fitted.target_max_its.tolist() == [300, 600]
+    assert fitted.retry_max_its == 600
+    assert [event["event"] for event in events] == [
+        "target_start",
+        "target_complete",
+        "target_start",
+        "target_retry",
+        "target_complete",
+    ]
+    retry = next(event for event in events if event["event"] == "target_retry")
+    assert retry["target_id"] == "second"
+    assert retry["previous_max_its"] == 300
+    assert retry["max_its"] == 600
 
 
 def test_unsupported_target_and_hidden_positive_fail_before_upstream_fit(monkeypatch):
@@ -343,3 +408,16 @@ def test_nonconvergence_fails_closed_and_api_has_no_reference_or_true_e_inputs()
 
     parameters = inspect.signature(sar.fit_sarpu_authors).parameters
     assert not ({"reference", "truth", "true_e", "e"} & set(parameters))
+
+
+def test_retry_limit_must_be_strictly_higher_than_initial_limit():
+    x, observed, measured, propensity = _problem()
+    with pytest.raises(ValueError, match="retry_max_its must exceed max_its"):
+        sar.fit_sarpu_authors(
+            x,
+            observed,
+            measured,
+            propensity,
+            max_its=300,
+            retry_max_its=300,
+        )

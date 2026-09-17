@@ -2101,16 +2101,18 @@ def _run_pu_comparators(prepared, observed, tuning_e, final_e, settings, context
         else:
             window = 10
             candidate_options = {
-                "max_its": max(window + 2, settings.maxiter),
-                "slope_eps": 1e-4,
-                "ll_eps": 1e-4,
+                "max_its": settings.sar_candidate_max_its,
+                "retry_max_its": settings.sar_target_retry_max_its,
+                "slope_eps": settings.sar_slope_eps,
+                "ll_eps": settings.sar_ll_eps,
                 "convergence_window": window,
                 "refit_classifier": True,
             }
             refit_options = {
-                "max_its": max(window + 2, settings.retry_maxiter),
-                "slope_eps": 1e-4,
-                "ll_eps": 1e-4,
+                "max_its": settings.sar_candidate_max_its,
+                "retry_max_its": settings.sar_target_retry_max_its,
+                "slope_eps": settings.sar_slope_eps,
+                "ll_eps": settings.sar_ll_eps,
                 "convergence_window": window,
                 "refit_classifier": True,
             }
@@ -2201,6 +2203,14 @@ def _run_pu_comparators(prepared, observed, tuning_e, final_e, settings, context
                     "assay/QC propensity design"
                 ),
                 "uses_known_measurement_mask": True,
+                "sar_candidate_max_its": settings.sar_candidate_max_its,
+                "sar_target_retry_max_its": settings.sar_target_retry_max_its,
+                "sar_slope_eps": settings.sar_slope_eps,
+                "sar_ll_eps": settings.sar_ll_eps,
+                "sar_retry_policy": (
+                    "retry only the failed target after stopping-criterion "
+                    "nonconvergence; retain completed targets"
+                ),
                 "propensity_unseen_level_policy": (
                     "fail on W-supported rows; all-zero contrast placeholder "
                     "only on unused off-panel rows"

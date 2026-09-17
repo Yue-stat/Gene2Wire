@@ -778,6 +778,15 @@ def test_wrapper_balances_bounded_candidate_coordinates() -> None:
     assert sar[0]["verified_vendor_sha256"] == (
         sar[0]["vendored_source_sha256"]
     )
+    assert sar[0]["sar_candidate_max_its"] == 2000
+    assert sar[0]["sar_target_retry_max_its"] == 4000
+    assert sar[0]["sar_slope_eps"] == pytest.approx(1e-3)
+    assert sar[0]["sar_ll_eps"] == pytest.approx(1e-3)
+    selected_sar = next(
+        row for row in tables["selected"] if row["model"] == "SAR-PU"
+    )
+    assert selected_sar["max_its"] == 2000
+    assert selected_sar["retry_max_its"] == 4000
 
 
 def test_wrapper_fails_only_sar_for_validation_assay_without_target_support() -> None:

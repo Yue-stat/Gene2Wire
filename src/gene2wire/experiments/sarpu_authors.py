@@ -418,6 +418,9 @@ class SARPUAuthorsFit:
     target_positive_counts: Array
     target_unlabeled_counts: Array
     target_iterations: Array
+    target_fit_attempts: Array
+    target_retried: Array
+    target_max_its: Array
     target_objective_values: Array
     final_upstream_loglikelihoods: Array
     final_propensity_slopes: Array
@@ -428,6 +431,7 @@ class SARPUAuthorsFit:
     target_ids: tuple[str, ...]
     seed: int
     max_its: int
+    retry_max_its: int | None
     slope_eps: float
     ll_eps: float
     convergence_window: int
@@ -500,6 +504,11 @@ class SARPUAuthorsFit:
             "final_iterations": int(self.iterations),
             "final_objective": float(self.objective_value),
             "target_iterations": [int(value) for value in self.target_iterations],
+            "target_fit_attempts": [
+                int(value) for value in self.target_fit_attempts
+            ],
+            "target_retried": [bool(value) for value in self.target_retried],
+            "target_max_its": [int(value) for value in self.target_max_its],
             "target_measured_counts": [int(value) for value in self.target_measured_counts],
             "target_positive_counts": [int(value) for value in self.target_positive_counts],
             "target_unlabeled_counts": [int(value) for value in self.target_unlabeled_counts],
@@ -527,6 +536,9 @@ class SARPUAuthorsFit:
             "wrapper_source_sha256": self.wrapper_source_sha256,
             "sklearn_version": self.sklearn_version,
             "max_its": int(self.max_its),
+            "retry_max_its": (
+                None if self.retry_max_its is None else int(self.retry_max_its)
+            ),
             "slope_eps": float(self.slope_eps),
             "ll_eps": float(self.ll_eps),
             "convergence_window": int(self.convergence_window),
@@ -544,6 +556,7 @@ def fit_sarpu_authors(
     target_ids: Sequence[Any] | None = None,
     classification_attributes: Sequence[int] | Array | None = None,
     max_its: int = 500,
+    retry_max_its: int | None = None,
     slope_eps: float = 1e-4,
     ll_eps: float = 1e-4,
     convergence_window: int = 10,
@@ -558,6 +571,9 @@ def fit_sarpu_authors(
     feature matrix and selected only by the propensity model.  Any unsupported,
     non-converged, optimizer/numeric-warning-emitting, or non-finite target
     aborts the entire fit; this function never substitutes another estimator.
+    When ``retry_max_its`` is supplied, only a target that reaches the first
+    iteration ceiling without satisfying both upstream stopping criteria is
+    restarted with that higher ceiling. Successfully fitted targets are kept.
     """
 
     source_hashes = verify_sarpu_vendor()
@@ -586,6 +602,10 @@ def fit_sarpu_authors(
         raise ValueError("convergence_window must be at least two")
     if max_its < convergence_window + 2:
         raise ValueError("max_its must be at least convergence_window + 2")
+    if retry_max_its is not None:
+        retry_max_its = _positive_int(retry_max_its, "retry_max_its")
+        if retry_max_its <= max_its:
+            raise ValueError("retry_max_its must exceed max_its")
     slope_eps = _positive_float(slope_eps, "slope_eps")
     ll_eps = _positive_float(ll_eps, "ll_eps")
     if not isinstance(refit_classifier, (bool, np.bool_)):
@@ -627,6 +647,9 @@ def fit_sarpu_authors(
     classifier_seeds = np.empty(n_targets, dtype=np.int64)
     propensity_seeds = np.empty(n_targets, dtype=np.int64)
     target_iterations = np.empty(n_targets, dtype=np.int64)
+    target_fit_attempts = np.ones(n_targets, dtype=np.int64)
+    target_retried = np.zeros(n_targets, dtype=bool)
+    target_max_its = np.full(n_targets, max_its, dtype=np.int64)
     target_objectives = np.empty(n_targets, dtype=np.float64)
     final_loglikelihoods = np.empty(n_targets, dtype=np.float64)
     final_slopes = np.empty(n_targets, dtype=np.float64)
@@ -675,81 +698,119 @@ def fit_sarpu_authors(
         )
         classifier_seeds[target] = classifier_seed
         propensity_seeds[target] = propensity_seed
-        classifier_model = CompatibleLogisticRegressionPU(random_state=classifier_seed)
-        propensity_model = CompatibleLogisticRegressionPU(random_state=propensity_seed)
-
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            try:
-                fitted_classifier, fitted_propensity, info = _UPSTREAM.pu_learn_sar_em(
-                    target_x,
-                    target_s,
-                    propensity_attributes,
-                    classification_attributes=classifier_attributes,
-                    classification_model=classifier_model,
-                    propensity_model=propensity_model,
-                    max_its=max_its,
-                    slope_eps=slope_eps,
-                    ll_eps=ll_eps,
-                    convergence_window=convergence_window,
-                    refit_classifier=refit_classifier,
-                )
-            except Exception as error:
-                raise SARPUAuthorsError(
-                    f"Authors' SAR-EM failed for target {target}: {error}"
-                ) from error
-
-        target_warning_messages = [
-            f"target {target}: {item.category.__name__}: {item.message}" for item in caught
-        ]
-        fatal_warnings = [
-            item
-            for item in caught
-            if issubclass(item.category, (ConvergenceWarning, RuntimeWarning))
-        ]
-        if fatal_warnings:
-            raise SARPUAuthorsConvergenceError(
-                "Authors' SAR-EM emitted a fatal optimizer/numeric warning: "
-                + " | ".join(target_warning_messages)
-            )
-        warning_messages.extend(target_warning_messages)
-
-        required_info = {
-            "nb_iterations",
-            "loglikelihoods",
-            "propensity_slopes",
-            "max_ll_improvements",
-        }
-        if not isinstance(info, dict) or not required_info.issubset(info):
-            raise SARPUAuthorsConvergenceError(
-                f"Authors' SAR-EM returned incomplete diagnostics for target {target}"
-            )
-        iteration_index = int(info["nb_iterations"])
-        loglikelihood_history = np.asarray(info["loglikelihoods"], dtype=np.float64)
-        slope_history = np.asarray(info["propensity_slopes"], dtype=np.float64)
-        improvement_history = np.asarray(info["max_ll_improvements"], dtype=np.float64)
-        if (
-            loglikelihood_history.ndim != 1
-            or slope_history.ndim != 1
-            or improvement_history.ndim != 1
-            or loglikelihood_history.size == 0
-            or slope_history.size == 0
-            or improvement_history.size == 0
-            or not np.all(np.isfinite(loglikelihood_history))
-            or not np.all(np.isfinite(slope_history))
-            or not np.all(np.isfinite(improvement_history))
-        ):
-            raise SARPUAuthorsConvergenceError(
-                f"Authors' SAR-EM returned non-finite/incomplete histories for target {target}"
-            )
-        final_slope = float(slope_history[-1])
-        final_improvement = float(improvement_history[-1])
-        converged = (
-            0 <= iteration_index < max_its - 1
-            and final_slope < slope_eps
-            and final_improvement < ll_eps
+        attempt_limits = (max_its,) + (
+            () if retry_max_its is None else (retry_max_its,)
         )
-        if not converged:
+        for attempt_index, attempt_max_its in enumerate(attempt_limits):
+            classifier_model = CompatibleLogisticRegressionPU(
+                random_state=classifier_seed
+            )
+            propensity_model = CompatibleLogisticRegressionPU(
+                random_state=propensity_seed
+            )
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                try:
+                    fitted_classifier, fitted_propensity, info = (
+                        _UPSTREAM.pu_learn_sar_em(
+                            target_x,
+                            target_s,
+                            propensity_attributes,
+                            classification_attributes=classifier_attributes,
+                            classification_model=classifier_model,
+                            propensity_model=propensity_model,
+                            max_its=attempt_max_its,
+                            slope_eps=slope_eps,
+                            ll_eps=ll_eps,
+                            convergence_window=convergence_window,
+                            refit_classifier=refit_classifier,
+                        )
+                    )
+                except Exception as error:
+                    raise SARPUAuthorsError(
+                        f"Authors' SAR-EM failed for target {target}: {error}"
+                    ) from error
+
+            target_warning_messages = [
+                f"target {target}: {item.category.__name__}: {item.message}"
+                for item in caught
+            ]
+            fatal_warnings = [
+                item
+                for item in caught
+                if issubclass(item.category, (ConvergenceWarning, RuntimeWarning))
+            ]
+            if fatal_warnings:
+                raise SARPUAuthorsConvergenceError(
+                    "Authors' SAR-EM emitted a fatal optimizer/numeric warning: "
+                    + " | ".join(target_warning_messages)
+                )
+            warning_messages.extend(target_warning_messages)
+
+            required_info = {
+                "nb_iterations",
+                "loglikelihoods",
+                "propensity_slopes",
+                "max_ll_improvements",
+            }
+            if not isinstance(info, dict) or not required_info.issubset(info):
+                raise SARPUAuthorsConvergenceError(
+                    "Authors' SAR-EM returned incomplete diagnostics for "
+                    f"target {target}"
+                )
+            iteration_index = int(info["nb_iterations"])
+            loglikelihood_history = np.asarray(
+                info["loglikelihoods"], dtype=np.float64
+            )
+            slope_history = np.asarray(
+                info["propensity_slopes"], dtype=np.float64
+            )
+            improvement_history = np.asarray(
+                info["max_ll_improvements"], dtype=np.float64
+            )
+            if (
+                loglikelihood_history.ndim != 1
+                or slope_history.ndim != 1
+                or improvement_history.ndim != 1
+                or loglikelihood_history.size == 0
+                or slope_history.size == 0
+                or improvement_history.size == 0
+                or not np.all(np.isfinite(loglikelihood_history))
+                or not np.all(np.isfinite(slope_history))
+                or not np.all(np.isfinite(improvement_history))
+            ):
+                raise SARPUAuthorsConvergenceError(
+                    "Authors' SAR-EM returned non-finite/incomplete histories "
+                    f"for target {target}"
+                )
+            final_slope = float(slope_history[-1])
+            final_improvement = float(improvement_history[-1])
+            converged = (
+                0 <= iteration_index < attempt_max_its - 1
+                and final_slope < slope_eps
+                and final_improvement < ll_eps
+            )
+            if converged:
+                target_fit_attempts[target] = attempt_index + 1
+                target_retried[target] = attempt_index > 0
+                target_max_its[target] = attempt_max_its
+                break
+            if attempt_index + 1 < len(attempt_limits):
+                if on_progress is not None:
+                    on_progress({
+                        "event": "target_retry",
+                        "target_index": target + 1,
+                        "target_total": n_targets,
+                        "target_id": fitted_target_ids[target],
+                        "attempt": attempt_index + 2,
+                        "previous_max_its": attempt_max_its,
+                        "max_its": attempt_limits[attempt_index + 1],
+                        "previous_iteration_index": iteration_index,
+                        "previous_slope": final_slope,
+                        "previous_ll_improvement": final_improvement,
+                        "elapsed_seconds": time.monotonic() - target_started,
+                    })
+                continue
             raise SARPUAuthorsConvergenceError(
                 "Authors' SAR-EM did not satisfy both upstream stopping criteria "
                 f"for target {target}: iteration_index={iteration_index}, "
@@ -812,6 +873,9 @@ def fit_sarpu_authors(
                 "target_total": n_targets,
                 "target_id": fitted_target_ids[target],
                 "iterations": int(target_iterations[target]),
+                "fit_attempts": int(target_fit_attempts[target]),
+                "retried": bool(target_retried[target]),
+                "max_its": int(target_max_its[target]),
                 "objective_value": float(objective),
                 "elapsed_seconds": time.monotonic() - target_started,
                 "cache_status": "fitted",
@@ -843,6 +907,9 @@ def fit_sarpu_authors(
         target_positive_counts=positive_counts,
         target_unlabeled_counts=unlabeled_counts,
         target_iterations=target_iterations,
+        target_fit_attempts=target_fit_attempts,
+        target_retried=target_retried,
+        target_max_its=target_max_its,
         target_objective_values=target_objectives,
         final_upstream_loglikelihoods=final_loglikelihoods,
         final_propensity_slopes=final_slopes,
@@ -853,6 +920,7 @@ def fit_sarpu_authors(
         target_ids=fitted_target_ids,
         seed=seed,
         max_its=max_its,
+        retry_max_its=retry_max_its,
         slope_eps=slope_eps,
         ll_eps=ll_eps,
         convergence_window=convergence_window,

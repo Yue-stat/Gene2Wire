@@ -32,6 +32,12 @@ class Settings:
     retry_maxiter: int = 1000
     tolerance: float = 1e-8
     init_direct_maxiter: int = 120
+    # SAR-PU uses the authors' EM stopping rules, so its iteration budget and
+    # tolerances are declared separately from the scipy optimizer settings.
+    sar_candidate_max_its: int = 2000
+    sar_target_retry_max_its: int = 4000
+    sar_slope_eps: float = 1e-3
+    sar_ll_eps: float = 1e-3
     # Fixed (never tuned) stabilization for explicit target-specific nuisance
     # coefficients.  Ordinary experiments have no nuisance design and retain
     # the exact historical value zero; gene-overlap notebooks set 1e-4.
@@ -51,10 +57,19 @@ class Settings:
 
     def __post_init__(self):
         for field in ("n_outer_folds", "n_jobs", "n_repetitions", "candidate_budget",
-                      "maxiter", "retry_maxiter", "init_direct_maxiter"):
+                      "maxiter", "retry_maxiter", "init_direct_maxiter",
+                      "sar_candidate_max_its", "sar_target_retry_max_its"):
             value = getattr(self, field)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{field} must be a positive integer")
+        if self.sar_target_retry_max_its <= self.sar_candidate_max_its:
+            raise ValueError(
+                "sar_target_retry_max_its must exceed sar_candidate_max_its"
+            )
+        for field in ("sar_slope_eps", "sar_ll_eps"):
+            value = getattr(self, field)
+            if isinstance(value, bool) or not np.isfinite(value) or value <= 0:
+                raise ValueError(f"{field} must be positive and finite")
         if self.n_outer_folds < 2:
             raise ValueError("At least two outer folds are required")
         if self.strategy not in {
